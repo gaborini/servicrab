@@ -10,18 +10,20 @@
 //! - `servicrab up [SERVICE...]` — run a whole stack in the foreground
 //!   (Linux/macOS)
 //!
+//! - `servicrab logs [SERVICE...]` — read the captured log files
+//! - `servicrab start` / `status` / `down` — background daemon control
+//!   (Linux/macOS)
+//!
 //! ## Future phases (TODOs)
 //!
-//! - TODO(phase-2): Add `start` / `stop` / `restart` commands that talk to
-//!   a background daemon over a Unix socket.
-//! - TODO(phase-2): Add `status` to show a rich process table.
-//! - TODO(phase-2): Add `logs <service>` to stream logs from the daemon.
-//! - TODO(phase-3): Add `down` for stopping a detached stack.
+//! - TODO(phase-2): Per-service `stop` / `restart` through the daemon.
+//! - TODO(phase-3): Config hot-reload (`servicrab reload`).
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 mod commands;
+mod daemon;
 mod style;
 
 #[derive(Parser, Debug)]
@@ -141,6 +143,54 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         no_prefix: bool,
     },
+
+    /// Start the stack in the background and return immediately.
+    /// Linux and macOS only.
+    Start {
+        /// Path to the configuration file.  If omitted, discovers
+        /// servicrab.toml by walking up from the current directory.
+        #[arg(long, short = 'c')]
+        config: Option<std::path::PathBuf>,
+
+        /// Never restart services, whatever their configured policy says.
+        #[arg(long, default_value_t = false)]
+        no_restart: bool,
+    },
+
+    /// Show what the background daemon is doing.  Linux and macOS only.
+    Status {
+        /// Path to the configuration file.  If omitted, discovers
+        /// servicrab.toml by walking up from the current directory.
+        #[arg(long, short = 'c')]
+        config: Option<std::path::PathBuf>,
+
+        /// Print machine-readable JSON instead of a table.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Stop the background daemon and every service it supervises.
+    /// Linux and macOS only.
+    Down {
+        /// Path to the configuration file.  If omitted, discovers
+        /// servicrab.toml by walking up from the current directory.
+        #[arg(long, short = 'c')]
+        config: Option<std::path::PathBuf>,
+    },
+
+    /// Supervise the stack in the foreground while serving the daemon socket.
+    /// This is what `start` runs in the background; use it directly under
+    /// systemd, launchd or a container.  Linux and macOS only.
+    Daemon {
+        /// Path to the configuration file.  If omitted, discovers
+        /// servicrab.toml by walking up from the current directory.
+        #[arg(long, short = 'c')]
+        config: Option<std::path::PathBuf>,
+
+        /// Never restart services, whatever their configured policy says.
+        #[arg(long, default_value_t = false)]
+        no_restart: bool,
+    },
 }
 
 fn main() {
@@ -153,6 +203,9 @@ fn main() {
     let default_filter = match cli.command {
         Commands::Run { .. } => "servicrab_core=info",
         Commands::Up { .. } => "error",
+        // The daemon's log file is the only trace it leaves, so it keeps the
+        // full lifecycle history.
+        Commands::Daemon { .. } => "servicrab=info,servicrab_core=info",
         _ => "warn",
     };
     tracing_subscriber::fmt()
@@ -193,6 +246,14 @@ fn main() {
                 abort_on_failure,
             },
         ),
+        Commands::Start { config, no_restart } => {
+            commands::daemon::start(config.as_deref(), no_restart)
+        }
+        Commands::Status { config, json } => commands::daemon::status(config.as_deref(), json),
+        Commands::Down { config } => commands::daemon::down(config.as_deref()),
+        Commands::Daemon { config, no_restart } => {
+            commands::daemon::daemon(config.as_deref(), no_restart)
+        }
         Commands::Logs {
             services,
             config,

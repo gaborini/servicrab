@@ -27,6 +27,7 @@ pub mod event;
 pub mod health;
 pub mod logs;
 pub mod plan;
+pub mod status;
 
 #[cfg(unix)]
 pub mod stack;
@@ -54,6 +55,7 @@ pub use plan::{known_services, lookup_service, plan_stack};
 pub use stack::{
     Readiness, ServiceReport, ServiceResult, StackOptions, StackOutcome, StackSupervisor,
 };
+pub use status::{Health, ServiceStatus, StatusRegistry};
 
 /// Sending half of a shutdown channel.
 ///

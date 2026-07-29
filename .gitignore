@@ -25,5 +25,8 @@
 # servicrab generated config (don't commit a personal config)
 servicrab.toml
 
+# servicrab runtime state (socket, pidfile, captured logs)
+.servicrab/
+
 # Temporary files
 /tmp/

@@ -14,6 +14,13 @@ pub const DIM: &str = "\x1b[2m";
 /// Bold text.
 pub const BOLD: &str = "\x1b[1m";
 
+/// Green, for healthy/running things.
+pub const GREEN: &str = "\x1b[32m";
+/// Yellow, for transient states.
+pub const YELLOW: &str = "\x1b[33m";
+/// Red, for failures.
+pub const RED: &str = "\x1b[31m";
+
 /// The colours cycled through when prefixing service output.
 pub const SERVICE_COLORS: [&str; 6] = [
     "\x1b[36m", // cyan
