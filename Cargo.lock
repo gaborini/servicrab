@@ -564,6 +564,7 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "clap",
+ "nix",
  "predicates",
  "serde",
  "serde_json",
