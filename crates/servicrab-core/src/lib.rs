@@ -43,6 +43,7 @@ pub use lifecycle::{
 pub use load::{discover_config, load, resolve_config_path};
 pub use runtime::{
     event_channel, plan_stack, EventKind, EventReceiver, EventSender, EventSink, ForegroundRunner,
-    LogRouter, LogWriter, OutputMode, RunOptions, RunOutcome, ServiceEvent, ServiceRunner,
-    SignalWatcher, StackOptions, StackOutcome, StackSupervisor, Stream,
+    Health, LogRouter, LogWriter, OutputMode, RunOptions, RunOutcome, ServiceEvent, ServiceRunner,
+    ServiceStatus, SignalWatcher, StackOptions, StackOutcome, StackSupervisor, StatusRegistry,
+    Stream,
 };
