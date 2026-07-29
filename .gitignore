@@ -1,0 +1,29 @@
+# Rust build artifacts
+/target/
+
+# Cargo lock (keep for binaries, ignore for libraries — we keep it for the workspace)
+# Cargo.lock  ← intentionally tracked
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Linux
+*.o
+*.so
+
+# Environment files
+.env
+.env.local
+
+# servicrab generated config (don't commit a personal config)
+servicrab.toml
+
+# Temporary files
+/tmp/
