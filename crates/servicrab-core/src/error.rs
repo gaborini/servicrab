@@ -160,3 +160,119 @@ impl std::fmt::Display for ConfigWarning {
         }
     }
 }
+
+// ── Runtime errors ─────────────────────────────────────────────────────────
+
+/// An error raised while supervising a service process.
+///
+/// Every variant carries the affected service name so that the CLI can report
+/// failures without needing extra context.
+#[derive(Debug, Error)]
+pub enum RuntimeError {
+    /// The requested service is not defined in the configuration.
+    #[error("unknown service {service:?}; known services: {known}")]
+    UnknownService {
+        /// The service name that was requested.
+        service: String,
+        /// Comma-separated list of configured service names.
+        known: String,
+    },
+
+    /// The configured executable could not be spawned.
+    #[error("service {service:?}: failed to spawn {executable:?}: {source}")]
+    SpawnFailed {
+        /// Affected service.
+        service: String,
+        /// The executable that could not be started.
+        executable: String,
+        /// Underlying OS error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A signal handler could not be installed.
+    #[error("service {service:?}: failed to register handler for {signal}: {source}")]
+    SignalRegistrationFailed {
+        /// Affected service.
+        service: String,
+        /// The signal whose handler could not be installed.
+        signal: &'static str,
+        /// Underlying OS error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A signal could not be delivered to the service's process group.
+    #[error("service {service:?}: failed to send {signal} to process group {pgid}: {source}")]
+    SignalDeliveryFailed {
+        /// Affected service.
+        service: String,
+        /// The signal that could not be delivered.
+        signal: String,
+        /// Target process-group id.
+        pgid: i32,
+        /// Underlying OS error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Waiting for the child process failed.
+    #[error("service {service:?}: failed to wait for child process: {source}")]
+    WaitFailed {
+        /// Affected service.
+        service: String,
+        /// Underlying OS error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The child could not be placed into its own process group.
+    #[error("service {service:?}: failed to set up a process group: {source}")]
+    ProcessGroupSetupFailed {
+        /// Affected service.
+        service: String,
+        /// Underlying OS error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The forced `SIGKILL` escalation after the shutdown timeout failed.
+    #[error("service {service:?}: failed to force-kill process group {pgid} after {timeout:?}: {source}")]
+    ForceKillFailed {
+        /// Affected service.
+        service: String,
+        /// Target process-group id.
+        pgid: i32,
+        /// The shutdown timeout that elapsed before escalation.
+        timeout: Duration,
+        /// Underlying OS error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The service exhausted its restart budget.
+    #[error("service {service:?}: giving up after {attempts} restart attempt(s)")]
+    RestartLimitExhausted {
+        /// Affected service.
+        service: String,
+        /// Number of restarts that were performed.
+        attempts: u32,
+    },
+
+    /// The lifecycle state machine rejected a transition.
+    #[error("service {service:?}: {source}")]
+    InvalidTransition {
+        /// Affected service.
+        service: String,
+        /// The rejected transition.
+        #[source]
+        source: crate::lifecycle::InvalidTransition,
+    },
+
+    /// The foreground runner is not available on this platform.
+    #[error("service {service:?}: the foreground runner is only supported on Linux and macOS")]
+    UnsupportedPlatform {
+        /// Affected service.
+        service: String,
+    },
+}

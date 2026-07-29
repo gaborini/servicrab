@@ -5,6 +5,8 @@
 //! - `servicrab init [--path PATH] [--force]` — create example config
 //! - `servicrab check [--config PATH]` — validate config, print summary
 //! - `servicrab list [--config PATH] [--json]` — list services
+//! - `servicrab run <SERVICE> [--config PATH] [--no-restart]` — run one
+//!   service in the foreground (Linux/macOS)
 //!
 //! ## Future phases (TODOs)
 //!
@@ -65,6 +67,22 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+
+    /// Run a single configured service in the foreground, applying its
+    /// restart and shutdown policy.  Linux and macOS only.
+    Run {
+        /// Name of the service to run, as defined in [services.<name>].
+        service: String,
+
+        /// Path to the configuration file.  If omitted, discovers
+        /// servicrab.toml by walking up from the current directory.
+        #[arg(long, short = 'c')]
+        config: Option<std::path::PathBuf>,
+
+        /// Never restart the service, whatever the configured policy says.
+        #[arg(long, default_value_t = false)]
+        no_restart: bool,
+    },
 }
 
 fn main() {
@@ -80,14 +98,24 @@ fn main() {
 
     let cli = Cli::parse();
 
+    // Commands return the process exit code to use; `0` means success.
     let result = match cli.command {
-        Commands::Init { path, force } => commands::init::run(&path, force),
-        Commands::Check { config } => commands::check::run(config.as_deref()),
-        Commands::List { config, json } => commands::list::run(config.as_deref(), json),
+        Commands::Init { path, force } => commands::init::run(&path, force).map(|()| 0),
+        Commands::Check { config } => commands::check::run(config.as_deref()).map(|()| 0),
+        Commands::List { config, json } => commands::list::run(config.as_deref(), json).map(|()| 0),
+        Commands::Run {
+            service,
+            config,
+            no_restart,
+        } => commands::run::run(&service, config.as_deref(), no_restart),
     };
 
-    if let Err(e) = result {
-        eprintln!("error: {e}");
-        std::process::exit(1);
+    match result {
+        Ok(0) => {}
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
     }
 }

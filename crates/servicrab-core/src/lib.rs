@@ -17,8 +17,7 @@
 //!
 //! - TODO(phase-2): Add `HealthCheck` configuration (HTTP probe, command
 //!   probe, interval, retries).
-//! - TODO(phase-2): Add `ServiceState` machine transitions and a
-//!   process-table abstraction for the background daemon.
+//! - TODO(phase-2): Add a process-table abstraction for the background daemon.
 //! - TODO(phase-3): Support `include` directives to split large configs
 //!   across multiple files.
 
@@ -28,12 +27,17 @@ pub mod graph;
 pub mod lifecycle;
 pub mod load;
 pub mod raw;
+pub mod runtime;
 pub mod validation;
 
 // Convenience re-exports.
 pub use config::{
     Config, Project, ProjectName, RestartPolicy, Service, ServiceName, ShutdownSignal,
 };
-pub use error::{ConfigError, ConfigWarning};
-pub use lifecycle::ServiceState;
+pub use error::{ConfigError, ConfigWarning, RuntimeError};
+pub use lifecycle::{
+    ExitReason, InvalidTransition, ProcessOutcome, RestartDecision, RestartTracker, ServiceState,
+    ShutdownReason, StateMachine,
+};
 pub use load::{discover_config, load, resolve_config_path};
+pub use runtime::{ForegroundRunner, RunOptions, RunOutcome};
