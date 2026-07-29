@@ -1,22 +1,19 @@
 //! `servicrab` — a lightweight cross-platform process supervisor.
 //!
-//! # Architecture notes
+//! ## Subcommands
 //!
-//! The CLI is intentionally thin: it delegates all business logic to
-//! `servicrab-core` and uses `tokio` only for the `run` subcommand where we
-//! need async process I/O.
+//! - `servicrab init [--path PATH] [--force]` — create example config
+//! - `servicrab check [--config PATH]` — validate config, print summary
+//! - `servicrab list [--config PATH] [--json]` — list services
 //!
 //! ## Future phases (TODOs)
 //!
-//! - TODO(phase-2): Add `servicrab start` / `stop` / `restart` commands that
-//!   talk to a background daemon over a Unix socket.
-//! - TODO(phase-2): Add `servicrab status` to show a rich process table.
-//! - TODO(phase-2): Add `servicrab logs <service>` to stream logs from the
-//!   daemon.
-//! - TODO(phase-3): Add `servicrab up` / `down` for whole-stack lifecycle.
-//! - TODO(phase-3): Add `servicrab watch` to restart services on file changes.
+//! - TODO(phase-2): Add `start` / `stop` / `restart` commands that talk to
+//!   a background daemon over a Unix socket.
+//! - TODO(phase-2): Add `status` to show a rich process table.
+//! - TODO(phase-2): Add `logs <service>` to stream logs from the daemon.
+//! - TODO(phase-3): Add `up` / `down` for whole-stack lifecycle.
 
-use anyhow::Context;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
@@ -36,41 +33,46 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Generate an example servicrab.toml in the current directory.
-    Init,
+    /// Create a documented example servicrab.toml in the current directory
+    /// (or the path specified by --path).
+    Init {
+        /// Where to write the config file.
+        #[arg(long, default_value = "servicrab.toml")]
+        path: std::path::PathBuf,
 
-    /// Parse and validate a servicrab.toml configuration file.
+        /// Overwrite the file if it already exists.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+
+    /// Load and validate a servicrab.toml; print project name, service count,
+    /// start order, and any warnings.
     Check {
-        /// Path to the configuration file.
-        #[arg(default_value = "servicrab.toml")]
-        config: std::path::PathBuf,
+        /// Path to the configuration file.  If omitted, discovers
+        /// servicrab.toml by walking up from the current directory.
+        #[arg(long, short = 'c')]
+        config: Option<std::path::PathBuf>,
     },
 
-    /// List services defined in a servicrab.toml configuration file.
+    /// List all services defined in a servicrab.toml.
     List {
-        /// Path to the configuration file.
-        #[arg(default_value = "servicrab.toml")]
-        config: std::path::PathBuf,
-    },
+        /// Path to the configuration file.  If omitted, discovers
+        /// servicrab.toml by walking up from the current directory.
+        #[arg(long, short = 'c')]
+        config: Option<std::path::PathBuf>,
 
-    /// Run a single service in the foreground, forwarding its stdout/stderr.
-    Run {
-        /// Name of the service to run (as defined in [services.<name>]).
-        service: String,
-
-        /// Path to the configuration file.
-        #[arg(default_value = "servicrab.toml")]
-        config: std::path::PathBuf,
+        /// Output in JSON format instead of the human-readable table.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() {
     // Initialise structured logging.  The log level can be overridden via the
     // RUST_LOG environment variable (e.g. `RUST_LOG=debug servicrab list`).
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
         )
         .with_target(false)
         .compact()
@@ -78,12 +80,14 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    match cli.command {
-        Commands::Init => commands::init::run().context("init failed"),
-        Commands::Check { config } => commands::check::run(&config).context("check failed"),
-        Commands::List { config } => commands::list::run(&config).context("list failed"),
-        Commands::Run { service, config } => commands::run::run(&service, &config)
-            .await
-            .context("run failed"),
+    let result = match cli.command {
+        Commands::Init { path, force } => commands::init::run(&path, force),
+        Commands::Check { config } => commands::check::run(config.as_deref()),
+        Commands::List { config, json } => commands::list::run(config.as_deref(), json),
+    };
+
+    if let Err(e) = result {
+        eprintln!("error: {e}");
+        std::process::exit(1);
     }
 }

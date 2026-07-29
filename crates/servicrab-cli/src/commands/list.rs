@@ -1,55 +1,105 @@
-//! `servicrab list [config]` — list configured services.
+//! `servicrab list [--config PATH] [--json]` — list configured services.
 
 use std::path::Path;
 
-use anyhow::Context;
-use servicrab_core::{config::Config, validation::validate};
+use serde::Serialize;
+use servicrab_core::{load, resolve_config_path, Service, ServiceName};
 
 /// Run the `list` subcommand.
-pub fn run(config_path: &Path) -> anyhow::Result<()> {
-    let raw = std::fs::read_to_string(config_path)
-        .with_context(|| format!("could not read {}", config_path.display()))?;
+pub fn run(config: Option<&Path>, json: bool) -> Result<(), String> {
+    let path = resolve_config_path(config).map_err(|e| format!("could not find config: {e}"))?;
 
-    let cfg: Config = Config::from_toml_str(&raw)
-        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+    let (cfg, _) = load(&path).map_err(|errors| {
+        let msgs: Vec<String> = errors.iter().map(|e| format!("  • {e}")).collect();
+        format!(
+            "✗ {} has {} error(s):\n{}",
+            path.display(),
+            errors.len(),
+            msgs.join("\n")
+        )
+    })?;
 
-    if let Err(errors) = validate(&cfg) {
-        eprintln!("✗ {} has {} error(s):", config_path.display(), errors.len());
-        for err in &errors {
-            eprintln!("  • {err}");
-        }
-        anyhow::bail!("configuration validation failed");
-    }
-
-    println!("Project: {}", cfg.project.name);
-    println!();
-
-    if cfg.services.is_empty() {
-        println!("No services defined.");
-        return Ok(());
-    }
-
-    // Sort by name for deterministic output.
-    let mut names: Vec<&String> = cfg.services.keys().collect();
-    names.sort();
-
-    println!("{:<20} {:<12} COMMAND", "NAME", "RESTART");
-    println!("{}", "-".repeat(60));
-
-    for name in names {
-        let svc = &cfg.services[name];
-        let cmd_preview = if svc.command.len() > 35 {
-            format!("{}…", &svc.command[..34])
-        } else {
-            svc.command.clone()
-        };
-        println!(
-            "{:<20} {:<12} {}",
-            name,
-            svc.restart.to_string(),
-            cmd_preview
-        );
+    if json {
+        print_json(&cfg.services);
+    } else {
+        print_table(&cfg.services, &cfg.project.name.to_string());
     }
 
     Ok(())
+}
+
+// ── JSON output ────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct ServiceJson<'a> {
+    name: &'a str,
+    command: Vec<&'a str>,
+    cwd: String,
+    depends_on: Vec<&'a str>,
+    autostart: bool,
+    restart: &'a str,
+}
+
+fn print_json(services: &std::collections::BTreeMap<ServiceName, Service>) {
+    let list: Vec<ServiceJson<'_>> = services
+        .values()
+        .map(|svc| {
+            let mut cmd = vec![svc.executable.as_str()];
+            cmd.extend(svc.args.iter().map(String::as_str));
+            ServiceJson {
+                name: svc.name.as_str(),
+                command: cmd,
+                cwd: svc.cwd.display().to_string(),
+                depends_on: svc.depends_on.iter().map(|n| n.as_str()).collect(),
+                autostart: svc.autostart,
+                restart: match svc.restart {
+                    servicrab_core::RestartPolicy::Never => "never",
+                    servicrab_core::RestartPolicy::OnFailure => "on-failure",
+                    servicrab_core::RestartPolicy::Always => "always",
+                },
+            }
+        })
+        .collect();
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&list).expect("JSON serialization")
+    );
+}
+
+// ── Human-readable table ───────────────────────────────────────────────────
+
+fn print_table(services: &std::collections::BTreeMap<ServiceName, Service>, project: &str) {
+    println!("Project: {project}");
+    println!();
+
+    if services.is_empty() {
+        println!("No services defined.");
+        return;
+    }
+
+    println!("{:<24} {:<12} {:<8} COMMAND", "NAME", "RESTART", "AUTO");
+    println!("{}", "─".repeat(72));
+
+    for svc in services.values() {
+        let mut cmd_parts = vec![svc.executable.as_str()];
+        cmd_parts.extend(svc.args.iter().map(String::as_str));
+        let cmd_str = cmd_parts.join(" ");
+        let cmd_preview = if cmd_str.len() > 30 {
+            format!("{}…", &cmd_str[..29])
+        } else {
+            cmd_str
+        };
+        println!(
+            "{:<24} {:<12} {:<8} {}",
+            svc.name.as_str(),
+            svc.restart.to_string(),
+            if svc.autostart { "yes" } else { "no" },
+            cmd_preview
+        );
+        if !svc.depends_on.is_empty() {
+            let deps: Vec<&str> = svc.depends_on.iter().map(|n| n.as_str()).collect();
+            println!("  depends on: {}", deps.join(", "));
+        }
+    }
 }
