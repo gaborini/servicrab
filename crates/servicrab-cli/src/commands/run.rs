@@ -6,9 +6,8 @@
 
 use std::path::Path;
 
-use servicrab_core::runtime::{RunOptions, RunOutcome};
+use servicrab_core::runtime::{lookup_service, OutputMode, RunOptions, RunOutcome};
 use servicrab_core::{load, resolve_config_path, ExitReason, ForegroundRunner, ShutdownReason};
-use servicrab_core::{RuntimeError, ServiceName};
 
 /// Exit code used when a run is cut short by Ctrl+C (`128 + SIGINT`).
 const EXIT_SIGINT: i32 = 130;
@@ -33,9 +32,12 @@ pub fn run(service: &str, config: Option<&Path>, no_restart: bool) -> Result<i32
         eprintln!("⚠  {warning}");
     }
 
-    let service = lookup(&cfg, service).map_err(|e| e.to_string())?;
+    let service = lookup_service(&cfg, service).map_err(|e| e.to_string())?;
 
-    let options = RunOptions { no_restart };
+    let options = RunOptions {
+        no_restart,
+        output: OutputMode::Inherit,
+    };
     let mut runner = ForegroundRunner::new(service, options);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -49,35 +51,6 @@ pub fn run(service: &str, config: Option<&Path>, no_restart: bool) -> Result<i32
     }
 }
 
-/// Find a service by name, producing a structured error listing the known
-/// services when it does not exist.
-fn lookup<'a>(
-    cfg: &'a servicrab_core::Config,
-    requested: &str,
-) -> Result<&'a servicrab_core::Service, RuntimeError> {
-    cfg.services
-        .iter()
-        .find(|(name, _)| name.as_str() == requested)
-        .map(|(_, svc)| svc)
-        .ok_or_else(|| RuntimeError::UnknownService {
-            service: requested.to_string(),
-            known: known_services(&cfg.services),
-        })
-}
-
-fn known_services(
-    services: &std::collections::BTreeMap<ServiceName, servicrab_core::Service>,
-) -> String {
-    if services.is_empty() {
-        return "(none)".to_string();
-    }
-    services
-        .keys()
-        .map(|n| n.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 /// Map a terminal [`RunOutcome`] to a process exit code.
 fn exit_code(outcome: RunOutcome) -> i32 {
     match outcome {
@@ -89,7 +62,7 @@ fn exit_code(outcome: RunOutcome) -> i32 {
         RunOutcome::Stopped { reason } => match reason {
             ShutdownReason::UserInterrupt => EXIT_SIGINT,
             ShutdownReason::Terminated => EXIT_SIGTERM,
-            ShutdownReason::RestartLimit => 1,
+            ShutdownReason::RestartLimit | ShutdownReason::StackFailure => 1,
         },
     }
 }

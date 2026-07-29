@@ -40,4 +40,8 @@ pub use lifecycle::{
     ShutdownReason, StateMachine,
 };
 pub use load::{discover_config, load, resolve_config_path};
-pub use runtime::{ForegroundRunner, RunOptions, RunOutcome};
+pub use runtime::{
+    event_channel, plan_stack, EventKind, EventReceiver, EventSender, EventSink, ForegroundRunner,
+    OutputMode, RunOptions, RunOutcome, ServiceEvent, ServiceRunner, SignalWatcher, StackOptions,
+    StackOutcome, StackSupervisor, Stream,
+};

@@ -192,6 +192,9 @@ pub enum ShutdownReason {
     Terminated,
     /// The restart limit was exhausted.
     RestartLimit,
+    /// Another service in the stack failed and the whole stack is being torn
+    /// down (`up --abort-on-failure`).
+    StackFailure,
 }
 
 impl ShutdownReason {
@@ -211,6 +214,7 @@ impl std::fmt::Display for ShutdownReason {
             ShutdownReason::UserInterrupt => write!(f, "interrupted by user"),
             ShutdownReason::Terminated => write!(f, "supervisor terminated"),
             ShutdownReason::RestartLimit => write!(f, "restart limit exhausted"),
+            ShutdownReason::StackFailure => write!(f, "another service failed"),
         }
     }
 }
