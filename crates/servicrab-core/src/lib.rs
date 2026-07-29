@@ -32,7 +32,8 @@ pub mod validation;
 
 // Convenience re-exports.
 pub use config::{
-    Config, Project, ProjectName, RestartPolicy, Service, ServiceName, ShutdownSignal,
+    Config, HealthCheck, HealthProbe, Project, ProjectName, RestartPolicy, Service, ServiceName,
+    ShutdownSignal, UnhealthyAction,
 };
 pub use error::{ConfigError, ConfigWarning, RuntimeError};
 pub use lifecycle::{

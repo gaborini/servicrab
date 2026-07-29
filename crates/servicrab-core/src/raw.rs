@@ -93,6 +93,52 @@ pub struct RawService {
     /// signal before forcibly killing it.  Defaults to `"10s"`.
     #[serde(default)]
     pub shutdown_timeout: Option<String>,
+
+    /// Optional health check (`[services.<name>.health]`).
+    #[serde(default)]
+    pub health: Option<RawHealthCheck>,
+}
+
+/// Raw health-check configuration (`[services.<name>.health]`).
+///
+/// Exactly one of `command`, `http` or `tcp` must be set.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawHealthCheck {
+    /// Command probe: first element is the executable, rest are arguments.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+
+    /// HTTP probe: an `http://host[:port][/path]` URL.
+    #[serde(default)]
+    pub http: Option<String>,
+
+    /// TCP probe: a `host:port` address.
+    #[serde(default)]
+    pub tcp: Option<String>,
+
+    /// Delay between probes.  Defaults to `"2s"`.
+    #[serde(default)]
+    pub interval: Option<String>,
+
+    /// Per-probe timeout.  Defaults to `"5s"`.
+    #[serde(default)]
+    pub timeout: Option<String>,
+
+    /// Consecutive failures tolerated before the service is unhealthy.
+    /// Defaults to `3`.
+    #[serde(default)]
+    pub retries: Option<u32>,
+
+    /// Grace period after start during which failures do not count.
+    /// Defaults to `"0s"`.
+    #[serde(default)]
+    pub start_period: Option<String>,
+
+    /// What to do when the service becomes unhealthy: `restart` (default) or
+    /// `ignore`.
+    #[serde(default)]
+    pub on_unhealthy: Option<String>,
 }
 
 /// Raw restart-policy string token.

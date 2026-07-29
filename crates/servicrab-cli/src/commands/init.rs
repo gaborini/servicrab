@@ -39,6 +39,19 @@ name = "my-project"
 #   stable_after          Consider stable after running this long (default: 60s)
 #   shutdown_signal       term | int | quit | hup  (default: term)
 #   shutdown_timeout      Wait this long before forcibly killing (default: 10s)
+#
+# Optional [services.<name>.health] block — exactly one probe:
+#   command       Probe command; exit code 0 means healthy
+#   http          Plain-HTTP URL that must answer 2xx/3xx, e.g. "http://127.0.0.1:3000/health"
+#   tcp           "host:port" that must accept a connection
+#   interval      Delay between probes (default: 2s)
+#   timeout       Per-probe timeout (default: 5s)
+#   retries       Consecutive failures before unhealthy (default: 3)
+#   start_period  Grace period after start (default: 0s)
+#   on_unhealthy  restart | ignore (default: restart)
+#
+# Services that depend on a health-checked service wait for its first
+# successful probe instead of just for its process to be up.
 
 [services.api]
 command = ["echo", "Replace me with your API server command"]
@@ -55,6 +68,11 @@ PORT = "3000"
 [services.db]
 command = ["echo", "Replace me with your database command"]
 restart = "always"
+
+# [services.db.health]
+# tcp = "127.0.0.1:5432"
+# interval = "2s"
+# start_period = "5s"
 
 [services.worker]
 command = ["echo", "Replace me with your worker command"]

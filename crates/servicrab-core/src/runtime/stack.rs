@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::{Config, Service, ServiceName};
 use crate::error::RuntimeError;
-use crate::lifecycle::{ServiceState, ShutdownReason};
+use crate::lifecycle::{ExitReason, ServiceState, ShutdownReason};
 use crate::runtime::event::{event_channel, EventKind, EventSender, EventSink, ServiceEvent};
 use crate::runtime::unix::ServiceRunner;
 use crate::runtime::{
@@ -133,7 +133,7 @@ impl<'a> StackSupervisor<'a> {
         };
 
         let (report_tx, mut report_rx) = mpsc::unbounded_channel::<ServiceReport>();
-        let mut states: BTreeMap<ServiceName, watch::Receiver<ServiceState>> = BTreeMap::new();
+        let mut states: BTreeMap<ServiceName, watch::Receiver<Readiness>> = BTreeMap::new();
         let mut stops: BTreeMap<ServiceName, crate::runtime::ShutdownTx> = BTreeMap::new();
         let mut handles: BTreeMap<ServiceName, JoinHandle<()>> = BTreeMap::new();
 
@@ -143,12 +143,12 @@ impl<'a> StackSupervisor<'a> {
             };
             let service = Arc::new(service.clone());
 
-            let (state_tx, state_rx) = watch::channel(ServiceState::Pending);
+            let (state_tx, state_rx) = watch::channel(Readiness::Pending);
             let (stop_tx, stop_rx) = shutdown_channel();
 
             // Dependencies always appear earlier in the plan, so their state
             // channels already exist.
-            let deps: Vec<(ServiceName, watch::Receiver<ServiceState>)> = service
+            let deps: Vec<(ServiceName, watch::Receiver<Readiness>)> = service
                 .depends_on
                 .iter()
                 .filter_map(|dep| states.get(dep).map(|rx| (dep.clone(), rx.clone())))
@@ -261,12 +261,27 @@ enum DependencyWait {
     Shutdown(ShutdownReason),
 }
 
+/// Whether a service can be depended on yet.
+///
+/// This is a coarser signal than [`ServiceState`]: dependents do not care
+/// about backoff or restarts, only about "can I start now", "keep waiting" and
+/// "this will never happen".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readiness {
+    /// Not available yet; keep waiting.
+    Pending,
+    /// Available: dependents may start.
+    Ready,
+    /// It will never become available.
+    Gone,
+}
+
 /// Supervise one service: wait for its dependencies, then run it.
 #[allow(clippy::too_many_arguments)]
 async fn supervise_service(
     service: Arc<Service>,
-    deps: Vec<(ServiceName, watch::Receiver<ServiceState>)>,
-    state: watch::Sender<ServiceState>,
+    deps: Vec<(ServiceName, watch::Receiver<Readiness>)>,
+    readiness: watch::Sender<Readiness>,
     mut stop: ShutdownRx,
     events: EventSender,
     options: RunOptions,
@@ -283,7 +298,7 @@ async fn supervise_service(
                     dependency: dependency.clone(),
                 },
             ));
-            let _ = state.send(ServiceState::Failed);
+            let _ = readiness.send(Readiness::Gone);
             let _ = reports.send(ServiceReport {
                 service: name,
                 result: ServiceResult::Skipped { dependency },
@@ -291,7 +306,7 @@ async fn supervise_service(
             return;
         }
         DependencyWait::Shutdown(reason) => {
-            let _ = state.send(ServiceState::Stopped);
+            let _ = readiness.send(Readiness::Gone);
             let _ = reports.send(ServiceReport {
                 service: name,
                 result: ServiceResult::Finished(RunOutcome::Stopped { reason }),
@@ -300,15 +315,18 @@ async fn supervise_service(
         }
     }
 
-    // Relay the runner's events to the stack-wide stream while mirroring state
-    // changes into the watch channel that dependents are waiting on.
+    // Relay the runner's events to the stack-wide stream while deriving the
+    // readiness signal that dependents are waiting on.
     let (tx, mut rx) = event_channel();
     let relay = {
         let global = events.clone();
+        // A service with a health check is only ready once a probe passes;
+        // without one, "the process is up" is the best signal available.
+        let mut tracker = ReadinessTracker::new(service.health.is_some());
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
-                if let EventKind::State(next) = &event.kind {
-                    let _ = state.send(*next);
+                if let Some(next) = tracker.observe(&event.kind) {
+                    let _ = readiness.send(next);
                 }
                 let _ = global.send(event);
             }
@@ -343,22 +361,80 @@ async fn supervise_service(
     });
 }
 
+/// Derives the readiness signal dependents wait on from a service's events.
+struct ReadinessTracker {
+    /// Whether the service promised a health check, in which case being up is
+    /// not enough to be ready.
+    gate_on_health: bool,
+    /// Whether the current process run is known to be unhealthy.
+    unhealthy: bool,
+}
+
+impl ReadinessTracker {
+    fn new(gate_on_health: bool) -> Self {
+        Self {
+            gate_on_health,
+            unhealthy: false,
+        }
+    }
+
+    /// Map one runtime event to the readiness it implies, if any.
+    fn observe(&mut self, kind: &EventKind) -> Option<Readiness> {
+        match kind {
+            // A passing health probe always means ready.
+            EventKind::Healthy => {
+                self.unhealthy = false;
+                Some(Readiness::Ready)
+            }
+            // A failing one takes readiness away again, so a dependent that
+            // has not started yet keeps waiting for the service to recover.
+            EventKind::Unhealthy { .. } => {
+                self.unhealthy = true;
+                Some(Readiness::Pending)
+            }
+            EventKind::Exited {
+                reason: ExitReason::Unhealthy,
+                ..
+            } => {
+                self.unhealthy = true;
+                None
+            }
+            EventKind::State(state) => match state {
+                // A restart gets a clean slate: the new process has to prove
+                // itself healthy again.
+                ServiceState::Starting => {
+                    self.unhealthy = false;
+                    None
+                }
+                // The process is up: enough on its own, unless the service
+                // promised a health check that has not passed yet.
+                ServiceState::Running if !self.gate_on_health => Some(Readiness::Ready),
+                // A one-shot dependency (a migration, a build step) that
+                // already did its job counts as available — unless it was
+                // stopped precisely because it was unhealthy.
+                ServiceState::Exited if !self.unhealthy => Some(Readiness::Ready),
+                ServiceState::Exited | ServiceState::Failed | ServiceState::Stopped => {
+                    Some(Readiness::Gone)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
 /// Wait until every dependency is available (or will never be).
 async fn wait_for_dependencies(
-    deps: &[(ServiceName, watch::Receiver<ServiceState>)],
+    deps: &[(ServiceName, watch::Receiver<Readiness>)],
     stop: &mut ShutdownRx,
 ) -> DependencyWait {
     for (name, receiver) in deps {
         let mut receiver = receiver.clone();
         loop {
             match *receiver.borrow_and_update() {
-                // Running: the process is up.  Exited: a one-shot dependency
-                // (a migration, a build step) already did its job.
-                ServiceState::Running | ServiceState::Exited => break,
-                ServiceState::Failed | ServiceState::Stopped => {
-                    return DependencyWait::Blocked(name.clone())
-                }
-                _ => {}
+                Readiness::Ready => break,
+                Readiness::Gone => return DependencyWait::Blocked(name.clone()),
+                Readiness::Pending => {}
             }
 
             tokio::select! {
@@ -422,8 +498,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dependencies_are_awaited_until_running() {
-        let (tx, rx) = watch::channel(ServiceState::Pending);
+    async fn dependencies_are_awaited_until_ready() {
+        let (tx, rx) = watch::channel(Readiness::Pending);
         let (_stop_tx, mut stop_rx) = shutdown_channel();
         let deps = vec![(name("db"), rx)];
 
@@ -436,19 +512,18 @@ mod tests {
         });
 
         tokio::task::yield_now().await;
-        tx.send(ServiceState::Starting).expect("receiver alive");
-        tx.send(ServiceState::Running).expect("receiver alive");
+        tx.send(Readiness::Ready).expect("receiver alive");
 
         assert!(waiter.await.expect("task"));
     }
 
     #[tokio::test]
     async fn a_failed_dependency_blocks_the_dependent() {
-        let (tx, rx) = watch::channel(ServiceState::Pending);
+        let (tx, rx) = watch::channel(Readiness::Pending);
         let (_stop_tx, mut stop_rx) = shutdown_channel();
         let deps = vec![(name("db"), rx)];
 
-        tx.send(ServiceState::Failed).expect("receiver alive");
+        tx.send(Readiness::Gone).expect("receiver alive");
 
         assert!(matches!(
             wait_for_dependencies(&deps, &mut stop_rx).await,
@@ -456,9 +531,88 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn readiness_follows_the_process_when_there_is_no_health_check() {
+        let mut tracker = ReadinessTracker::new(false);
+        assert_eq!(
+            tracker.observe(&EventKind::State(ServiceState::Running)),
+            Some(Readiness::Ready)
+        );
+        assert_eq!(
+            tracker.observe(&EventKind::State(ServiceState::Backoff)),
+            None
+        );
+        assert_eq!(
+            tracker.observe(&EventKind::State(ServiceState::Failed)),
+            Some(Readiness::Gone)
+        );
+    }
+
+    #[test]
+    fn a_health_checked_service_is_only_ready_once_a_probe_passes() {
+        let mut tracker = ReadinessTracker::new(true);
+        assert_eq!(
+            tracker.observe(&EventKind::State(ServiceState::Running)),
+            None
+        );
+        assert_eq!(tracker.observe(&EventKind::Healthy), Some(Readiness::Ready));
+        assert_eq!(
+            tracker.observe(&EventKind::Unhealthy {
+                message: "boom".to_string()
+            }),
+            Some(Readiness::Pending)
+        );
+    }
+
+    #[test]
+    fn a_one_shot_dependency_counts_as_ready_once_it_exits() {
+        for gate in [false, true] {
+            let mut tracker = ReadinessTracker::new(gate);
+            assert_eq!(
+                tracker.observe(&EventKind::State(ServiceState::Exited)),
+                Some(Readiness::Ready)
+            );
+        }
+    }
+
+    #[test]
+    fn a_service_stopped_for_being_unhealthy_never_becomes_available() {
+        let mut tracker = ReadinessTracker::new(true);
+        assert_eq!(
+            tracker.observe(&EventKind::Unhealthy {
+                message: "boom".to_string()
+            }),
+            Some(Readiness::Pending)
+        );
+        assert_eq!(
+            tracker.observe(&EventKind::Exited {
+                reason: ExitReason::Unhealthy,
+                uptime: Duration::from_secs(1),
+            }),
+            None
+        );
+        assert_eq!(
+            tracker.observe(&EventKind::State(ServiceState::Exited)),
+            Some(Readiness::Gone)
+        );
+    }
+
+    #[test]
+    fn a_restart_resets_the_unhealthy_verdict() {
+        let mut tracker = ReadinessTracker::new(true);
+        tracker.observe(&EventKind::Unhealthy {
+            message: "boom".to_string(),
+        });
+        assert_eq!(
+            tracker.observe(&EventKind::State(ServiceState::Starting)),
+            None
+        );
+        assert_eq!(tracker.observe(&EventKind::Healthy), Some(Readiness::Ready));
+    }
+
     #[tokio::test]
     async fn shutdown_interrupts_the_dependency_wait() {
-        let (_tx, rx) = watch::channel(ServiceState::Pending);
+        let (_tx, rx) = watch::channel(Readiness::Pending);
         let (stop_tx, mut stop_rx) = shutdown_channel();
         let deps = vec![(name("db"), rx)];
 

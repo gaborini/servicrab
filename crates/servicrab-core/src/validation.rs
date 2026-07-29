@@ -8,11 +8,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::{
-    Config, Project, ProjectName, RestartPolicy, Service, ServiceName, ShutdownSignal,
+    Config, HealthCheck, HealthProbe, Project, ProjectName, RestartPolicy, Service, ServiceName,
+    ShutdownSignal, UnhealthyAction,
 };
 use crate::error::{ConfigError, ConfigWarning};
 use crate::graph::topological_sort;
-use crate::raw::{RawConfig, RawRestartPolicy};
+use crate::raw::{RawConfig, RawHealthCheck, RawRestartPolicy};
 
 /// The only supported schema version.
 const SUPPORTED_VERSION: u32 = 1;
@@ -165,6 +166,11 @@ pub fn validate_raw(
             &mut errors,
         );
 
+        let health = raw_svc
+            .health
+            .as_ref()
+            .and_then(|raw_health| validate_health(raw_health, raw_name, &mut errors));
+
         // restart_max_delay >= restart_delay
         if restart_max_delay < restart_delay {
             errors.push(ConfigError::RestartMaxDelayTooSmall {
@@ -225,6 +231,7 @@ pub fn validate_raw(
                 stable_after,
                 shutdown_signal,
                 shutdown_timeout,
+                health,
             },
         );
     }
@@ -488,6 +495,221 @@ fn parse_duration_field(
     dur
 }
 
+// ── Health-check validation ────────────────────────────────────────────────
+
+/// Validate a `[services.<name>.health]` table.
+///
+/// Returns `None` (after pushing errors) when the table is unusable.
+fn validate_health(
+    raw: &RawHealthCheck,
+    service: &str,
+    errors: &mut Vec<ConfigError>,
+) -> Option<HealthCheck> {
+    let declared: Vec<&'static str> = [
+        raw.command.is_some().then_some("command"),
+        raw.http.is_some().then_some("http"),
+        raw.tcp.is_some().then_some("tcp"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    let probe = match declared.as_slice() {
+        [] => {
+            errors.push(ConfigError::MissingHealthProbe {
+                service: service.to_string(),
+            });
+            None
+        }
+        [_] => build_probe(raw, service, errors),
+        _ => {
+            errors.push(ConfigError::ConflictingHealthProbes {
+                service: service.to_string(),
+                probes: declared.join(", "),
+            });
+            None
+        }
+    };
+
+    let interval = parse_duration_field(
+        raw.interval.as_deref(),
+        "health.interval",
+        Duration::from_secs(2),
+        service,
+        DUR_100MS,
+        DUR_1H,
+        errors,
+    );
+    let timeout = parse_duration_field(
+        raw.timeout.as_deref(),
+        "health.timeout",
+        Duration::from_secs(5),
+        service,
+        DUR_100MS,
+        DUR_1H,
+        errors,
+    );
+    let start_period = parse_duration_field(
+        raw.start_period.as_deref(),
+        "health.start_period",
+        Duration::ZERO,
+        service,
+        Duration::ZERO,
+        DUR_24H,
+        errors,
+    );
+
+    let on_unhealthy = match raw.on_unhealthy.as_deref() {
+        None | Some("restart") => UnhealthyAction::Restart,
+        Some("ignore") => UnhealthyAction::Ignore,
+        Some(other) => {
+            errors.push(ConfigError::InvalidUnhealthyAction {
+                service: service.to_string(),
+                value: other.to_string(),
+            });
+            UnhealthyAction::Restart
+        }
+    };
+
+    // `retries` is the number of consecutive failures needed to declare the
+    // service unhealthy, so it is always at least one probe.
+    let retries = raw.retries.unwrap_or(3).max(1);
+
+    Some(HealthCheck {
+        probe: probe?,
+        interval,
+        timeout,
+        retries,
+        start_period,
+        on_unhealthy,
+    })
+}
+
+/// Build the probe described by the (single) probe field that was set.
+fn build_probe(
+    raw: &RawHealthCheck,
+    service: &str,
+    errors: &mut Vec<ConfigError>,
+) -> Option<HealthProbe> {
+    let invalid =
+        |field: &'static str, value: &str, reason: &str| ConfigError::InvalidHealthProbe {
+            service: service.to_string(),
+            field,
+            value: value.to_string(),
+            reason: reason.to_string(),
+        };
+
+    if let Some(command) = &raw.command {
+        let Some(executable) = command.first() else {
+            errors.push(invalid("command", "", "the command must not be empty"));
+            return None;
+        };
+        if executable.is_empty() || command.iter().any(|part| part.contains('\0')) {
+            errors.push(invalid(
+                "command",
+                executable,
+                "the executable must not be empty and no argument may contain a NUL byte",
+            ));
+            return None;
+        }
+        return Some(HealthProbe::Command {
+            executable: executable.clone(),
+            args: command[1..].to_vec(),
+        });
+    }
+
+    if let Some(url) = &raw.http {
+        return match parse_http_url(url) {
+            Ok(probe) => Some(probe),
+            Err(reason) => {
+                errors.push(invalid("http", url, &reason));
+                None
+            }
+        };
+    }
+
+    if let Some(addr) = &raw.tcp {
+        return match parse_host_port(addr) {
+            Ok((host, port)) => Some(HealthProbe::Tcp { host, port }),
+            Err(reason) => {
+                errors.push(invalid("tcp", addr, &reason));
+                None
+            }
+        };
+    }
+
+    None
+}
+
+/// Parse an `http://host[:port][/path]` URL into an [`HealthProbe::Http`].
+///
+/// Only plaintext HTTP is supported; use a `command` probe (e.g. `curl`) for
+/// anything that needs TLS, redirects or authentication.
+fn parse_http_url(url: &str) -> Result<HealthProbe, String> {
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| match url.split_once("://") {
+            Some(("https", _)) => {
+                "https is not supported; use a `command` probe such as `curl -fsS <url>`"
+                    .to_string()
+            }
+            _ => "the URL must start with `http://`".to_string(),
+        })?;
+
+    let (authority, path) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, "/"),
+    };
+    if authority.contains('@') {
+        return Err("credentials in the URL are not supported".to_string());
+    }
+
+    let (host, port) = match parse_host_port(authority) {
+        Ok(hp) => hp,
+        Err(_) if !authority.contains(':') => {
+            if authority.is_empty() {
+                return Err("the URL has no host".to_string());
+            }
+            (authority.to_string(), 80)
+        }
+        Err(reason) => return Err(reason),
+    };
+
+    Ok(HealthProbe::Http {
+        url: url.to_string(),
+        host,
+        port,
+        path: path.to_string(),
+    })
+}
+
+/// Parse a `host:port` pair, accepting `[::1]:port` for IPv6 literals.
+fn parse_host_port(addr: &str) -> Result<(String, u16), String> {
+    let (host, port) = if let Some(rest) = addr.strip_prefix('[') {
+        let (host, rest) = rest
+            .split_once(']')
+            .ok_or_else(|| "unterminated IPv6 literal".to_string())?;
+        let port = rest
+            .strip_prefix(':')
+            .ok_or_else(|| "expected `[host]:port`".to_string())?;
+        (host, port)
+    } else {
+        addr.rsplit_once(':')
+            .ok_or_else(|| "expected `host:port`".to_string())?
+    };
+
+    if host.is_empty() {
+        return Err("the host must not be empty".to_string());
+    }
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("{port:?} is not a valid port number"))?;
+    if port == 0 {
+        return Err("the port must not be zero".to_string());
+    }
+    Ok((host.to_string(), port))
+}
+
 // ── Shutdown signal parsing ────────────────────────────────────────────────
 
 fn parse_shutdown_signal(
@@ -558,11 +780,251 @@ mod tests {
     }
 
     /// Like `load_from_str` but expects exactly one error.
-    #[allow(dead_code)]
     fn expect_one_error(toml: &str) -> ConfigError {
         let errs = load_from_str(toml).unwrap_err();
         assert_eq!(errs.len(), 1, "expected 1 error, got: {errs:?}");
         errs.into_iter().next().unwrap()
+    }
+
+    // ── Health checks ──────────────────────────────────────────────────────
+
+    /// A config with a single service carrying the given `[health]` body.
+    fn with_health(body: &str) -> String {
+        format!(
+            r#"
+version = 1
+[project]
+name = "p"
+[services.api]
+command = ["echo", "hi"]
+[services.api.health]
+{body}
+"#
+        )
+    }
+
+    #[test]
+    fn a_health_check_defaults_are_applied() {
+        let (cfg, _) = load_from_str(&with_health(r#"tcp = "127.0.0.1:5432""#)).unwrap();
+        let health = cfg
+            .services
+            .values()
+            .next()
+            .unwrap()
+            .health
+            .clone()
+            .unwrap();
+        assert_eq!(
+            health.probe,
+            HealthProbe::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: 5432
+            }
+        );
+        assert_eq!(health.interval, Duration::from_secs(2));
+        assert_eq!(health.timeout, Duration::from_secs(5));
+        assert_eq!(health.retries, 3);
+        assert_eq!(health.start_period, Duration::ZERO);
+        assert_eq!(health.on_unhealthy, UnhealthyAction::Restart);
+    }
+
+    #[test]
+    fn a_health_check_can_override_every_field() {
+        let toml = with_health(
+            r#"command = ["curl", "-fsS", "http://localhost/health"]
+interval = "500ms"
+timeout = "1s"
+retries = 7
+start_period = "10s"
+on_unhealthy = "ignore""#,
+        );
+        let (cfg, _) = load_from_str(&toml).unwrap();
+        let health = cfg
+            .services
+            .values()
+            .next()
+            .unwrap()
+            .health
+            .clone()
+            .unwrap();
+        assert_eq!(
+            health.probe,
+            HealthProbe::Command {
+                executable: "curl".to_string(),
+                args: vec!["-fsS".to_string(), "http://localhost/health".to_string()],
+            }
+        );
+        assert_eq!(health.interval, Duration::from_millis(500));
+        assert_eq!(health.timeout, Duration::from_secs(1));
+        assert_eq!(health.retries, 7);
+        assert_eq!(health.start_period, Duration::from_secs(10));
+        assert_eq!(health.on_unhealthy, UnhealthyAction::Ignore);
+    }
+
+    #[test]
+    fn an_http_probe_is_split_into_host_port_and_path() {
+        let (cfg, _) = load_from_str(&with_health(
+            r#"http = "http://127.0.0.1:8080/healthz?full=1""#,
+        ))
+        .unwrap();
+        let health = cfg
+            .services
+            .values()
+            .next()
+            .unwrap()
+            .health
+            .clone()
+            .unwrap();
+        assert_eq!(
+            health.probe,
+            HealthProbe::Http {
+                url: "http://127.0.0.1:8080/healthz?full=1".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+                path: "/healthz?full=1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_http_probe_defaults_to_port_80_and_root() {
+        let (cfg, _) = load_from_str(&with_health(r#"http = "http://example.test""#)).unwrap();
+        let health = cfg
+            .services
+            .values()
+            .next()
+            .unwrap()
+            .health
+            .clone()
+            .unwrap();
+        assert_eq!(
+            health.probe,
+            HealthProbe::Http {
+                url: "http://example.test".to_string(),
+                host: "example.test".to_string(),
+                port: 80,
+                path: "/".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn https_health_urls_are_rejected_with_a_hint() {
+        let err = expect_one_error(&with_health(r#"http = "https://example.test/health""#));
+        let msg = err.to_string();
+        assert!(msg.contains("https is not supported"), "{msg}");
+    }
+
+    #[test]
+    fn a_health_table_without_a_probe_is_rejected() {
+        let err = expect_one_error(&with_health(r#"interval = "1s""#));
+        assert!(
+            matches!(err, ConfigError::MissingHealthProbe { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_health_table_with_two_probes_is_rejected() {
+        let err = expect_one_error(&with_health(
+            r#"tcp = "127.0.0.1:5432"
+http = "http://127.0.0.1:8080/""#,
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("http, tcp"), "{msg}");
+    }
+
+    #[test]
+    fn a_malformed_tcp_probe_is_rejected() {
+        for (addr, needle) in [
+            (r#"tcp = "127.0.0.1""#, "expected `host:port`"),
+            (r#"tcp = "127.0.0.1:0""#, "must not be zero"),
+            (r#"tcp = "127.0.0.1:https""#, "not a valid port"),
+            (r#"tcp = ":5432""#, "host must not be empty"),
+        ] {
+            let err = expect_one_error(&with_health(addr));
+            let msg = err.to_string();
+            assert!(msg.contains(needle), "{addr}: {msg}");
+        }
+    }
+
+    #[test]
+    fn an_ipv6_tcp_probe_is_accepted() {
+        let (cfg, _) = load_from_str(&with_health(r#"tcp = "[::1]:6379""#)).unwrap();
+        let health = cfg
+            .services
+            .values()
+            .next()
+            .unwrap()
+            .health
+            .clone()
+            .unwrap();
+        assert_eq!(
+            health.probe,
+            HealthProbe::Tcp {
+                host: "::1".to_string(),
+                port: 6379
+            }
+        );
+    }
+
+    #[test]
+    fn an_empty_probe_command_is_rejected() {
+        let err = expect_one_error(&with_health("command = []"));
+        assert!(
+            matches!(err, ConfigError::InvalidHealthProbe { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_on_unhealthy_action_is_rejected() {
+        let err = expect_one_error(&with_health(
+            r#"tcp = "127.0.0.1:5432"
+on_unhealthy = "explode""#,
+        ));
+        assert!(
+            matches!(err, ConfigError::InvalidUnhealthyAction { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_health_interval_is_rejected() {
+        let err = expect_one_error(&with_health(
+            r#"tcp = "127.0.0.1:5432"
+interval = "10ms""#,
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("health.interval"), "{msg}");
+    }
+
+    #[test]
+    fn zero_retries_are_normalised_to_one() {
+        let (cfg, _) = load_from_str(&with_health(
+            r#"tcp = "127.0.0.1:5432"
+retries = 0"#,
+        ))
+        .unwrap();
+        let health = cfg
+            .services
+            .values()
+            .next()
+            .unwrap()
+            .health
+            .clone()
+            .unwrap();
+        assert_eq!(health.retries, 1);
+    }
+
+    #[test]
+    fn an_unknown_health_field_is_rejected() {
+        let toml = with_health(
+            r#"tcp = "127.0.0.1:5432"
+retires = 3"#,
+        );
+        let raw: Result<RawConfig, _> = toml::from_str(&toml);
+        assert!(raw.is_err(), "unknown health fields must not be accepted");
     }
 
     // ── Minimal valid config ───────────────────────────────────────────────
@@ -764,6 +1226,7 @@ command = ["echo"]
                         stable_after: None,
                         shutdown_signal: None,
                         shutdown_timeout: None,
+                        health: None,
                     },
                 );
                 m
@@ -1118,6 +1581,7 @@ restart_delay = "2s"
                 stable_after: None,
                 shutdown_signal: None,
                 shutdown_timeout: None,
+                health: None,
             },
         );
         RawConfig {

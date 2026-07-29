@@ -117,6 +117,93 @@ pub struct Project {
     pub env: BTreeMap<String, String>,
 }
 
+// ── Health checks ──────────────────────────────────────────────────────────
+
+/// How a service's health is probed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case", tag = "kind")]
+pub enum HealthProbe {
+    /// Run a command; exit status `0` means healthy.
+    Command {
+        /// Executable to run.
+        executable: String,
+        /// Arguments passed to the executable.
+        args: Vec<String>,
+    },
+    /// Issue a plain `HTTP/1.1` `GET` and require a `2xx`/`3xx` response.
+    Http {
+        /// The original URL, as written in the config.
+        url: String,
+        /// Host part of the URL.
+        host: String,
+        /// Port (defaults to `80` when the URL omits it).
+        port: u16,
+        /// Request target, including any query string.
+        path: String,
+    },
+    /// Open a TCP connection to `host:port`.
+    Tcp {
+        /// Host part of the address.
+        host: String,
+        /// Port part of the address.
+        port: u16,
+    },
+}
+
+impl std::fmt::Display for HealthProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HealthProbe::Command { executable, args } => {
+                write!(f, "command {executable}")?;
+                for arg in args {
+                    write!(f, " {arg}")?;
+                }
+                Ok(())
+            }
+            HealthProbe::Http { url, .. } => write!(f, "http {url}"),
+            HealthProbe::Tcp { host, port } => write!(f, "tcp {host}:{port}"),
+        }
+    }
+}
+
+/// What the supervisor does when a service is declared unhealthy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UnhealthyAction {
+    /// Stop the process and let the restart policy decide what happens next
+    /// (default).
+    #[default]
+    Restart,
+    /// Only report the failure and keep the process running.
+    Ignore,
+}
+
+impl std::fmt::Display for UnhealthyAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UnhealthyAction::Restart => write!(f, "restart"),
+            UnhealthyAction::Ignore => write!(f, "ignore"),
+        }
+    }
+}
+
+/// Validated health-check configuration for a service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HealthCheck {
+    /// How health is probed.
+    pub probe: HealthProbe,
+    /// How long to wait between probes.
+    pub interval: Duration,
+    /// How long a single probe may take before it counts as a failure.
+    pub timeout: Duration,
+    /// Consecutive failures tolerated before the service is unhealthy.
+    pub retries: u32,
+    /// Grace period after start during which failures do not count.
+    pub start_period: Duration,
+    /// What to do once the service is declared unhealthy.
+    pub on_unhealthy: UnhealthyAction,
+}
+
 // ── Service ────────────────────────────────────────────────────────────────
 
 /// Validated configuration for a single managed service.
@@ -151,6 +238,8 @@ pub struct Service {
     pub shutdown_signal: ShutdownSignal,
     /// How long to wait for the process to exit after the shutdown signal.
     pub shutdown_timeout: Duration,
+    /// Optional health check used for readiness gating and liveness.
+    pub health: Option<HealthCheck>,
 }
 
 // ── Config ─────────────────────────────────────────────────────────────────

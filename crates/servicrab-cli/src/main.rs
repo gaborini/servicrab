@@ -122,11 +122,12 @@ fn main() {
     let cli = Cli::parse();
 
     // `run` has no other progress output, so its lifecycle transitions are
-    // logged by default.  `up` renders its own event stream, and the remaining
-    // commands are one-shot, so those stay quiet unless asked otherwise.
+    // logged by default.  `up` renders the same information from its event
+    // stream, so logging is quiet there to avoid printing everything twice.
     // Either way `RUST_LOG` wins (e.g. `RUST_LOG=debug servicrab up`).
     let default_filter = match cli.command {
         Commands::Run { .. } => "servicrab_core=info",
+        Commands::Up { .. } => "error",
         _ => "warn",
     };
     tracing_subscriber::fmt()

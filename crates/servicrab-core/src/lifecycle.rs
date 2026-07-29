@@ -60,6 +60,7 @@ impl ServiceState {
                 | (Backoff, Starting)
                 | (Backoff, Stopped)
                 | (Backoff, Failed)
+                | (Stopping, Backoff)
                 | (Stopping, Stopped)
                 | (Stopping, Exited)
                 | (Stopping, Failed)
@@ -162,6 +163,8 @@ pub enum ExitReason {
         /// resource shortage rather than a missing executable).
         retryable: bool,
     },
+    /// The process was stopped because its health check failed.
+    Unhealthy,
 }
 
 impl ExitReason {
@@ -179,6 +182,7 @@ impl std::fmt::Display for ExitReason {
             ExitReason::SpawnFailure { retryable } => {
                 write!(f, "spawn failed (retryable: {retryable})")
             }
+            ExitReason::Unhealthy => write!(f, "stopped after failing its health check"),
         }
     }
 }
@@ -195,6 +199,8 @@ pub enum ShutdownReason {
     /// Another service in the stack failed and the whole stack is being torn
     /// down (`up --abort-on-failure`).
     StackFailure,
+    /// The service failed its health check.
+    Unhealthy,
 }
 
 impl ShutdownReason {
@@ -215,6 +221,7 @@ impl std::fmt::Display for ShutdownReason {
             ShutdownReason::Terminated => write!(f, "supervisor terminated"),
             ShutdownReason::RestartLimit => write!(f, "restart limit exhausted"),
             ShutdownReason::StackFailure => write!(f, "another service failed"),
+            ShutdownReason::Unhealthy => write!(f, "failed its health check"),
         }
     }
 }
@@ -377,7 +384,7 @@ impl RestartTracker {
             },
             RestartPolicy::OnFailure => match reason {
                 ExitReason::Code(0) => false,
-                ExitReason::Code(_) | ExitReason::Signal(_) => true,
+                ExitReason::Code(_) | ExitReason::Signal(_) | ExitReason::Unhealthy => true,
                 ExitReason::SpawnFailure { retryable } => retryable,
             },
         }

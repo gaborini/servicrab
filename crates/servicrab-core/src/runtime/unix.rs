@@ -26,6 +26,7 @@ use nix::unistd::Pid;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::config::{RestartPolicy, Service, ShutdownSignal};
@@ -35,6 +36,7 @@ use crate::lifecycle::{
     StateMachine,
 };
 use crate::runtime::event::{EventKind, EventSink, Stream};
+use crate::runtime::health::{HealthMonitor, HealthSignal};
 use crate::runtime::{
     shutdown_channel, wait_for_shutdown, OutputMode, RunOptions, RunOutcome, ShutdownRx, ShutdownTx,
 };
@@ -192,6 +194,26 @@ enum Wake {
     Exited(ExitReason),
     /// A shutdown was requested.
     Signalled(ShutdownReason),
+    /// The service's health check gave up on it.
+    Unhealthy,
+}
+
+/// Wait for the health monitor to declare the service unhealthy.
+///
+/// Pends forever when the service has no health check, when failures are only
+/// reported (`on_unhealthy = "ignore"`), or once the monitor is gone: in those
+/// cases the process is only ever stopped by an exit or a shutdown request.
+async fn next_unhealthy(health: &mut Option<mpsc::UnboundedReceiver<HealthSignal>>, act: bool) {
+    match health {
+        Some(rx) if act => loop {
+            match rx.recv().await {
+                Some(signal) if signal.is_unhealthy() => return,
+                Some(_) => continue,
+                None => std::future::pending().await,
+            }
+        },
+        _ => std::future::pending().await,
+    }
 }
 
 /// SIGINT/SIGTERM handling for the current process.
@@ -427,6 +449,16 @@ impl<'a> ServiceRunner<'a> {
 
             let readers = self.spawn_readers(&mut handle);
 
+            // The monitor lives exactly as long as this process run: dropping
+            // the receiver at the end of the iteration stops the probing task.
+            let mut health = HealthMonitor::for_service(self.service, self.events.clone())
+                .map(HealthMonitor::spawn);
+            let act_on_unhealthy = self
+                .service
+                .health
+                .as_ref()
+                .is_some_and(crate::runtime::health::stops_process);
+
             self.transition(ServiceState::Running)?;
             self.emit(EventKind::Started {
                 pgid: handle.pgid(),
@@ -438,6 +470,7 @@ impl<'a> ServiceRunner<'a> {
             let wake = tokio::select! {
                 result = handle.wait(&name) => Wake::Exited(result?),
                 reason = wait_for_shutdown(shutdown) => Wake::Signalled(reason),
+                () = next_unhealthy(&mut health, act_on_unhealthy) => Wake::Unhealthy,
             };
 
             let (reason, stopped_by) = match wake {
@@ -446,6 +479,15 @@ impl<'a> ServiceRunner<'a> {
                     self.emit(EventKind::Stopping { reason: why });
                     let reason = self.shutdown(&mut handle, why, shutdown).await?;
                     (reason, Some(why))
+                }
+                // An unhealthy service is stopped like any other, but the
+                // outcome is fed to the restart policy instead of ending the
+                // supervision loop.
+                Wake::Unhealthy => {
+                    let why = ShutdownReason::Unhealthy;
+                    self.emit(EventKind::Stopping { reason: why });
+                    self.shutdown(&mut handle, why, shutdown).await?;
+                    (ExitReason::Unhealthy, None)
                 }
             };
 

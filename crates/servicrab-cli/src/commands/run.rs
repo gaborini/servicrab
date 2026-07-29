@@ -57,12 +57,14 @@ fn exit_code(outcome: RunOutcome) -> i32 {
         RunOutcome::Exited { reason, .. } => match reason {
             ExitReason::Code(code) => code,
             ExitReason::Signal(sig) => 128 + sig,
-            ExitReason::SpawnFailure { .. } => 1,
+            ExitReason::SpawnFailure { .. } | ExitReason::Unhealthy => 1,
         },
         RunOutcome::Stopped { reason } => match reason {
             ShutdownReason::UserInterrupt => EXIT_SIGINT,
             ShutdownReason::Terminated => EXIT_SIGTERM,
-            ShutdownReason::RestartLimit | ShutdownReason::StackFailure => 1,
+            ShutdownReason::RestartLimit
+            | ShutdownReason::StackFailure
+            | ShutdownReason::Unhealthy => 1,
         },
     }
 }
