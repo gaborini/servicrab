@@ -25,6 +25,7 @@ use crate::lifecycle::{ExitReason, ShutdownReason};
 pub mod event;
 #[cfg(unix)]
 pub mod health;
+pub mod logs;
 pub mod plan;
 
 #[cfg(unix)]
@@ -48,6 +49,7 @@ pub use event::{
 };
 #[cfg(unix)]
 pub use health::{HealthMonitor, HealthSignal};
+pub use logs::{LogRouter, LogWriter};
 pub use plan::{known_services, lookup_service, plan_stack};
 pub use stack::{
     Readiness, ServiceReport, ServiceResult, StackOptions, StackOutcome, StackSupervisor,

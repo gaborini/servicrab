@@ -145,6 +145,22 @@ pub enum ConfigError {
         reason: String,
     },
 
+    /// A malformed byte size in `[project.logs]`.
+    #[error("project.logs: invalid size {value:?} for field `{field}`: {reason}")]
+    InvalidSize {
+        field: &'static str,
+        value: String,
+        reason: String,
+    },
+
+    /// `[project.logs] max_files` is outside the supported range.
+    #[error("project.logs: max_files must be between 0 and 100, got {value}")]
+    InvalidMaxFiles { value: u32 },
+
+    /// The log directory could not be created.
+    #[error("project.logs: log directory {dir} could not be created: {reason}")]
+    InvalidLogDir { dir: PathBuf, reason: String },
+
     /// An unrecognised `on_unhealthy` action.
     #[error(
         "service {service:?}: unknown [health] on_unhealthy {value:?}; expected one of: restart, ignore"

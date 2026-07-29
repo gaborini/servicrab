@@ -15,6 +15,7 @@ Think of it as a minimal, zero-dependency alternative to [overmind](https://gith
 - `servicrab run <service>` — supervise a single service in the foreground with live stdout/stderr, restart policy, and process-group shutdown (Linux/macOS)
 - `servicrab up` — run your whole stack in the foreground: dependency-ordered start, interleaved and colour-prefixed output, reverse-order shutdown (Linux/macOS)
 - Health checks: `command`, `http` and `tcp` probes with readiness gating and automatic restart of unhealthy services
+- Log files: opt-in per-service capture with size-based rotation, plus `servicrab logs [-f]` to read and follow them
 - Restart policies: `never`, `on-failure`, `always`, with exponential backoff
 - Per-service environment variables and working directories
 - Dependency declarations and a deterministic start order
@@ -121,6 +122,7 @@ if you want shell semantics.
 | `servicrab list [--config PATH] [--json]` | List all services with their restart policies |
 | `servicrab run <SERVICE> [--config PATH] [--no-restart]` | Supervise one service in the foreground |
 | `servicrab up [SERVICE...] [--config PATH] [--no-restart] [--no-prefix] [--timestamps] [--abort-on-failure]` | Supervise a whole stack in the foreground |
+| `servicrab logs [SERVICE...] [--config PATH] [-f] [-n N] [--no-prefix]` | Show (and follow) the captured log files |
 
 If `--config` is omitted, Servicrab discovers `servicrab.toml` by walking up
 from the current directory.
@@ -299,7 +301,6 @@ backend, and the run is reported as failed.
 `servicrab up` supports **Linux and macOS**. Current limitations:
 
 - no background daemon: `up` runs in the foreground and stops with your shell;
-- no log files or log rotation — redirect the output yourself;
 - no `--json` event stream yet;
 - `servicrab down` does not exist yet (Ctrl+C is the way to stop a stack).
 
@@ -349,6 +350,46 @@ command = ["./scripts/queue-ok.sh"]      # healthy when it exits with code 0
 
 Failures during `start_period` never count, which gives slow starters time to
 come up without burning their retry budget.
+
+---
+
+## Log files
+
+Add a `[project.logs]` table and servicrab keeps a copy of everything its
+services write:
+
+```toml
+[project.logs]
+dir = ".servicrab/logs"   # relative paths resolve next to servicrab.toml
+max_size = "10MB"         # rotate once a file grows past this (default 10MB)
+max_files = 3             # how many rotated generations to keep (default 3)
+
+[services.noisy.logs]
+enabled = false           # this one service is not written to disk
+```
+
+Every service gets its own `<dir>/<service>.log`. When a file crosses
+`max_size` it is rotated to `<service>.log.1`, the previous `.1` becomes `.2`,
+and so on up to `max_files`; anything older is deleted. `max_files = 0` simply
+truncates the file instead of keeping history.
+
+Both `servicrab up` and `servicrab run` write these files, and neither changes
+what you see in the terminal — the files are a copy, not a redirect.
+
+Read them back with `logs`:
+
+```bash
+servicrab logs                 # last 50 lines of every service, prefixed
+servicrab logs api -n 200      # last 200 lines of one service, unprefixed
+servicrab logs -f              # follow new output (Ctrl+C to stop)
+```
+
+`logs -f` notices rotation and keeps following the fresh file. Without a
+`[project.logs]` table the command tells you how to enable capture rather than
+printing nothing.
+
+Sizes accept `B`, `KB`/`KiB`, `MB`/`MiB`, `GB`/`GiB` and `TB`/`TiB` suffixes;
+all of them are powers of 1024.
 
 ---
 
@@ -410,16 +451,20 @@ cargo test -p servicrab-core config::tests
 - [x] Readiness gating: dependents wait for a healthy dependency
 - [x] Unhealthy services are stopped and restarted by policy
 
+### Phase 1.8 (current) — Log files ✅
+- [x] Opt-in capture to `<dir>/<service>.log` with size-based rotation
+- [x] `servicrab logs [SERVICE...] [-f] [-n N]`
+- [x] Per-service opt-out via `[services.<name>.logs] enabled = false`
+
 ### Phase 2 — Background daemon
 - [ ] Background daemon process with Unix socket / named-pipe API
 - [ ] `servicrab start` / `stop` / `restart` / `status` commands
-- [ ] `servicrab logs <service>` — stream live logs
+- [ ] Live log streaming from the daemon
 
 ### Phase 3 — Stack management
 - [ ] `servicrab down` — stop a detached stack
 - [ ] `servicrab watch` — restart on file changes (à la `watchexec`)
 - [ ] `.env` file support per service
-- [ ] Health-check probes (HTTP + command)
 - [ ] Config hot-reload
 
 ### Phase 4 — Platform integration (optional)

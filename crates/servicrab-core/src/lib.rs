@@ -32,8 +32,8 @@ pub mod validation;
 
 // Convenience re-exports.
 pub use config::{
-    Config, HealthCheck, HealthProbe, Project, ProjectName, RestartPolicy, Service, ServiceName,
-    ShutdownSignal, UnhealthyAction,
+    Config, HealthCheck, HealthProbe, LogSettings, Project, ProjectName, RestartPolicy, Service,
+    ServiceName, ShutdownSignal, UnhealthyAction,
 };
 pub use error::{ConfigError, ConfigWarning, RuntimeError};
 pub use lifecycle::{
@@ -43,6 +43,6 @@ pub use lifecycle::{
 pub use load::{discover_config, load, resolve_config_path};
 pub use runtime::{
     event_channel, plan_stack, EventKind, EventReceiver, EventSender, EventSink, ForegroundRunner,
-    OutputMode, RunOptions, RunOutcome, ServiceEvent, ServiceRunner, SignalWatcher, StackOptions,
-    StackOutcome, StackSupervisor, Stream,
+    LogRouter, LogWriter, OutputMode, RunOptions, RunOutcome, ServiceEvent, ServiceRunner,
+    SignalWatcher, StackOptions, StackOutcome, StackSupervisor, Stream,
 };

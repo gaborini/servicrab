@@ -10,7 +10,7 @@ use std::path::Path;
 use servicrab_core::runtime::stack::{ServiceResult, StackOptions, StackSupervisor};
 use servicrab_core::{
     event_channel, load, plan_stack, resolve_config_path, Config, EventKind, EventReceiver,
-    ServiceName, ShutdownReason, SignalWatcher, Stream,
+    LogRouter, ServiceName, ShutdownReason, SignalWatcher, Stream,
 };
 
 use crate::style::{self, BOLD, DIM, RESET, SERVICE_COLORS};
@@ -62,6 +62,8 @@ pub fn run(services: &[String], config: Option<&Path>, options: UpOptions) -> Re
     let printer = Printer::new(&plan, options);
     printer.banner(&cfg, &plan);
 
+    let logs = crate::commands::logs::router_for(&cfg);
+
     let stack_options = StackOptions {
         no_restart: options.no_restart,
         abort_on_failure: options.abort_on_failure,
@@ -77,7 +79,7 @@ pub fn run(services: &[String], config: Option<&Path>, options: UpOptions) -> Re
         let mut shutdown = signals.subscribe();
 
         let (events_tx, events_rx) = event_channel();
-        let renderer = tokio::spawn(render(events_rx, printer));
+        let renderer = tokio::spawn(render(events_rx, printer, logs));
 
         let supervisor = StackSupervisor::new(&cfg, plan, stack_options, events_tx);
         let outcome = supervisor.run(&mut shutdown).await;
@@ -103,9 +105,19 @@ pub fn run(services: &[String], config: Option<&Path>, options: UpOptions) -> Re
     })
 }
 
-/// Drain the event stream, rendering everything as it arrives.
-async fn render(mut events: EventReceiver, printer: Printer) -> Printer {
+/// Drain the event stream, rendering everything as it arrives and copying
+/// captured output to the log files when file logging is enabled.
+async fn render(
+    mut events: EventReceiver,
+    printer: Printer,
+    mut logs: Option<LogRouter>,
+) -> Printer {
     while let Some(event) = events.recv().await {
+        if let (Some(router), EventKind::Log { line, .. }) = (logs.as_mut(), &event.kind) {
+            if let Some(problem) = router.record(&event.service, line) {
+                printer.warn(&problem);
+            }
+        }
         printer.event(&event.service, &event.kind);
     }
     printer
@@ -233,6 +245,13 @@ impl Printer {
             self.prefix(service),
             style::paint(self.color, DIM, &format!("{symbol} {message}"))
         );
+        let _ = err.flush();
+    }
+
+    /// Report a problem with the supervisor itself (not with a service).
+    fn warn(&self, message: &str) {
+        let mut err = std::io::stderr().lock();
+        let _ = writeln!(err, "⚠  {message}");
         let _ = err.flush();
     }
 

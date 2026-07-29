@@ -108,6 +108,32 @@ impl std::fmt::Display for ShutdownSignal {
 
 // ── Project ────────────────────────────────────────────────────────────────
 
+/// Validated file-logging settings.
+///
+/// File logging is opt-in: it is only active when the config declares a
+/// `[project.logs]` table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LogSettings {
+    /// Absolute directory the log files are written to.
+    pub dir: PathBuf,
+    /// Rotate a service's log file once it grows past this many bytes.
+    pub max_size: u64,
+    /// How many rotated files to keep per service.
+    pub max_files: u32,
+}
+
+impl LogSettings {
+    /// Path of the active log file for `service`.
+    pub fn file_for(&self, service: &ServiceName) -> PathBuf {
+        self.dir.join(format!("{service}.log"))
+    }
+
+    /// Path of the `n`-th rotated file for `service` (1 is the most recent).
+    pub fn rotated_file_for(&self, service: &ServiceName, n: u32) -> PathBuf {
+        self.dir.join(format!("{service}.log.{n}"))
+    }
+}
+
 /// Validated project metadata.
 #[derive(Debug, Clone, Serialize)]
 pub struct Project {
@@ -115,6 +141,8 @@ pub struct Project {
     pub name: ProjectName,
     /// Project-level environment variables (as declared in `[project.env]`).
     pub env: BTreeMap<String, String>,
+    /// File-logging settings, when `[project.logs]` was declared.
+    pub logs: Option<LogSettings>,
 }
 
 // ── Health checks ──────────────────────────────────────────────────────────
@@ -240,6 +268,9 @@ pub struct Service {
     pub shutdown_timeout: Duration,
     /// Optional health check used for readiness gating and liveness.
     pub health: Option<HealthCheck>,
+    /// Whether this service's output is written to a log file (only relevant
+    /// when the project declares `[project.logs]`).
+    pub log_to_file: bool,
 }
 
 // ── Config ─────────────────────────────────────────────────────────────────
