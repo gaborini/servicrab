@@ -13,6 +13,7 @@ serde = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+humantime = { workspace = true }
 
 [dev-dependencies]
-# nothing extra needed yet
+tempfile = "3"

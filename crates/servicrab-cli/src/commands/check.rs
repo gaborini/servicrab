@@ -1,40 +1,43 @@
-//! `servicrab check [config]` — parse and validate a `servicrab.toml`.
+//! `servicrab check [--config PATH]` — load and validate a `servicrab.toml`.
 
 use std::path::Path;
 
-use anyhow::Context;
-use servicrab_core::{config::Config, validation::validate};
-use tracing::info;
+use servicrab_core::{load, resolve_config_path};
 
 /// Run the `check` subcommand.
-pub fn run(config_path: &Path) -> anyhow::Result<()> {
-    let raw = std::fs::read_to_string(config_path)
-        .with_context(|| format!("could not read {}", config_path.display()))?;
+pub fn run(config: Option<&Path>) -> Result<(), String> {
+    let path = resolve_config_path(config).map_err(|e| format!("could not find config: {e}"))?;
 
-    let cfg: Config = Config::from_toml_str(&raw)
-        .with_context(|| format!("failed to parse {}", config_path.display()))?;
-
-    match validate(&cfg) {
-        Ok(()) => {
-            info!(
-                config = %config_path.display(),
-                services = cfg.services.len(),
-                "Configuration is valid"
-            );
+    match load(&path) {
+        Ok((cfg, warnings)) => {
+            let svc_count = cfg.services.len();
+            println!("✓ {} — project: {}", path.display(), cfg.project.name);
             println!(
-                "✓ {} is valid ({} service{}).",
-                config_path.display(),
-                cfg.services.len(),
-                if cfg.services.len() == 1 { "" } else { "s" }
+                "  {} service{}",
+                svc_count,
+                if svc_count == 1 { "" } else { "s" }
             );
+
+            let order: Vec<&str> = cfg.start_order.iter().map(|n| n.as_str()).collect();
+            println!("  start order: {}", order.join(" → "));
+
+            if !warnings.is_empty() {
+                println!("  {} warning(s):", warnings.len());
+                for w in &warnings {
+                    println!("    ⚠  {w}");
+                }
+            }
             Ok(())
         }
         Err(errors) => {
-            eprintln!("✗ {} has {} error(s):", config_path.display(), errors.len());
+            eprintln!("✗ {} has {} error(s):", path.display(), errors.len());
             for err in &errors {
                 eprintln!("  • {err}");
             }
-            anyhow::bail!("configuration validation failed");
+            Err(format!(
+                "configuration validation failed ({} error(s))",
+                errors.len()
+            ))
         }
     }
 }

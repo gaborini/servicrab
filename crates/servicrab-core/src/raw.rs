@@ -1,0 +1,113 @@
+//! Raw TOML deserialization model for `servicrab.toml`.
+//!
+//! These types are used only for parsing.  After deserializing, callers must
+//! run the validation pipeline in [`crate::validation`] to obtain the
+//! [`crate::config::Config`] runtime model.
+//!
+//! All structs use `#[serde(deny_unknown_fields)]` so that typos in field
+//! names produce a hard error rather than being silently ignored.
+
+use std::collections::BTreeMap;
+
+use serde::Deserialize;
+
+/// Top-level raw configuration, as parsed directly from `servicrab.toml`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawConfig {
+    /// Schema version; must be `1`.
+    pub version: u32,
+
+    /// Project-level metadata.
+    pub project: RawProject,
+
+    /// Service definitions.  The outer `BTreeMap` key is the service name.
+    #[serde(default)]
+    pub services: BTreeMap<String, RawService>,
+}
+
+/// Raw project metadata (`[project]`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawProject {
+    /// Project name (validated by the validation layer).
+    pub name: String,
+
+    /// Project-level environment variables.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+/// Raw service configuration (`[services.<name>]`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawService {
+    /// Command to execute: first element is the executable, rest are arguments.
+    pub command: Vec<String>,
+
+    /// Working directory (relative paths are resolved against the config
+    /// file's parent directory by the validation layer).
+    #[serde(default)]
+    pub cwd: Option<String>,
+
+    /// Service-level environment variables.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+
+    /// Services that must be started before this one.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+
+    /// Whether to start this service automatically.  Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub autostart: bool,
+
+    /// Restart policy for this service.
+    #[serde(default)]
+    pub restart: RawRestartPolicy,
+
+    /// Minimum delay before the first restart.  Defaults to `"1s"`.
+    #[serde(default)]
+    pub restart_delay: Option<String>,
+
+    /// Maximum delay between restarts (exponential-backoff ceiling).
+    /// Defaults to `"30s"`.
+    #[serde(default)]
+    pub restart_max_delay: Option<String>,
+
+    /// Maximum number of restarts before giving up.  Defaults to `10`.
+    #[serde(default)]
+    pub max_restarts: Option<u32>,
+
+    /// How long the process must run before it is considered stable.
+    /// Defaults to `"60s"`.
+    #[serde(default)]
+    pub stable_after: Option<String>,
+
+    /// Signal used to request graceful shutdown.  One of `term`, `int`,
+    /// `quit`, `hup`.  Defaults to `"term"`.
+    #[serde(default)]
+    pub shutdown_signal: Option<String>,
+
+    /// How long to wait for the service to exit after sending the shutdown
+    /// signal before forcibly killing it.  Defaults to `"10s"`.
+    #[serde(default)]
+    pub shutdown_timeout: Option<String>,
+}
+
+/// Raw restart-policy string token.
+#[derive(Debug, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RawRestartPolicy {
+    /// Never restart (default).
+    #[default]
+    Never,
+    /// Restart only on non-zero exit.
+    OnFailure,
+    /// Always restart.
+    Always,
+}
+
+fn default_true() -> bool {
+    true
+}

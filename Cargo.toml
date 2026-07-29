@@ -23,7 +23,11 @@ clap = { version = "4", features = ["derive"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.8"
+
+# Duration parsing
+humantime = "2"
 
 # Logging / tracing
 tracing = "0.1"

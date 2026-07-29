@@ -1,113 +1,72 @@
-//! Configuration models for `servicrab.toml`.
+//! Validated runtime configuration model.
 //!
-//! ## Example `servicrab.toml`
+//! These types are produced by the validation pipeline in
+//! [`crate::validation`] and are the *only* types that the CLI and the future
+//! daemon should use after the config file has been loaded.
 //!
-//! ```toml
-//! [project]
-//! name = "my-stack"
-//!
-//! [services.api]
-//! command = "cargo run --bin api"
-//! cwd = "./api"
-//! restart = "on-failure"
-//! depends_on = ["db"]
-//!
-//! [services.db]
-//! command = "postgres -D /usr/local/var/postgres"
-//! restart = "always"
-//!
-//! [services.worker]
-//! command = "python worker.py"
-//! cwd = "./worker"
-//! restart = "never"
-//!
-//! [services.worker.env]
-//! DATABASE_URL = "postgres://localhost/mydb"
-//! QUEUE_URL = "redis://localhost"
-//! ```
+//! No public constructor accepts the raw TOML model directly; all config
+//! must flow through [`crate::load::load`].
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-/// Top-level configuration parsed from `servicrab.toml`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Config {
-    /// Project-level metadata.
-    pub project: ProjectConfig,
+// ── Name newtypes ──────────────────────────────────────────────────────────
 
-    /// Map of service name → service configuration.
-    #[serde(default)]
-    pub services: HashMap<String, ServiceConfig>,
-}
+/// A validated project name.
+///
+/// Rules: 1–64 ASCII bytes, starts with an ASCII alphanumeric character,
+/// remaining characters are ASCII alphanumerics, `.`, `_`, or `-`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct ProjectName(pub(crate) String);
 
-impl Config {
-    /// Parse a [`Config`] from a TOML string.
-    ///
-    /// Returns a `toml::de::Error` on parse failure; call
-    /// [`crate::validation::validate`] afterwards to check semantic rules.
-    pub fn from_toml_str(s: &str) -> Result<Self, toml::de::Error> {
-        toml::from_str(s)
+impl ProjectName {
+    /// Return the name as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
-/// Project-level metadata (`[project]`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ProjectConfig {
-    /// Human-readable project name shown in log output.
-    pub name: String,
+impl std::fmt::Display for ProjectName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
 }
 
-/// Configuration for a single managed service (`[services.<name>]`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ServiceConfig {
-    /// Shell command (or executable path) used to start the service.
-    ///
-    /// The string is passed to the OS shell (`sh -c` on Unix, `cmd /C` on
-    /// Windows) so that shell features such as pipes and redirections work as
-    /// expected.
-    ///
-    /// TODO(phase-2): Add `args` as a separate `Vec<String>` for execvp-style
-    /// invocation without a shell.
-    pub command: String,
+/// A validated service name.
+///
+/// Rules: 1–48 ASCII bytes, starts with an ASCII alphanumeric character,
+/// remaining characters are ASCII alphanumerics, `.`, `_`, or `-`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct ServiceName(pub(crate) String);
 
-    /// Optional working directory for the process.  Defaults to the directory
-    /// that contains `servicrab.toml`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
-
-    /// Environment variables to inject into the process.
-    ///
-    /// These are *merged* with (and override) the supervisor's own environment.
-    ///
-    /// TODO(phase-2): Support `.env` file references here.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub env: HashMap<String, String>,
-
-    /// Restart policy for this service.  Defaults to [`RestartPolicy::Never`].
-    #[serde(default)]
-    pub restart: RestartPolicy,
-
-    /// Services that must be in the *running* state before this service is
-    /// started.
-    ///
-    /// TODO(phase-2): Enforce ordering in the daemon's start sequence.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub depends_on: Vec<String>,
+impl ServiceName {
+    /// Return the name as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
-/// Restart policy controlling what happens when a service process exits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+impl std::fmt::Display for ServiceName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+// ── Policy enums ───────────────────────────────────────────────────────────
+
+/// Restart policy for a service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RestartPolicy {
-    /// Never restart the process after it exits.  Useful for one-shot tasks.
+    /// Never restart the process (default).
     #[default]
     Never,
-
-    /// Restart only when the process exits with a non-zero status code.
+    /// Restart only when the process exits with a non-zero status.
     OnFailure,
-
-    /// Always restart the process, regardless of exit status.
+    /// Always restart, regardless of exit status.
     Always,
 }
 
@@ -121,103 +80,94 @@ impl std::fmt::Display for RestartPolicy {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Signal sent to a service when requesting graceful shutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShutdownSignal {
+    /// `SIGTERM` (default).
+    #[default]
+    Term,
+    /// `SIGINT`.
+    Int,
+    /// `SIGQUIT`.
+    Quit,
+    /// `SIGHUP`.
+    Hup,
+}
 
-    const MINIMAL_TOML: &str = r#"
-[project]
-name = "test-project"
-
-[services.hello]
-command = "echo hello"
-"#;
-
-    const FULL_TOML: &str = r#"
-[project]
-name = "my-stack"
-
-[services.api]
-command = "cargo run --bin api"
-cwd = "./api"
-restart = "on-failure"
-depends_on = ["db"]
-
-[services.db]
-command = "postgres -D /tmp/pg"
-restart = "always"
-
-[services.worker]
-command = "python worker.py"
-restart = "never"
-
-[services.worker.env]
-DATABASE_URL = "postgres://localhost/mydb"
-QUEUE = "redis://localhost"
-"#;
-
-    #[test]
-    fn parse_minimal_config() {
-        let cfg = Config::from_toml_str(MINIMAL_TOML).expect("parse minimal config");
-        assert_eq!(cfg.project.name, "test-project");
-        assert!(cfg.services.contains_key("hello"));
-        let svc = &cfg.services["hello"];
-        assert_eq!(svc.command, "echo hello");
-        assert_eq!(svc.restart, RestartPolicy::Never);
-        assert!(svc.env.is_empty());
-        assert!(svc.depends_on.is_empty());
+impl std::fmt::Display for ShutdownSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShutdownSignal::Term => write!(f, "term"),
+            ShutdownSignal::Int => write!(f, "int"),
+            ShutdownSignal::Quit => write!(f, "quit"),
+            ShutdownSignal::Hup => write!(f, "hup"),
+        }
     }
+}
 
-    #[test]
-    fn parse_full_config() {
-        let cfg = Config::from_toml_str(FULL_TOML).expect("parse full config");
-        assert_eq!(cfg.project.name, "my-stack");
+// ── Project ────────────────────────────────────────────────────────────────
 
-        let api = cfg.services.get("api").expect("api service");
-        assert_eq!(api.command, "cargo run --bin api");
-        assert_eq!(api.cwd.as_deref(), Some("./api"));
-        assert_eq!(api.restart, RestartPolicy::OnFailure);
-        assert_eq!(api.depends_on, vec!["db"]);
+/// Validated project metadata.
+#[derive(Debug, Clone, Serialize)]
+pub struct Project {
+    /// Validated project name.
+    pub name: ProjectName,
+    /// Project-level environment variables (as declared in `[project.env]`).
+    pub env: BTreeMap<String, String>,
+}
 
-        let db = cfg.services.get("db").expect("db service");
-        assert_eq!(db.restart, RestartPolicy::Always);
+// ── Service ────────────────────────────────────────────────────────────────
 
-        let worker = cfg.services.get("worker").expect("worker service");
-        assert_eq!(worker.restart, RestartPolicy::Never);
-        assert_eq!(
-            worker.env.get("DATABASE_URL").map(String::as_str),
-            Some("postgres://localhost/mydb")
-        );
-    }
+/// Validated configuration for a single managed service.
+#[derive(Debug, Clone, Serialize)]
+pub struct Service {
+    /// Validated service name.
+    pub name: ServiceName,
+    /// The executable to run (first element of the raw `command` list).
+    pub executable: String,
+    /// Arguments to pass to the executable (remaining elements of `command`).
+    pub args: Vec<String>,
+    /// Absolute, canonicalized working directory.
+    pub cwd: PathBuf,
+    /// Effective environment: process env + project env + service env (later
+    /// entries override earlier ones).
+    pub env: BTreeMap<String, String>,
+    /// Validated list of service names that must start before this one.
+    pub depends_on: Vec<ServiceName>,
+    /// Whether the supervisor should start this service automatically.
+    pub autostart: bool,
+    /// Restart policy.
+    pub restart: RestartPolicy,
+    /// Minimum delay before the first restart attempt.
+    pub restart_delay: Duration,
+    /// Maximum delay between restart attempts (exponential-backoff ceiling).
+    pub restart_max_delay: Duration,
+    /// Maximum number of restart attempts before giving up.
+    pub max_restarts: u32,
+    /// How long the process must run before it is considered stable.
+    pub stable_after: Duration,
+    /// Signal used to request graceful shutdown.
+    pub shutdown_signal: ShutdownSignal,
+    /// How long to wait for the process to exit after the shutdown signal.
+    pub shutdown_timeout: Duration,
+}
 
-    #[test]
-    fn restart_policy_default_is_never() {
-        let toml = r#"
-[project]
-name = "p"
-[services.s]
-command = "true"
-"#;
-        let cfg = Config::from_toml_str(toml).unwrap();
-        assert_eq!(cfg.services["s"].restart, RestartPolicy::Never);
-    }
+// ── Config ─────────────────────────────────────────────────────────────────
 
-    #[test]
-    fn parse_invalid_toml_returns_error() {
-        let result = Config::from_toml_str("this is not valid toml ][");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn missing_project_section_returns_error() {
-        let result = Config::from_toml_str("[services.foo]\ncommand = \"echo\"");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn restart_policy_display() {
-        assert_eq!(RestartPolicy::Never.to_string(), "never");
-        assert_eq!(RestartPolicy::OnFailure.to_string(), "on-failure");
-        assert_eq!(RestartPolicy::Always.to_string(), "always");
-    }
+/// Fully validated runtime configuration.
+///
+/// Obtain this via [`crate::load::load`]; do not construct it directly.
+#[derive(Debug, Clone, Serialize)]
+pub struct Config {
+    /// Absolute path to the `servicrab.toml` file that was loaded.
+    pub source_path: PathBuf,
+    /// Absolute path to the directory containing the config file.
+    pub source_dir: PathBuf,
+    /// Validated project metadata.
+    pub project: Project,
+    /// Validated services, keyed by service name (deterministic BTreeMap).
+    pub services: BTreeMap<ServiceName, Service>,
+    /// Deterministic topological start order (dependencies before dependents).
+    pub start_order: Vec<ServiceName>,
 }
