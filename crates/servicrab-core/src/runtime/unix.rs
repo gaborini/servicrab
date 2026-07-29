@@ -1,4 +1,4 @@
-//! Unix implementation of the foreground process runner.
+//! Unix implementation of the process runner.
 //!
 //! Each supervised service is placed into its own process group so that
 //! shutdown can target the whole tree, not just the direct child:
@@ -12,15 +12,21 @@
 //!
 //! Signalling only the direct child would leave `node` and `esbuild` running,
 //! so every signal is delivered with `killpg(2)`.
+//!
+//! [`ServiceRunner`] supervises exactly one service and is driven entirely by a
+//! shutdown channel, which makes it reusable both for the single-service `run`
+//! command (see [`ForegroundRunner`]) and for the multi-service stack
+//! supervisor in [`crate::runtime::stack`].
 
-use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::task::JoinHandle;
 
 use crate::config::{RestartPolicy, Service, ShutdownSignal};
 use crate::error::RuntimeError;
@@ -28,7 +34,13 @@ use crate::lifecycle::{
     ExitReason, ProcessOutcome, RestartDecision, RestartTracker, ServiceState, ShutdownReason,
     StateMachine,
 };
-use crate::runtime::{RunOptions, RunOutcome};
+use crate::runtime::event::{EventKind, EventSink, Stream};
+use crate::runtime::{
+    shutdown_channel, wait_for_shutdown, OutputMode, RunOptions, RunOutcome, ShutdownRx, ShutdownTx,
+};
+
+/// How long to wait for the output readers to drain after the child exited.
+const READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Map a validated [`ShutdownSignal`] onto the OS signal.
 fn os_signal(signal: ShutdownSignal) -> Signal {
@@ -64,7 +76,12 @@ impl ProcessHandle {
     ///
     /// The executable and its arguments are passed verbatim — no shell is
     /// involved unless the user configured a shell as the executable.
-    pub fn spawn(service: &Service) -> Result<Self, RuntimeError> {
+    pub fn spawn(service: &Service, output: OutputMode) -> Result<Self, RuntimeError> {
+        let (stdout, stderr) = match output {
+            OutputMode::Inherit => (Stdio::inherit(), Stdio::inherit()),
+            OutputMode::Capture => (Stdio::piped(), Stdio::piped()),
+        };
+
         let mut command = Command::new(&service.executable);
         command
             .args(&service.args)
@@ -72,8 +89,8 @@ impl ProcessHandle {
             .env_clear()
             .envs(&service.env)
             .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
+            .stdout(stdout)
+            .stderr(stderr)
             // Put the child into a brand-new process group whose id equals the
             // child's pid.  This is done by the standard library between fork
             // and exec via `setpgid(2)`, so no `unsafe` pre-exec hook of our
@@ -159,6 +176,7 @@ impl ProcessHandle {
 }
 
 fn exit_reason(status: std::process::ExitStatus) -> ExitReason {
+    use std::os::unix::process::ExitStatusExt;
     match (status.code(), status.signal()) {
         (Some(code), _) => ExitReason::Code(code),
         (None, Some(sig)) => ExitReason::Signal(sig),
@@ -172,19 +190,93 @@ fn exit_reason(status: std::process::ExitStatus) -> ExitReason {
 enum Wake {
     /// The child process exited on its own.
     Exited(ExitReason),
-    /// A shutdown signal was received.
+    /// A shutdown was requested.
     Signalled(ShutdownReason),
 }
 
-/// Runs a single configured service in the foreground, applying its restart
-/// policy and handling shutdown signals.
-pub struct ForegroundRunner<'a> {
+/// SIGINT/SIGTERM handling for the current process.
+///
+/// The watcher forwards every signal it sees into a shutdown channel so that
+/// one or many [`ServiceRunner`]s can react to it.  A second signal is
+/// forwarded as well, which the runners interpret as "stop waiting, kill now".
+#[derive(Debug)]
+pub struct SignalWatcher {
+    tx: ShutdownTx,
+    task: JoinHandle<()>,
+}
+
+impl SignalWatcher {
+    /// Install SIGINT and SIGTERM handlers.
+    ///
+    /// `label` only gives signal-registration errors a useful subject: a
+    /// service name for `run`, the project name for `up`.
+    pub fn install(label: &str) -> Result<Self, RuntimeError> {
+        let mut sigint = signal(SignalKind::interrupt()).map_err(|source| {
+            RuntimeError::SignalRegistrationFailed {
+                service: label.to_string(),
+                signal: "SIGINT",
+                source,
+            }
+        })?;
+        let mut sigterm = signal(SignalKind::terminate()).map_err(|source| {
+            RuntimeError::SignalRegistrationFailed {
+                service: label.to_string(),
+                signal: "SIGTERM",
+                source,
+            }
+        })?;
+
+        let (tx, _rx) = shutdown_channel();
+        let sender = tx.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let reason = tokio::select! {
+                    _ = sigint.recv() => ShutdownReason::UserInterrupt,
+                    _ = sigterm.recv() => ShutdownReason::Terminated,
+                };
+                // `send` fails only when every receiver is gone, in which case
+                // there is nothing left to shut down.
+                if sender.send(Some(reason)).is_err() {
+                    return;
+                }
+            }
+        });
+
+        Ok(Self { tx, task })
+    }
+
+    /// A fresh receiver for the shutdown channel.
+    pub fn subscribe(&self) -> ShutdownRx {
+        self.tx.subscribe()
+    }
+
+    /// A clone of the sender, for code that requests a shutdown itself (for
+    /// example when a service fails and `--abort-on-failure` is in effect).
+    pub fn sender(&self) -> ShutdownTx {
+        self.tx.clone()
+    }
+}
+
+impl Drop for SignalWatcher {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Supervises a single service process: spawning, restarting, and shutting it
+/// down.
+///
+/// The runner owns no signal handlers of its own; it reacts to a shutdown
+/// channel so that many runners can be driven together.
+pub struct ServiceRunner<'a> {
     service: &'a Service,
     tracker: RestartTracker,
     state: StateMachine,
+    output: OutputMode,
+    events: EventSink,
 }
 
-impl<'a> ForegroundRunner<'a> {
+impl<'a> ServiceRunner<'a> {
     /// Build a runner for a validated service.
     pub fn new(service: &'a Service, options: RunOptions) -> Self {
         let policy = options.effective_policy(service.restart);
@@ -192,12 +284,25 @@ impl<'a> ForegroundRunner<'a> {
             service,
             tracker: RestartTracker::from_service(service).with_policy(policy),
             state: StateMachine::new(),
+            output: options.output,
+            events: EventSink::none(),
         }
     }
 
-    /// The effective restart policy after `--no-restart` is taken into account.
+    /// Publish lifecycle events and captured output to `events`.
+    pub fn with_events(mut self, events: EventSink) -> Self {
+        self.events = events;
+        self
+    }
+
+    /// The effective restart policy after `--no-restart` is taken into
+    /// account.
     pub fn policy(&self) -> RestartPolicy {
         self.tracker.policy()
+    }
+
+    fn emit(&self, kind: EventKind) {
+        self.events.emit(&self.service.name, kind);
     }
 
     fn transition(&mut self, next: ServiceState) -> Result<(), RuntimeError> {
@@ -208,34 +313,73 @@ impl<'a> ForegroundRunner<'a> {
                 source,
             })?;
         tracing::debug!(service = %self.service.name, state = %next, "state transition");
+        self.emit(EventKind::State(next));
         Ok(())
+    }
+
+    /// Attach line readers to the child's piped output, if capturing.
+    fn spawn_readers(&self, handle: &mut ProcessHandle) -> Vec<JoinHandle<()>> {
+        if !matches!(self.output, OutputMode::Capture) {
+            return Vec::new();
+        }
+
+        let mut readers = Vec::new();
+        if let Some(stdout) = handle.child.stdout.take() {
+            readers.push(self.spawn_reader(stdout, Stream::Stdout));
+        }
+        if let Some(stderr) = handle.child.stderr.take() {
+            readers.push(self.spawn_reader(stderr, Stream::Stderr));
+        }
+        readers
+    }
+
+    fn spawn_reader<R>(&self, pipe: R, stream: Stream) -> JoinHandle<()>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
+        let events = self.events.clone();
+        let name = self.service.name.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(pipe).lines();
+            // Invalid UTF-8 ends the reader rather than the service; the
+            // process keeps running and its exit status is still reported.
+            while let Ok(Some(line)) = lines.next_line().await {
+                events.emit(&name, EventKind::Log { stream, line });
+            }
+        })
+    }
+
+    /// Wait for the output readers to finish, but never block shutdown on a
+    /// descendant that inherited the pipe and refuses to close it.
+    async fn drain_readers(readers: Vec<JoinHandle<()>>) {
+        for reader in readers {
+            if tokio::time::timeout(READER_DRAIN_TIMEOUT, reader)
+                .await
+                .is_err()
+            {
+                // The timeout dropped the JoinHandle, which detaches the task;
+                // it ends as soon as the pipe closes.
+                tracing::debug!("output reader did not finish within the drain timeout");
+            }
+        }
     }
 
     /// Run the service until it stops for good.
     ///
     /// The returned [`RunOutcome`] describes how the run finished; mapping that
     /// to a process exit code is the caller's job.
-    pub async fn run(&mut self) -> Result<RunOutcome, RuntimeError> {
+    pub async fn run(&mut self, shutdown: &mut ShutdownRx) -> Result<RunOutcome, RuntimeError> {
         let name = self.service.name.to_string();
-
-        let mut sigint = signal(SignalKind::interrupt()).map_err(|source| {
-            RuntimeError::SignalRegistrationFailed {
-                service: name.clone(),
-                signal: "SIGINT",
-                source,
-            }
-        })?;
-        let mut sigterm = signal(SignalKind::terminate()).map_err(|source| {
-            RuntimeError::SignalRegistrationFailed {
-                service: name.clone(),
-                signal: "SIGTERM",
-                source,
-            }
-        })?;
-
         let mut restarts = 0u32;
 
         loop {
+            // A shutdown that arrived before (or during) the backoff must not
+            // be overtaken by a new process.
+            if let Some(reason) = *shutdown.borrow_and_update() {
+                self.transition(ServiceState::Stopped)?;
+                return Ok(RunOutcome::Stopped { reason });
+            }
+
             self.transition(ServiceState::Starting)?;
             tracing::info!(
                 service = %name,
@@ -244,7 +388,7 @@ impl<'a> ForegroundRunner<'a> {
                 "starting service"
             );
 
-            let mut handle = match ProcessHandle::spawn(self.service) {
+            let mut handle = match ProcessHandle::spawn(self.service, self.output) {
                 Ok(handle) => handle,
                 Err(err) => {
                     // Feed the spawn failure through the restart policy so that
@@ -261,8 +405,8 @@ impl<'a> ForegroundRunner<'a> {
                         RestartDecision::Restart { delay, attempt } => {
                             tracing::warn!(service = %name, error = %err, "spawn failed");
                             self.transition(ServiceState::Backoff)?;
-                            if let Some(reason) =
-                                wait_backoff(&name, delay, attempt, &mut sigint, &mut sigterm).await
+                            self.emit(EventKind::Backoff { delay, attempt });
+                            if let Some(reason) = self.wait_backoff(delay, attempt, shutdown).await
                             {
                                 self.transition(ServiceState::Stopped)?;
                                 return Ok(RunOutcome::Stopped { reason });
@@ -272,29 +416,35 @@ impl<'a> ForegroundRunner<'a> {
                         }
                         RestartDecision::Stop | RestartDecision::Fail { .. } => {
                             let _ = self.transition(ServiceState::Failed);
+                            self.emit(EventKind::Failed {
+                                message: err.to_string(),
+                            });
                             return Err(err);
                         }
                     }
                 }
             };
 
+            let readers = self.spawn_readers(&mut handle);
+
             self.transition(ServiceState::Running)?;
+            self.emit(EventKind::Started {
+                pgid: handle.pgid(),
+            });
             tracing::info!(service = %name, pid = handle.pgid(), "service running");
 
             // The select! branches cannot borrow `handle` twice, so the wake-up
             // reason is captured first and shutdown is driven afterwards.
             let wake = tokio::select! {
                 result = handle.wait(&name) => Wake::Exited(result?),
-                _ = sigint.recv() => Wake::Signalled(ShutdownReason::UserInterrupt),
-                _ = sigterm.recv() => Wake::Signalled(ShutdownReason::Terminated),
+                reason = wait_for_shutdown(shutdown) => Wake::Signalled(reason),
             };
 
-            let (reason, shutdown) = match wake {
+            let (reason, stopped_by) = match wake {
                 Wake::Exited(reason) => (reason, None),
                 Wake::Signalled(why) => {
-                    let reason = self
-                        .shutdown(&mut handle, why, &mut sigint, &mut sigterm)
-                        .await?;
+                    self.emit(EventKind::Stopping { reason: why });
+                    let reason = self.shutdown(&mut handle, why, shutdown).await?;
                     (reason, Some(why))
                 }
             };
@@ -303,38 +453,52 @@ impl<'a> ForegroundRunner<'a> {
 
             // Sweep the group so no descendant outlives the direct child.
             handle.kill_group(&name, self.service.shutdown_timeout)?;
+            Self::drain_readers(readers).await;
 
-            if let Some(reason) = shutdown {
-                tracing::info!(service = %name, %reason, "service stopped");
+            if let Some(why) = stopped_by {
+                tracing::info!(service = %name, reason = %why, "service stopped");
                 self.transition(ServiceState::Stopped)?;
-                return Ok(RunOutcome::Stopped { reason });
+                self.emit(EventKind::Finished {
+                    summary: format!("stopped ({why}), last status: {reason}"),
+                });
+                return Ok(RunOutcome::Stopped { reason: why });
             }
 
             tracing::info!(service = %name, %reason, ?uptime, "service exited");
+            self.emit(EventKind::Exited { reason, uptime });
 
             let outcome = ProcessOutcome::new(reason, uptime);
             match self.tracker.decide(outcome, None) {
                 RestartDecision::Restart { delay, attempt } => {
                     self.transition(ServiceState::Backoff)?;
-                    if let Some(reason) =
-                        wait_backoff(&name, delay, attempt, &mut sigint, &mut sigterm).await
-                    {
+                    self.emit(EventKind::Backoff { delay, attempt });
+                    if let Some(why) = self.wait_backoff(delay, attempt, shutdown).await {
                         self.transition(ServiceState::Stopped)?;
-                        return Ok(RunOutcome::Stopped { reason });
+                        self.emit(EventKind::Finished {
+                            summary: format!("stopped ({why})"),
+                        });
+                        return Ok(RunOutcome::Stopped { reason: why });
                     }
                     restarts += 1;
                 }
                 RestartDecision::Stop => {
                     self.transition(ServiceState::Exited)?;
+                    self.emit(EventKind::Finished {
+                        summary: reason.to_string(),
+                    });
                     return Ok(RunOutcome::Exited { reason, restarts });
                 }
                 RestartDecision::Fail { reason: why } => {
                     self.transition(ServiceState::Failed)?;
                     tracing::error!(service = %name, %why, restarts, "giving up");
-                    return Err(RuntimeError::RestartLimitExhausted {
+                    let err = RuntimeError::RestartLimitExhausted {
                         service: name,
                         attempts: restarts,
+                    };
+                    self.emit(EventKind::Failed {
+                        message: err.to_string(),
                     });
+                    return Err(err);
                 }
             }
         }
@@ -346,8 +510,7 @@ impl<'a> ForegroundRunner<'a> {
         &mut self,
         handle: &mut ProcessHandle,
         reason: ShutdownReason,
-        sigint: &mut tokio::signal::unix::Signal,
-        sigterm: &mut tokio::signal::unix::Signal,
+        shutdown: &mut ShutdownRx,
     ) -> Result<ExitReason, RuntimeError> {
         let name = self.service.name.to_string();
         self.transition(ServiceState::Stopping)?;
@@ -378,12 +541,10 @@ impl<'a> ForegroundRunner<'a> {
                     }
                 }
             }
-            _ = sigint.recv() => {
-                tracing::warn!(service = %name, "second interrupt; escalating to SIGKILL");
-                true
-            }
-            _ = sigterm.recv() => {
-                tracing::warn!(service = %name, "second termination signal; escalating to SIGKILL");
+            // Any further shutdown request while we are already stopping means
+            // "do not wait any longer".
+            _ = shutdown.changed() => {
+                tracing::warn!(service = %name, "second shutdown request; escalating to SIGKILL");
                 true
             }
         };
@@ -393,22 +554,57 @@ impl<'a> ForegroundRunner<'a> {
         }
         handle.wait(&name).await
     }
+
+    /// Sleep out a restart delay, returning `Some(reason)` if a shutdown was
+    /// requested during the wait.
+    async fn wait_backoff(
+        &self,
+        delay: Duration,
+        attempt: u32,
+        shutdown: &mut ShutdownRx,
+    ) -> Option<ShutdownReason> {
+        tracing::info!(service = %self.service.name, ?delay, attempt, "restarting after backoff");
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => None,
+            reason = wait_for_shutdown(shutdown) => Some(reason),
+        }
+    }
 }
 
-/// Sleep out a restart delay, returning `Some(reason)` if a shutdown signal
-/// interrupted the wait.
-async fn wait_backoff(
-    service: &str,
-    delay: Duration,
-    attempt: u32,
-    sigint: &mut tokio::signal::unix::Signal,
-    sigterm: &mut tokio::signal::unix::Signal,
-) -> Option<ShutdownReason> {
-    tracing::info!(service = %service, ?delay, attempt, "restarting after backoff");
-    tokio::select! {
-        _ = tokio::time::sleep(delay) => None,
-        _ = sigint.recv() => Some(ShutdownReason::UserInterrupt),
-        _ = sigterm.recv() => Some(ShutdownReason::Terminated),
+/// Runs a single configured service in the foreground, installing its own
+/// SIGINT/SIGTERM handlers.
+///
+/// This is the engine behind `servicrab run`.
+pub struct ForegroundRunner<'a> {
+    runner: ServiceRunner<'a>,
+    label: String,
+}
+
+impl<'a> ForegroundRunner<'a> {
+    /// Build a runner for a validated service.
+    pub fn new(service: &'a Service, options: RunOptions) -> Self {
+        Self {
+            label: service.name.to_string(),
+            runner: ServiceRunner::new(service, options),
+        }
+    }
+
+    /// Publish lifecycle events and captured output to `events`.
+    pub fn with_events(mut self, events: EventSink) -> Self {
+        self.runner = self.runner.with_events(events);
+        self
+    }
+
+    /// The effective restart policy after `--no-restart` is taken into account.
+    pub fn policy(&self) -> RestartPolicy {
+        self.runner.policy()
+    }
+
+    /// Run the service until it stops for good.
+    pub async fn run(&mut self) -> Result<RunOutcome, RuntimeError> {
+        let signals = SignalWatcher::install(&self.label)?;
+        let mut shutdown = signals.subscribe();
+        self.runner.run(&mut shutdown).await
     }
 }
 
@@ -436,6 +632,7 @@ mod tests {
 
     #[test]
     fn exit_status_maps_to_exit_reason() {
+        use std::os::unix::process::ExitStatusExt;
         assert_eq!(
             exit_reason(std::process::ExitStatus::from_raw(0)),
             ExitReason::Code(0)

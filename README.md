@@ -13,9 +13,10 @@ Think of it as a minimal, zero-dependency alternative to [overmind](https://gith
 - `servicrab check` — validate your config before running anything
 - `servicrab list` — see all services and their restart policies at a glance
 - `servicrab run <service>` — supervise a single service in the foreground with live stdout/stderr, restart policy, and process-group shutdown (Linux/macOS)
+- `servicrab up` — run your whole stack in the foreground: dependency-ordered start, interleaved and colour-prefixed output, reverse-order shutdown (Linux/macOS)
 - Restart policies: `never`, `on-failure`, `always`, with exponential backoff
 - Per-service environment variables and working directories
-- Dependency declarations and a deterministic start order (ordering is enforced once multi-service supervision lands)
+- Dependency declarations and a deterministic start order
 
 ---
 
@@ -56,6 +57,9 @@ servicrab list
 
 # 5. Run a service in the foreground
 servicrab run api
+
+# 6. …or bring the whole stack up
+servicrab up
 ```
 
 ---
@@ -115,6 +119,7 @@ if you want shell semantics.
 | `servicrab check [--config PATH]` | Parse and validate the config file |
 | `servicrab list [--config PATH] [--json]` | List all services with their restart policies |
 | `servicrab run <SERVICE> [--config PATH] [--no-restart]` | Supervise one service in the foreground |
+| `servicrab up [SERVICE...] [--config PATH] [--no-restart] [--no-prefix] [--timestamps] [--abort-on-failure]` | Supervise a whole stack in the foreground |
 
 If `--config` is omitted, Servicrab discovers `servicrab.toml` by walking up
 from the current directory.
@@ -224,13 +229,76 @@ exits, so no descendant outlives the run.
 `servicrab run` supports **Linux and macOS**. Windows is out of scope for now;
 the command reports an unsupported-platform error there.
 
-Current limitations:
+---
 
-- one service per invocation — `depends_on` is validated but not yet acted on;
-- no background daemon, no `up` / `down`;
-- no health or readiness checks;
-- no log files or log rotation — output is inherited, so redirect it yourself;
-- no `--json` event stream yet.
+## Running a whole stack in the foreground
+
+```sh
+servicrab up                       # start every service with autostart = true
+servicrab up api                   # start `api` and everything it depends on
+servicrab up --no-restart          # ignore every configured restart policy
+servicrab up --timestamps          # prefix each line with a UTC timestamp
+servicrab up --no-prefix           # raw output, no service prefix
+servicrab up --abort-on-failure    # tear the stack down when a service fails
+```
+
+Output is interleaved and prefixed with the service name, each service getting
+its own colour:
+
+```
+servicrab up acme-stack → redis, api
+redis | ▶ started (pgid 41234)
+redis | Ready to accept connections
+api   | ▶ started (pgid 41235)
+api   | listening on 0.0.0.0:3000
+```
+
+A service's own stdout is written to Servicrab's stdout and its stderr to
+Servicrab's stderr, so `servicrab up > stack.log` keeps the two apart. Colour is
+disabled automatically when the output is not a terminal, when `NO_COLOR` is
+set, or when `TERM=dumb`.
+
+### Which services are started
+
+- with no arguments: every service with `autostart = true`;
+- with explicit names: those services only;
+- in both cases every transitive `depends_on` entry is pulled in, even when it
+  has `autostart = false`.
+
+### Start and stop ordering
+
+Services start in the configuration's deterministic topological order, and a
+service is only spawned once every service it depends on is **running**. Note
+that "running" currently means "the process was spawned" — real readiness
+probes are a later milestone, so a dependent may still need to retry its first
+connection.
+
+Shutdown happens in reverse: dependents are stopped (and fully reaped) before
+the services they depend on, each with its own `shutdown_signal` and
+`shutdown_timeout`, escalating to `SIGKILL` per service exactly as `run` does.
+
+If a dependency never comes up — it fails to spawn, or exhausts its restart
+budget — its dependents are **skipped** rather than started against a missing
+backend, and the run is reported as failed.
+
+### Exit codes for `up`
+
+| Situation | Exit code |
+|---|---|
+| Every service ended cleanly | `0` |
+| Ctrl+C (SIGINT) | `130` |
+| SIGTERM | `143` |
+| A service failed or was skipped | `1` |
+
+### Platform support and current limitations
+
+`servicrab up` supports **Linux and macOS**. Current limitations:
+
+- no background daemon: `up` runs in the foreground and stops with your shell;
+- no health or readiness checks — dependency gating is "process is up";
+- no log files or log rotation — redirect the output yourself;
+- no `--json` event stream yet;
+- `servicrab down` does not exist yet (Ctrl+C is the way to stop a stack).
 
 ---
 
@@ -282,15 +350,18 @@ cargo test -p servicrab-core config::tests
 - [x] Restart policy enforcement with exponential backoff
 - [x] Graceful shutdown with `SIGKILL` escalation
 
+### Phase 1.6 (current) — Stack runner ✅
+- [x] `servicrab up` — concurrent supervision of the whole stack
+- [x] Dependency ordering on start, reverse order on shutdown
+- [x] Interleaved, prefixed, colourised output
+
 ### Phase 2 — Background daemon
 - [ ] Background daemon process with Unix socket / named-pipe API
 - [ ] `servicrab start` / `stop` / `restart` / `status` commands
-- [ ] Dependency ordering on start
-- [ ] Concurrent supervision of the whole stack
 - [ ] `servicrab logs <service>` — stream live logs
 
 ### Phase 3 — Stack management
-- [ ] `servicrab up` / `servicrab down` — whole-stack lifecycle
+- [ ] `servicrab down` — stop a detached stack
 - [ ] `servicrab watch` — restart on file changes (à la `watchexec`)
 - [ ] `.env` file support per service
 - [ ] Health-check probes (HTTP + command)

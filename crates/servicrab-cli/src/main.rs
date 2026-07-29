@@ -7,6 +7,8 @@
 //! - `servicrab list [--config PATH] [--json]` — list services
 //! - `servicrab run <SERVICE> [--config PATH] [--no-restart]` — run one
 //!   service in the foreground (Linux/macOS)
+//! - `servicrab up [SERVICE...]` — run a whole stack in the foreground
+//!   (Linux/macOS)
 //!
 //! ## Future phases (TODOs)
 //!
@@ -14,12 +16,13 @@
 //!   a background daemon over a Unix socket.
 //! - TODO(phase-2): Add `status` to show a rich process table.
 //! - TODO(phase-2): Add `logs <service>` to stream logs from the daemon.
-//! - TODO(phase-3): Add `up` / `down` for whole-stack lifecycle.
+//! - TODO(phase-3): Add `down` for stopping a detached stack.
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 mod commands;
+mod style;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -83,20 +86,59 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         no_restart: bool,
     },
+
+    /// Run a whole stack in the foreground: start every service in dependency
+    /// order, interleave their output, and stop them in reverse order on
+    /// Ctrl+C.  Linux and macOS only.
+    Up {
+        /// Services to start.  Their dependencies are always started too.
+        /// With no names, every service with autostart = true is started.
+        services: Vec<String>,
+
+        /// Path to the configuration file.  If omitted, discovers
+        /// servicrab.toml by walking up from the current directory.
+        #[arg(long, short = 'c')]
+        config: Option<std::path::PathBuf>,
+
+        /// Never restart services, whatever their configured policy says.
+        #[arg(long, default_value_t = false)]
+        no_restart: bool,
+
+        /// Do not prefix output lines with the service name.
+        #[arg(long, default_value_t = false)]
+        no_prefix: bool,
+
+        /// Prefix output lines with a UTC timestamp.
+        #[arg(long, default_value_t = false)]
+        timestamps: bool,
+
+        /// Stop the whole stack as soon as one service fails.
+        #[arg(long, default_value_t = false)]
+        abort_on_failure: bool,
+    },
 }
 
 fn main() {
-    // Initialise structured logging.  The log level can be overridden via the
-    // RUST_LOG environment variable (e.g. `RUST_LOG=debug servicrab list`).
+    let cli = Cli::parse();
+
+    // `run` has no other progress output, so its lifecycle transitions are
+    // logged by default.  `up` renders its own event stream, and the remaining
+    // commands are one-shot, so those stay quiet unless asked otherwise.
+    // Either way `RUST_LOG` wins (e.g. `RUST_LOG=debug servicrab up`).
+    let default_filter = match cli.command {
+        Commands::Run { .. } => "servicrab_core=info",
+        _ => "warn",
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
         )
+        // Diagnostics belong on stderr; stdout is reserved for command output
+        // and for the stdout of supervised services.
+        .with_writer(std::io::stderr)
         .with_target(false)
         .compact()
         .init();
-
-    let cli = Cli::parse();
 
     // Commands return the process exit code to use; `0` means success.
     let result = match cli.command {
@@ -108,6 +150,23 @@ fn main() {
             config,
             no_restart,
         } => commands::run::run(&service, config.as_deref(), no_restart),
+        Commands::Up {
+            services,
+            config,
+            no_restart,
+            no_prefix,
+            timestamps,
+            abort_on_failure,
+        } => commands::up::run(
+            &services,
+            config.as_deref(),
+            commands::up::UpOptions {
+                no_restart,
+                no_prefix,
+                timestamps,
+                abort_on_failure,
+            },
+        ),
     };
 
     match result {
