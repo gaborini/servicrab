@@ -29,6 +29,9 @@ toml = "0.8"
 # Duration parsing
 humantime = "2"
 
+# Unix process/signal APIs (used only by the Unix runtime module)
+nix = { version = "0.31", features = ["signal", "process"] }
+
 # Logging / tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
