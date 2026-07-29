@@ -36,6 +36,39 @@ pub struct RawProject {
     /// Project-level environment variables.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+
+    /// Optional file-logging settings (`[project.logs]`).
+    #[serde(default)]
+    pub logs: Option<RawLogs>,
+}
+
+/// Raw file-logging settings (`[project.logs]`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawLogs {
+    /// Directory for the log files (relative paths resolve against the config
+    /// file's directory).  Defaults to `".servicrab/logs"`.
+    #[serde(default)]
+    pub dir: Option<String>,
+
+    /// Rotate a log file once it grows past this size, e.g. `"10MB"`.
+    /// Defaults to `"10MB"`.
+    #[serde(default)]
+    pub max_size: Option<String>,
+
+    /// How many rotated files to keep per service.  Defaults to `3`.
+    #[serde(default)]
+    pub max_files: Option<u32>,
+}
+
+/// Raw per-service logging settings (`[services.<name>.logs]`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawServiceLogs {
+    /// Whether this service's output is written to a log file.  Defaults to
+    /// `true` when `[project.logs]` is present.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 /// Raw service configuration (`[services.<name>]`).
@@ -97,6 +130,10 @@ pub struct RawService {
     /// Optional health check (`[services.<name>.health]`).
     #[serde(default)]
     pub health: Option<RawHealthCheck>,
+
+    /// Optional per-service logging settings (`[services.<name>.logs]`).
+    #[serde(default)]
+    pub logs: Option<RawServiceLogs>,
 }
 
 /// Raw health-check configuration (`[services.<name>.health]`).

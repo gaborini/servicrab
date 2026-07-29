@@ -21,6 +21,15 @@ name = "my-project"
 # [project.env]
 # RUST_LOG = "info"
 
+# ── Log files ─────────────────────────────────────────────────────────────────
+# Uncomment to keep a copy of every service's output on disk.  Files are
+# rotated once they cross max_size:  api.log -> api.log.1 -> api.log.2 ...
+# Read them back with `servicrab logs [SERVICE] [-f] [-n N]`.
+# [project.logs]
+# dir = ".servicrab/logs"   # relative to this file (default)
+# max_size = "10MB"         # rotate above this size (default)
+# max_files = 3             # rotated generations to keep (default)
+
 # ── Services ──────────────────────────────────────────────────────────────────
 # Each [services.<name>] block defines one managed process.
 #
@@ -39,6 +48,10 @@ name = "my-project"
 #   stable_after          Consider stable after running this long (default: 60s)
 #   shutdown_signal       term | int | quit | hup  (default: term)
 #   shutdown_timeout      Wait this long before forcibly killing (default: 10s)
+#
+# Optional [services.<name>.logs] block:
+#   enabled       Write this service's output to a log file (default: true,
+#                 only has an effect when [project.logs] exists)
 #
 # Optional [services.<name>.health] block — exactly one probe:
 #   command       Probe command; exit code 0 means healthy

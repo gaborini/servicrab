@@ -116,6 +116,31 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         abort_on_failure: bool,
     },
+
+    /// Show the captured log files of one or more services.  Requires a
+    /// [project.logs] section in the configuration.
+    Logs {
+        /// Services to show.  With no names, every service that writes log
+        /// files is shown.
+        services: Vec<String>,
+
+        /// Path to the configuration file.  If omitted, discovers
+        /// servicrab.toml by walking up from the current directory.
+        #[arg(long, short = 'c')]
+        config: Option<std::path::PathBuf>,
+
+        /// Keep printing new lines as they are written.
+        #[arg(long, short = 'f', default_value_t = false)]
+        follow: bool,
+
+        /// Number of trailing lines to show per service.
+        #[arg(long, short = 'n', default_value_t = 50)]
+        lines: usize,
+
+        /// Do not prefix output lines with the service name.
+        #[arg(long, default_value_t = false)]
+        no_prefix: bool,
+    },
 }
 
 fn main() {
@@ -168,6 +193,22 @@ fn main() {
                 abort_on_failure,
             },
         ),
+        Commands::Logs {
+            services,
+            config,
+            follow,
+            lines,
+            no_prefix,
+        } => commands::logs::run(
+            &services,
+            config.as_deref(),
+            commands::logs::LogsOptions {
+                follow,
+                lines,
+                no_prefix,
+            },
+        )
+        .map(|()| 0),
     };
 
     match result {

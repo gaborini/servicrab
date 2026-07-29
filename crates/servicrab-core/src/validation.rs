@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::{
-    Config, HealthCheck, HealthProbe, Project, ProjectName, RestartPolicy, Service, ServiceName,
-    ShutdownSignal, UnhealthyAction,
+    Config, HealthCheck, HealthProbe, LogSettings, Project, ProjectName, RestartPolicy, Service,
+    ServiceName, ShutdownSignal, UnhealthyAction,
 };
 use crate::error::{ConfigError, ConfigWarning};
 use crate::graph::topological_sort;
@@ -58,6 +58,13 @@ pub fn validate_raw(
 
     // ── 4. Project env ─────────────────────────────────────────────────────
     let project_env = validate_project_env(&raw.project.env, &mut errors);
+
+    // ── 4b. Project log settings ───────────────────────────────────────────
+    let logs = raw
+        .project
+        .logs
+        .as_ref()
+        .and_then(|raw_logs| validate_logs(raw_logs, &source_dir, &mut errors));
 
     // ── 5. At least one service ────────────────────────────────────────────
     if raw.services.is_empty() {
@@ -171,6 +178,8 @@ pub fn validate_raw(
             .as_ref()
             .and_then(|raw_health| validate_health(raw_health, raw_name, &mut errors));
 
+        let log_to_file = raw_svc.logs.as_ref().map_or(true, |logs| logs.enabled);
+
         // restart_max_delay >= restart_delay
         if restart_max_delay < restart_delay {
             errors.push(ConfigError::RestartMaxDelayTooSmall {
@@ -232,6 +241,7 @@ pub fn validate_raw(
                 shutdown_signal,
                 shutdown_timeout,
                 health,
+                log_to_file,
             },
         );
     }
@@ -280,6 +290,7 @@ pub fn validate_raw(
         project: Project {
             name: project_name.expect("project_name is Some when no errors"),
             env: project_env,
+            logs,
         },
         services,
         start_order,
@@ -493,6 +504,119 @@ fn parse_duration_field(
     }
 
     dur
+}
+
+// ── Log settings validation ────────────────────────────────────────────────
+
+/// Default log directory, relative to the config file.
+const DEFAULT_LOG_DIR: &str = ".servicrab/logs";
+/// Default rotation threshold.
+const DEFAULT_MAX_SIZE: u64 = 10 * 1024 * 1024;
+/// Smallest rotation threshold that still makes sense.
+const MIN_MAX_SIZE: u64 = 1024;
+/// Largest accepted rotation threshold (1 TiB).
+const MAX_MAX_SIZE: u64 = 1024 * 1024 * 1024 * 1024;
+
+/// Validate a `[project.logs]` table.
+fn validate_logs(
+    raw: &crate::raw::RawLogs,
+    source_dir: &Path,
+    errors: &mut Vec<ConfigError>,
+) -> Option<LogSettings> {
+    let dir = raw.dir.as_deref().unwrap_or(DEFAULT_LOG_DIR);
+    let dir = {
+        let candidate = PathBuf::from(dir);
+        if candidate.is_absolute() {
+            candidate
+        } else {
+            source_dir.join(candidate)
+        }
+    };
+
+    // Catching a file where a directory belongs here turns a confusing
+    // runtime write failure into a config error.
+    if dir.exists() && !dir.is_dir() {
+        errors.push(ConfigError::InvalidLogDir {
+            dir: dir.clone(),
+            reason: "exists but is not a directory".to_string(),
+        });
+        return None;
+    }
+
+    let max_size = match raw.max_size.as_deref() {
+        None => DEFAULT_MAX_SIZE,
+        Some(value) => match parse_size(value) {
+            Ok(size) if (MIN_MAX_SIZE..=MAX_MAX_SIZE).contains(&size) => size,
+            Ok(size) => {
+                errors.push(ConfigError::InvalidSize {
+                    field: "max_size",
+                    value: value.to_string(),
+                    reason: format!(
+                        "{size} bytes is outside the supported range ({MIN_MAX_SIZE} bytes to 1TB)"
+                    ),
+                });
+                DEFAULT_MAX_SIZE
+            }
+            Err(reason) => {
+                errors.push(ConfigError::InvalidSize {
+                    field: "max_size",
+                    value: value.to_string(),
+                    reason,
+                });
+                DEFAULT_MAX_SIZE
+            }
+        },
+    };
+
+    let max_files = raw.max_files.unwrap_or(3);
+    if max_files > 100 {
+        errors.push(ConfigError::InvalidMaxFiles { value: max_files });
+        return None;
+    }
+
+    Some(LogSettings {
+        dir,
+        max_size,
+        max_files,
+    })
+}
+
+/// Parse a byte size such as `"512"`, `"64KB"`, `"10 MB"` or `"1GiB"`.
+///
+/// Both SI-style (`KB`, `MB`, `GB`) and binary (`KiB`, `MiB`, `GiB`) suffixes
+/// are accepted and treated as powers of 1024, which is what people mean when
+/// they size a log file.
+pub(crate) fn parse_size(value: &str) -> Result<u64, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("the size must not be empty".to_string());
+    }
+
+    let split = trimmed
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(trimmed.len());
+    let (number, suffix) = trimmed.split_at(split);
+    let number: f64 = number
+        .parse()
+        .map_err(|_| format!("{number:?} is not a number"))?;
+    if number < 0.0 {
+        return Err("the size must not be negative".to_string());
+    }
+
+    let multiplier = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1u64,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        "t" | "tb" | "tib" => 1024u64 * 1024 * 1024 * 1024,
+        other => return Err(format!("unknown unit {other:?}; use B, KB, MB, GB or TB")),
+    };
+
+    let bytes = number * multiplier as f64;
+    if !bytes.is_finite() || bytes > u64::MAX as f64 {
+        return Err("the size is too large".to_string());
+    }
+    Ok(bytes as u64)
 }
 
 // ── Health-check validation ────────────────────────────────────────────────
@@ -784,6 +908,149 @@ mod tests {
         let errs = load_from_str(toml).unwrap_err();
         assert_eq!(errs.len(), 1, "expected 1 error, got: {errs:?}");
         errs.into_iter().next().unwrap()
+    }
+
+    // ── Log settings ───────────────────────────────────────────────────────
+
+    /// A config whose project carries the given `[project.logs]` body.
+    fn with_logs(body: &str, service_extra: &str) -> String {
+        format!(
+            r#"
+version = 1
+[project]
+name = "p"
+[project.logs]
+{body}
+[services.api]
+command = ["echo", "hi"]
+{service_extra}
+"#
+        )
+    }
+
+    /// The single service every log test declares.
+    fn api(cfg: &Config) -> &Service {
+        cfg.services.values().next().expect("one service")
+    }
+
+    #[test]
+    fn log_settings_default_to_a_project_local_directory() {
+        let (cfg, _) = load_from_str(&with_logs("", "")).unwrap();
+        let logs = cfg.project.logs.expect("logs enabled");
+
+        assert!(logs.dir.ends_with(".servicrab/logs"), "{:?}", logs.dir);
+        assert!(logs.dir.is_absolute());
+        assert_eq!(logs.max_size, 10 * 1024 * 1024);
+        assert_eq!(logs.max_files, 3);
+    }
+
+    #[test]
+    fn no_logs_table_means_no_file_logging() {
+        let (cfg, _) = load_from_str(
+            r#"
+version = 1
+[project]
+name = "p"
+[services.api]
+command = ["echo", "hi"]
+"#,
+        )
+        .unwrap();
+        assert!(cfg.project.logs.is_none());
+    }
+
+    #[test]
+    fn log_sizes_accept_si_and_binary_suffixes() {
+        assert_eq!(parse_size("512").unwrap(), 512);
+        assert_eq!(parse_size("1B").unwrap(), 1);
+        assert_eq!(parse_size("64KiB").unwrap(), 64 * 1024);
+        assert_eq!(parse_size("10 MB").unwrap(), 10 * 1024 * 1024);
+        assert_eq!(parse_size("1.5mb").unwrap(), 1024 * 1024 * 3 / 2);
+        assert_eq!(parse_size("2G").unwrap(), 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn log_sizes_reject_nonsense() {
+        assert!(parse_size("").is_err());
+        assert!(parse_size("MB").is_err());
+        assert!(parse_size("10 parsecs").is_err());
+    }
+
+    #[test]
+    fn an_unknown_size_unit_is_a_config_error() {
+        let err = expect_one_error(&with_logs(r#"max_size = "10 parsecs""#, ""));
+        assert!(
+            matches!(&err, ConfigError::InvalidSize { field, .. } if *field == "max_size"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_tiny_max_size_is_rejected() {
+        let err = expect_one_error(&with_logs(r#"max_size = "10""#, ""));
+        assert!(matches!(err, ConfigError::InvalidSize { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn too_many_rotated_files_are_rejected() {
+        let err = expect_one_error(&with_logs("max_files = 101", ""));
+        assert!(
+            matches!(err, ConfigError::InvalidMaxFiles { value: 101 }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn keeping_no_rotated_files_is_allowed() {
+        let (cfg, _) = load_from_str(&with_logs("max_files = 0", "")).unwrap();
+        assert_eq!(cfg.project.logs.unwrap().max_files, 0);
+    }
+
+    #[test]
+    fn a_service_can_opt_out_of_file_logging() {
+        let (cfg, _) =
+            load_from_str(&with_logs("", "[services.api.logs]\nenabled = false")).unwrap();
+        assert!(!api(&cfg).log_to_file);
+    }
+
+    #[test]
+    fn services_log_to_file_by_default() {
+        let (cfg, _) = load_from_str(&with_logs("", "")).unwrap();
+        assert!(api(&cfg).log_to_file);
+    }
+
+    #[test]
+    fn an_absolute_log_dir_is_used_as_is() {
+        let (cfg, _) =
+            load_from_str(&with_logs(r#"dir = "/tmp/servicrab-test-logs""#, "")).unwrap();
+        assert_eq!(
+            cfg.project.logs.unwrap().dir,
+            PathBuf::from("/tmp/servicrab-test-logs")
+        );
+    }
+
+    #[test]
+    fn a_log_file_where_a_directory_belongs_is_a_config_error() {
+        let dir = TempDir::new().unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, "hi").unwrap();
+
+        let toml = with_logs(&format!(r#"dir = "{}""#, blocker.display()), "");
+        let err = expect_one_error(&toml);
+        assert!(matches!(err, ConfigError::InvalidLogDir { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn log_files_live_next_to_each_other_per_service() {
+        let (cfg, _) = load_from_str(&with_logs("", "")).unwrap();
+        let name = api(&cfg).name.clone();
+        let logs = cfg.project.logs.unwrap();
+
+        assert_eq!(logs.file_for(&name).file_name().unwrap(), "api.log");
+        assert_eq!(
+            logs.rotated_file_for(&name, 2).file_name().unwrap(),
+            "api.log.2"
+        );
     }
 
     // ── Health checks ──────────────────────────────────────────────────────
@@ -1206,6 +1473,7 @@ command = ["echo"]
         let raw = crate::raw::RawConfig {
             version: 1,
             project: crate::raw::RawProject {
+                logs: None,
                 name: "p".into(),
                 env: Default::default(),
             },
@@ -1227,6 +1495,7 @@ command = ["echo"]
                         shutdown_signal: None,
                         shutdown_timeout: None,
                         health: None,
+                        logs: None,
                     },
                 );
                 m
@@ -1582,11 +1851,13 @@ restart_delay = "2s"
                 shutdown_signal: None,
                 shutdown_timeout: None,
                 health: None,
+                logs: None,
             },
         );
         RawConfig {
             version: 1,
             project: crate::raw::RawProject {
+                logs: None,
                 name: "p".into(),
                 env: Default::default(),
             },

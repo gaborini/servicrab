@@ -3,5 +3,6 @@
 pub mod check;
 pub mod init;
 pub mod list;
+pub mod logs;
 pub mod run;
 pub mod up;
