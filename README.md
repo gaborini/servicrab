@@ -14,6 +14,7 @@ Think of it as a minimal, zero-dependency alternative to [overmind](https://gith
 - `servicrab list` — see all services and their restart policies at a glance
 - `servicrab run <service>` — supervise a single service in the foreground with live stdout/stderr, restart policy, and process-group shutdown (Linux/macOS)
 - `servicrab up` — run your whole stack in the foreground: dependency-ordered start, interleaved and colour-prefixed output, reverse-order shutdown (Linux/macOS)
+- Health checks: `command`, `http` and `tcp` probes with readiness gating and automatic restart of unhealthy services
 - Restart policies: `never`, `on-failure`, `always`, with exponential backoff
 - Per-service environment variables and working directories
 - Dependency declarations and a deterministic start order
@@ -268,10 +269,13 @@ set, or when `TERM=dumb`.
 ### Start and stop ordering
 
 Services start in the configuration's deterministic topological order, and a
-service is only spawned once every service it depends on is **running**. Note
-that "running" currently means "the process was spawned" — real readiness
-probes are a later milestone, so a dependent may still need to retry its first
-connection.
+service is only spawned once every service it depends on is **available**:
+
+- a service without a health check is available as soon as its process is up;
+- a service **with** a health check is available only after its first
+  successful probe;
+- a one-shot dependency (a migration, a build step) that exited cleanly counts
+  as available too.
 
 Shutdown happens in reverse: dependents are stopped (and fully reaped) before
 the services they depend on, each with its own `shutdown_signal` and
@@ -295,10 +299,56 @@ backend, and the run is reported as failed.
 `servicrab up` supports **Linux and macOS**. Current limitations:
 
 - no background daemon: `up` runs in the foreground and stops with your shell;
-- no health or readiness checks — dependency gating is "process is up";
 - no log files or log rotation — redirect the output yourself;
 - no `--json` event stream yet;
 - `servicrab down` does not exist yet (Ctrl+C is the way to stop a stack).
+
+---
+
+## Health checks
+
+Any service may declare a `[services.<name>.health]` block with exactly one
+probe:
+
+```toml
+[services.db.health]
+tcp = "127.0.0.1:5432"        # healthy when the port accepts a connection
+interval = "2s"               # delay between probes          (default 2s)
+timeout = "5s"                # per-probe timeout             (default 5s)
+retries = 3                   # failures before unhealthy     (default 3)
+start_period = "10s"          # failures ignored for this long (default 0s)
+on_unhealthy = "restart"      # restart | ignore              (default restart)
+
+[services.api.health]
+http = "http://127.0.0.1:3000/healthz"   # healthy on any 2xx/3xx response
+
+[services.worker.health]
+command = ["./scripts/queue-ok.sh"]      # healthy when it exits with code 0
+```
+
+- **`command`** runs the given executable with the service's environment and
+  working directory; exit code `0` means healthy.
+- **`http`** speaks plain HTTP/1.1 — no TLS, no redirects. For anything else
+  use a `command` probe such as `["curl", "-fsS", "https://…"]`.
+- **`tcp`** succeeds as soon as a connection can be established. `[::1]:6379`
+  works for IPv6 literals.
+
+### What health checks do
+
+1. **Readiness gating.** Dependents of a health-checked service wait for its
+   first successful probe instead of merely for its process to exist. This is
+   the difference between "postgres has been spawned" and "postgres accepts
+   connections".
+2. **Liveness.** Probing continues for as long as the process runs. After
+   `retries` consecutive failures the service is declared unhealthy.
+   With the default `on_unhealthy = "restart"` the process is stopped with its
+   usual `shutdown_signal`/`shutdown_timeout` and the **restart policy**
+   decides what happens next — so `restart = "never"` means an unhealthy
+   service simply stops, while `on-failure`/`always` bring it back. Set
+   `on_unhealthy = "ignore"` to only report the failure.
+
+Failures during `start_period` never count, which gives slow starters time to
+come up without burning their retry budget.
 
 ---
 
@@ -354,6 +404,11 @@ cargo test -p servicrab-core config::tests
 - [x] `servicrab up` — concurrent supervision of the whole stack
 - [x] Dependency ordering on start, reverse order on shutdown
 - [x] Interleaved, prefixed, colourised output
+
+### Phase 1.7 (current) — Health checks ✅
+- [x] `command`, `http` and `tcp` probes
+- [x] Readiness gating: dependents wait for a healthy dependency
+- [x] Unhealthy services are stopped and restarted by policy
 
 ### Phase 2 — Background daemon
 - [ ] Background daemon process with Unix socket / named-pipe API

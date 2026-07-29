@@ -189,6 +189,19 @@ impl Printer {
                 &format!("skipped: dependency {dependency} never became available"),
             ),
             EventKind::Failed { message } => self.status(service, "✗", message),
+            EventKind::Healthy => self.status(service, "✔", "healthy"),
+            EventKind::HealthProbeFailed {
+                message,
+                consecutive,
+                retries,
+            } => self.status(
+                service,
+                "!",
+                &format!("health probe failed ({consecutive}/{retries}): {message}"),
+            ),
+            EventKind::Unhealthy { message } => {
+                self.status(service, "✗", &format!("unhealthy: {message}"))
+            }
             // State transitions and the final summary are already conveyed by
             // the events above; showing them too would only add noise.
             EventKind::State(_) | EventKind::Finished { .. } => {}

@@ -10,6 +10,17 @@ use crate::lifecycle::ShutdownReason;
 use crate::runtime::event::EventSender;
 use crate::runtime::{RunOutcome, ShutdownRx};
 
+/// Whether a service can be depended on yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readiness {
+    /// Not available yet; keep waiting.
+    Pending,
+    /// Available: dependents may start.
+    Ready,
+    /// It will never become available.
+    Gone,
+}
+
 /// Options for a stack run.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StackOptions {

@@ -123,6 +123,33 @@ pub enum ConfigError {
     /// An unrecognised shutdown signal string.
     #[error("service {service:?}: unknown shutdown_signal {value:?}; expected one of: term, int, quit, hup")]
     InvalidShutdownSignal { service: String, value: String },
+
+    /// The `[health]` table declared no probe at all.
+    #[error(
+        "service {service:?}: [health] must declare exactly one of `command`, `http` or `tcp`"
+    )]
+    MissingHealthProbe { service: String },
+
+    /// The `[health]` table declared more than one probe.
+    #[error(
+        "service {service:?}: [health] declares multiple probes ({probes}); exactly one of `command`, `http` or `tcp` is allowed"
+    )]
+    ConflictingHealthProbes { service: String, probes: String },
+
+    /// A health probe was declared but is not usable.
+    #[error("service {service:?}: invalid [health] {field} probe {value:?}: {reason}")]
+    InvalidHealthProbe {
+        service: String,
+        field: &'static str,
+        value: String,
+        reason: String,
+    },
+
+    /// An unrecognised `on_unhealthy` action.
+    #[error(
+        "service {service:?}: unknown [health] on_unhealthy {value:?}; expected one of: restart, ignore"
+    )]
+    InvalidUnhealthyAction { service: String, value: String },
 }
 
 /// A non-fatal configuration warning.

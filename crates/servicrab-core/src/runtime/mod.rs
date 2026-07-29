@@ -23,6 +23,8 @@ use crate::config::RestartPolicy;
 use crate::lifecycle::{ExitReason, ShutdownReason};
 
 pub mod event;
+#[cfg(unix)]
+pub mod health;
 pub mod plan;
 
 #[cfg(unix)]
@@ -44,8 +46,12 @@ pub use stub::{ForegroundRunner, ServiceRunner, SignalWatcher};
 pub use event::{
     event_channel, EventKind, EventReceiver, EventSender, EventSink, ServiceEvent, Stream,
 };
+#[cfg(unix)]
+pub use health::{HealthMonitor, HealthSignal};
 pub use plan::{known_services, lookup_service, plan_stack};
-pub use stack::{ServiceReport, ServiceResult, StackOptions, StackOutcome, StackSupervisor};
+pub use stack::{
+    Readiness, ServiceReport, ServiceResult, StackOptions, StackOutcome, StackSupervisor,
+};
 
 /// Sending half of a shutdown channel.
 ///

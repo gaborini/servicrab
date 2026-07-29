@@ -77,6 +77,22 @@ pub enum EventKind {
         /// A human-readable description of the final outcome.
         summary: String,
     },
+    /// The service passed its health check and is considered ready.
+    Healthy,
+    /// A health probe failed.
+    HealthProbeFailed {
+        /// Why the probe failed.
+        message: String,
+        /// How many consecutive failures have been seen so far.
+        consecutive: u32,
+        /// How many consecutive failures are tolerated.
+        retries: u32,
+    },
+    /// The service exhausted its health-check retry budget.
+    Unhealthy {
+        /// Why the last probe failed.
+        message: String,
+    },
     /// The service failed fatally.
     Failed {
         /// A human-readable description of the failure.

@@ -38,6 +38,8 @@ struct ServiceJson<'a> {
     depends_on: Vec<&'a str>,
     autostart: bool,
     restart: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    health: Option<String>,
 }
 
 fn print_json(services: &std::collections::BTreeMap<ServiceName, Service>) {
@@ -57,6 +59,7 @@ fn print_json(services: &std::collections::BTreeMap<ServiceName, Service>) {
                     servicrab_core::RestartPolicy::OnFailure => "on-failure",
                     servicrab_core::RestartPolicy::Always => "always",
                 },
+                health: svc.health.as_ref().map(|h| h.probe.to_string()),
             }
         })
         .collect();
@@ -100,6 +103,13 @@ fn print_table(services: &std::collections::BTreeMap<ServiceName, Service>, proj
         if !svc.depends_on.is_empty() {
             let deps: Vec<&str> = svc.depends_on.iter().map(|n| n.as_str()).collect();
             println!("  depends on: {}", deps.join(", "));
+        }
+        if let Some(health) = &svc.health {
+            println!(
+                "  health: {} every {}",
+                health.probe,
+                humantime::format_duration(health.interval)
+            );
         }
     }
 }
