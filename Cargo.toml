@@ -1,0 +1,38 @@
+[workspace]
+members = [
+    "crates/servicrab-cli",
+    "crates/servicrab-core",
+    "crates/servicrab-protocol",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["servicrab contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/gaborini/servicrab"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Internal crates
+servicrab-core = { path = "crates/servicrab-core" }
+servicrab-protocol = { path = "crates/servicrab-protocol" }
