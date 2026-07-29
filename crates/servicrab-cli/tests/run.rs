@@ -61,6 +61,12 @@ fn run_service(config_path: &Path, service: &str, extra: &[&str]) -> (i32, Strin
 
 /// Spawn `servicrab run <service>` in the background, capturing stdout.
 fn spawn_service(config_path: &Path, service: &str, stdout: Stdio) -> Child {
+    spawn_service_with(config_path, service, stdout, Stdio::null())
+}
+
+/// Like [`spawn_service`] but with an explicit stderr redirection, so a test
+/// can report what the supervisor said when an assertion fails.
+fn spawn_service_with(config_path: &Path, service: &str, stdout: Stdio, stderr: Stdio) -> Child {
     Command::new(binary())
         .arg("run")
         .arg(service)
@@ -68,9 +74,19 @@ fn spawn_service(config_path: &Path, service: &str, stdout: Stdio) -> Child {
         .arg(config_path)
         .env_remove("RUST_LOG")
         .stdout(stdout)
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .spawn()
         .expect("failed to spawn servicrab")
+}
+
+/// Drain a child's captured stderr without blocking forever.
+fn drain_stderr(child: &mut Child) -> String {
+    use std::io::Read;
+    let mut buf = String::new();
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut buf);
+    }
+    buf
 }
 
 /// Block until `path` exists (or the ceiling elapses).
@@ -406,15 +422,16 @@ fn interrupt_triggers_graceful_shutdown() {
         ),
     );
 
-    let mut child = spawn_service(&cfg, "sleeper", Stdio::null());
+    let mut child = spawn_service_with(&cfg, "sleeper", Stdio::null(), Stdio::piped());
     wait_for_file(&marker);
 
     kill(Pid::from_raw(child.id() as i32), Signal::SIGINT).unwrap();
     let code = wait_bounded(&mut child);
+    let stderr = drain_stderr(&mut child);
 
     // 130 == 128 + SIGINT; `restart = "always"` must not resurrect the service
     // after an explicit user shutdown.
-    assert_eq!(code, 130);
+    assert_eq!(code, 130, "supervisor said: {stderr}");
 }
 
 #[test]
@@ -440,16 +457,17 @@ fn shutdown_timeout_escalates_to_sigkill() {
         ),
     );
 
-    let mut child = spawn_service(&cfg, "stubborn", Stdio::null());
+    let mut child = spawn_service_with(&cfg, "stubborn", Stdio::null(), Stdio::piped());
     wait_for_file(&marker);
 
     let started = Instant::now();
     kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM).unwrap();
     let code = wait_bounded(&mut child);
     let elapsed = started.elapsed();
+    let stderr = drain_stderr(&mut child);
 
     // 143 == 128 + SIGTERM.
-    assert_eq!(code, 143);
+    assert_eq!(code, 143, "supervisor said: {stderr}");
     assert!(
         elapsed >= Duration::from_millis(400),
         "the supervisor should have waited out the shutdown timeout, took {elapsed:?}"

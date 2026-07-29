@@ -368,13 +368,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_tcp_probe_fails_when_nothing_listens() {
-        // Bind and immediately drop to get a port that is very likely free.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        // Port 1 is privileged, so nothing can be listening on it — unlike a
+        // just-released ephemeral port, which another test may grab.
         let probe = HealthProbe::Tcp {
             host: "127.0.0.1".to_string(),
-            port,
+            port: 1,
         };
         let err = probe_once(&probe, &ctx(), Duration::from_secs(5))
             .await
