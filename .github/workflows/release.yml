@@ -49,6 +49,13 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }} --bin servicrab
 
+      # Generated with a host build rather than the release binary: the
+      # x86_64-apple-darwin artefact is cross-compiled on an arm runner, so it
+      # cannot be executed here.  The pages come out of the clap definitions,
+      # which are the same for every target.
+      - name: Generate the man pages
+        run: cargo run --quiet --locked --bin servicrab -- man --output man
+
       - name: Package
         id: package
         run: |
@@ -58,6 +65,7 @@ jobs:
           mkdir -p "dist/${name}"
           cp "target/${{ matrix.target }}/release/servicrab" "dist/${name}/"
           cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE "dist/${name}/"
+          cp -R man "dist/${name}/man"
           tar -czf "dist/${name}.tar.gz" -C dist "${name}"
           shasum -a 256 "dist/${name}.tar.gz" | sed "s| dist/| |" > "dist/${name}.tar.gz.sha256"
           echo "archive=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"

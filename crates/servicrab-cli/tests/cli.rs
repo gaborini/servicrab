@@ -259,6 +259,69 @@ fn completions_reject_an_unknown_shell() {
     cmd().arg("completions").arg("tcsh").assert().failure();
 }
 
+// ── man ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn the_man_page_documents_every_subcommand() {
+    let output = cmd()
+        .arg("man")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+
+    assert!(text.starts_with(".ie"), "should start with roff, not text");
+    assert!(text.contains(".TH servicrab 1"), "missing the man title");
+
+    // The page is generated from the clap definitions, so a new subcommand
+    // shows up here without anyone remembering to add it.
+    for sub in [
+        "init",
+        "check",
+        "list",
+        "run",
+        "up",
+        "watch",
+        "logs",
+        "start",
+        "stop",
+        "restart",
+        "reload",
+        "events",
+        "status",
+        "down",
+        "generate",
+        "completions",
+        "man",
+        "daemon",
+    ] {
+        assert!(text.contains(sub), "the man page should mention {sub}");
+    }
+}
+
+#[test]
+fn the_man_page_has_the_hand_written_sections() {
+    let output = cmd()
+        .arg("man")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+
+    for section in [".SH FILES", ".SH ENVIRONMENT", ".SH EXIT STATUS"] {
+        assert!(text.contains(section), "the man page should have {section}");
+    }
+    assert!(text.contains("daemon.sock"), "FILES should list the socket");
+    assert!(
+        text.contains("RUST_LOG"),
+        "ENVIRONMENT should list RUST_LOG"
+    );
+}
+
 // ── env_file ───────────────────────────────────────────────────────────────
 
 #[test]

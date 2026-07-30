@@ -332,33 +332,23 @@ command = ["{0}"]
 
 // ── ordering, dependencies, shutdown ───────────────────────────────────────
 
+/// The verdict comes from the supervisor's own event stream, not from what the
+/// two service scripts manage to write to a shared file.
+///
+/// An earlier version of this test had the dependent sleep 300ms and then look
+/// for a marker file the dependency writes.  That asserts the scheduling of two
+/// shells rather than the start order: on a loaded machine the dependency's
+/// first `echo` had not run yet after 300ms, and the test failed while the
+/// supervisor had done exactly the right thing.  `started` events are emitted
+/// by the supervisor as it acts, through one channel, so their order *is* the
+/// start order.
 #[test]
 fn a_dependent_starts_only_after_its_dependency_is_up() {
     let dir = TempDir::new().unwrap();
-    let log = dir.path().join("order.txt");
-    let marker = dir.path().join("db.up");
-    // The dependency records that it is up and then stays alive.
-    script(
-        dir.path(),
-        "db.sh",
-        &format!(
-            "echo db >> {}\necho up > {}\nsleep 1",
-            log.display(),
-            marker.display()
-        ),
-    );
-    // The dependent waits out any shell start-up jitter and then checks
-    // whether the dependency really was up before it got started.
-    script(
-        dir.path(),
-        "api.sh",
-        &format!(
-            "sleep 0.3\nif [ -f {} ]; then echo api-after-db >> {}; else echo api-before-db >> {}; fi",
-            marker.display(),
-            log.display(),
-            log.display()
-        ),
-    );
+    // The dependency outlives the dependent, so a supervisor that ignored
+    // depends_on would have no reason to produce this order by accident.
+    script(dir.path(), "db.sh", "sleep 0.5");
+    script(dir.path(), "api.sh", "true");
     let cfg = config(
         dir.path(),
         &format!(
@@ -380,11 +370,16 @@ command = ["{}"]
         ),
     );
 
-    let (code, _stdout, _stderr) = up(&cfg, &[]);
-    assert_eq!(code, 0);
-    let order = fs::read_to_string(&log).expect("order log");
-    let lines: Vec<&str> = order.lines().collect();
-    assert_eq!(lines, vec!["db", "api-after-db"], "order: {order}");
+    let (code, stdout, stderr) = up(&cfg, &["--json"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+
+    let started: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["event"]["kind"] == "started")
+        .filter_map(|event| event["service"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(started, vec!["db", "api"], "{stdout}");
 }
 
 #[test]

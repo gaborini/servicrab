@@ -7,19 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `servicrab man` prints the man page in roff, or writes one page per command
+  into a directory with `--output`. Release tarballs now ship the generated
+  pages under `man/`. The pages come from the same command definitions as
+  `--help`; files, environment variables and exit codes are documented by hand
+  on the main page.
+- A dependency audit (`cargo-deny`) with the policy in `deny.toml`: RustSec
+  advisories, unmaintained crates, licences and package sources. It runs in its
+  own `Audit` workflow — on dependency changes, and weekly, because advisories
+  are published on someone else's schedule.
+- Dependabot for the cargo and github-actions ecosystems, grouped into one
+  pull request per week.
+- A CI job that compiles the workspace on Windows. Supervision is still
+  Unix-only, but the `cfg(not(unix))` stubs are now built by something other
+  than hope.
+- Community files a public repository is expected to have: `SECURITY.md`,
+  `CODE_OF_CONDUCT.md`, issue forms for bugs and features, and a pull request
+  template.
+- A CI job checks the workspace on the declared MSRV with `--locked`, so the
+  minimum supported version is verified on every push instead of being an
+  unchecked claim in the manifest.
+
 ### Changed
 
+- The daemon socket is now created with mode `0600`. It was left to the process
+  umask, which is `022` on most systems but `002` on distributions that give
+  each user a private group — and connecting to the socket is enough to start
+  and stop every service in the project.
+- CI runs clippy and the test suite with `--locked`. Without it a transitive
+  dependency could be silently upgraded, and CI would stop testing what
+  `Cargo.lock` ships.
 - The declared minimum supported Rust version is now **1.85**, up from the
   previously documented 1.75. The old number was never true: the dependency
   tree in `Cargo.lock` contains crates that require edition 2024, so a 1.75
   toolchain failed before compiling a single line. Nothing in servicrab itself
   changed — only the promise now matches reality.
 
-### Added
+### Fixed
 
-- A CI job that checks the workspace on the declared MSRV with `--locked`, so
-  the minimum supported version is verified on every push instead of being an
-  unchecked claim in the manifest.
+- A flaky `up` test. It asserted the start order by having the dependent sleep
+  300ms and then look for a marker file written by the dependency, which
+  measures how the two shells happen to be scheduled rather than what the
+  supervisor did; on a loaded machine it failed while the supervisor had behaved
+  correctly. It now reads the start order out of the event stream.
 
 ## [0.1.0] - 2026-07-30
 

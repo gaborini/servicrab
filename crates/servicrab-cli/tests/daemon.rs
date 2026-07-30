@@ -178,6 +178,39 @@ restart = "always"
     assert!(stdout.contains("no daemon is running"), "{stdout}");
 }
 
+/// Connecting to the socket is enough to start and stop every service in the
+/// project, so the file permissions are the whole access control.  Leaving them
+/// to the umask means a distribution that ships 002 hands that to the group.
+#[test]
+fn the_socket_is_only_reachable_by_its_owner() {
+    let dir = TempDir::new().unwrap();
+    let svc = resident(dir.path(), "api.sh");
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}"]
+restart = "always"
+"#,
+            svc.display()
+        ),
+    );
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("api to run", |s| s.contains("running"));
+
+    let mode = fs::metadata(dir.path().join(".servicrab/daemon.sock"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "socket mode is {mode:o}, expected 600");
+}
+
 #[test]
 fn starting_twice_is_refused() {
     let dir = TempDir::new().unwrap();

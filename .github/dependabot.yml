@@ -1,0 +1,30 @@
+version: 2
+
+updates:
+  # Cargo.lock is what CI tests and what the release builds, so a lagging
+  # transitive dependency stays invisible until someone runs cargo update by
+  # hand.  Grouped into one pull request per week: individual patch bumps of
+  # transitive crates are not worth a review each.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-and-patch:
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: "deps"
+
+  # The Node 20 deprecation warnings on the actions were noticed by accident.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"

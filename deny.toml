@@ -1,0 +1,49 @@
+# cargo-deny configuration — see https://embarkstudios.github.io/cargo-deny/
+#
+# A process supervisor can end up running as root, so what is in the dependency
+# tree matters.  This file is enforced by a CI job on every pull request.
+
+[graph]
+all-features = true
+# Only the platforms servicrab actually supports.  Auditing the Windows
+# dependency tree would report crates we never compile.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+[advisories]
+# RustSec advisories are a hard failure: an unmaintained or vulnerable crate in
+# a supervisor is exactly the thing this check exists to catch.
+yanked = "deny"
+unmaintained = "all"
+# Add entries here (with the advisory id and a one-line reason) only when an
+# advisory does not apply to how servicrab uses the crate.
+ignore = []
+
+[licenses]
+# Everything in the tree today is permissive, and the project itself is
+# MIT OR Apache-2.0.  A copyleft dependency should be a deliberate decision,
+# not something that arrives with a patch bump.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+]
+
+[bans]
+# Two versions of the same crate usually means a dependency is lagging; it is
+# worth seeing, but it is not something a contributor can always fix.
+multiple-versions = "warn"
+# A wildcard version requirement makes the build non-reproducible.
+wildcards = "deny"
+# The workspace crates depend on each other by path, which is not a risk.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
