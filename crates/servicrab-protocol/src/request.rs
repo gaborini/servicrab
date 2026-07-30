@@ -33,4 +33,7 @@ pub enum Request {
         /// Service name as declared in `servicrab.toml`.
         name: String,
     },
+
+    /// Re-read the configuration file and apply the difference.
+    Reload,
 }

@@ -113,6 +113,15 @@ pub enum Control {
         /// Answered once the command completes.
         ack: Ack,
     },
+    /// Replace the running configuration.
+    Reload {
+        /// The freshly validated configuration.
+        config: Box<Config>,
+        /// The start plan derived from it.
+        plan: Vec<ServiceName>,
+        /// Answered once the difference has been applied.
+        ack: Ack,
+    },
 }
 
 /// Sending half of the control channel.

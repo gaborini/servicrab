@@ -127,6 +127,19 @@ pub enum Control {
         /// Answered once the replacement has been spawned.
         ack: Ack,
     },
+    /// Replace the running configuration.
+    ///
+    /// Services that disappeared are stopped, new ones are started, and the
+    /// ones whose definition changed are restarted with it.  Everything else
+    /// keeps running untouched.
+    Reload {
+        /// The freshly validated configuration.
+        config: Box<Config>,
+        /// The start plan derived from it.
+        plan: Vec<ServiceName>,
+        /// Answered once the difference has been applied.
+        ack: Ack,
+    },
 }
 
 /// Sending half of the control channel.
@@ -149,6 +162,9 @@ struct Slot {
     handle: Option<JoinHandle<()>>,
     /// Set while a stop is only the first half of a restart.
     restart_when_stopped: bool,
+    /// Set when a reload dropped the service: the slot disappears as soon as
+    /// its supervision task reports back.
+    retired: bool,
     /// The client waiting for the in-flight command to complete.
     pending: Option<Ack>,
 }
@@ -239,41 +255,28 @@ impl<'a> StackSupervisor<'a> {
         };
 
         let (report_tx, mut report_rx) = mpsc::unbounded_channel::<ServiceReport>();
-        let mut slots: BTreeMap<ServiceName, Slot> = BTreeMap::new();
+        let mut state = RunState {
+            config: Arc::new(self.config.clone()),
+            plan: std::mem::take(&mut self.plan),
+            slots: BTreeMap::new(),
+        };
 
-        for name in &self.plan {
-            let Some(service) = self.config.services.get(name) else {
+        // Every slot exists before any of them is spawned, so a service can
+        // subscribe to the readiness of the ones it depends on.
+        for name in state.plan.clone() {
+            let Some(service) = state.config.services.get(&name).cloned() else {
                 continue;
             };
-            let (state_tx, state_rx) = watch::channel(Readiness::Pending);
-
-            // Dependencies always appear earlier in the plan, so their slots
-            // already exist.
-            let deps: Vec<(ServiceName, watch::Receiver<Readiness>)> = service
-                .depends_on
-                .iter()
-                .filter_map(|dep| {
-                    slots
-                        .get(dep)
-                        .map(|slot| (dep.clone(), slot.readiness.subscribe()))
-                })
-                .collect();
-
-            let mut slot = Slot {
-                service: Arc::new(service.clone()),
-                deps,
-                readiness: Arc::new(state_tx),
-                stop: None,
-                handle: None,
-                restart_when_stopped: false,
-                pending: None,
-            };
-            drop(state_rx);
-            slot.spawn(self.events.clone(), run_options, report_tx.clone());
-            slots.insert(name.clone(), slot);
+            state.insert_slot(&name, Arc::new(service));
+        }
+        state.rewire_dependencies();
+        for name in state.plan.clone() {
+            if let Some(slot) = state.slots.get_mut(&name) {
+                slot.spawn(self.events.clone(), run_options, report_tx.clone());
+            }
         }
 
-        let mut running = slots.len();
+        let mut running = state.slots.len();
         let mut reports: Vec<ServiceReport> = Vec::with_capacity(running);
         let mut shutdown_reason: Option<ShutdownReason> = None;
 
@@ -294,10 +297,14 @@ impl<'a> StackSupervisor<'a> {
                     let failed = report.result.is_failure();
                     tracing::debug!(service = %report.service, "service finished");
 
-                    if let Some(slot) = slots.get_mut(&report.service) {
+                    let mut retire = false;
+                    if let Some(slot) = state.slots.get_mut(&report.service) {
                         slot.stop = None;
                         slot.handle = None;
-                        if slot.restart_when_stopped {
+                        if slot.retired {
+                            slot.answer(Ok("stopped".to_string()));
+                            retire = true;
+                        } else if slot.restart_when_stopped {
                             slot.restart_when_stopped = false;
                             slot.spawn(self.events.clone(), run_options, report_tx.clone());
                             running += 1;
@@ -306,17 +313,24 @@ impl<'a> StackSupervisor<'a> {
                             slot.answer(Ok("stopped".to_string()));
                         }
                     }
+                    if retire {
+                        state.slots.remove(&report.service);
+                    }
 
-                    reports.push(report);
-                    if failed && self.options.abort_on_failure {
-                        shutdown_reason = Some(ShutdownReason::StackFailure);
-                        break;
+                    // A service the operator removed is not part of the run's
+                    // verdict; it did exactly what it was told to do.
+                    if !retire {
+                        reports.push(report);
+                        if failed && self.options.abort_on_failure {
+                            shutdown_reason = Some(ShutdownReason::StackFailure);
+                            break;
+                        }
                     }
                 }
                 command = next_control(&mut self.control) => {
                     self.handle_control(
                         command,
-                        &mut slots,
+                        &mut state,
                         &mut running,
                         run_options,
                         &report_tx,
@@ -325,17 +339,19 @@ impl<'a> StackSupervisor<'a> {
             }
         }
 
-        let stops: BTreeMap<ServiceName, crate::runtime::ShutdownTx> = slots
+        let stops: BTreeMap<ServiceName, crate::runtime::ShutdownTx> = state
+            .slots
             .iter()
             .filter_map(|(name, slot)| slot.stop.clone().map(|stop| (name.clone(), stop)))
             .collect();
-        let mut handles: BTreeMap<ServiceName, JoinHandle<()>> = slots
+        let mut handles: BTreeMap<ServiceName, JoinHandle<()>> = state
+            .slots
             .iter_mut()
             .filter_map(|(name, slot)| slot.handle.take().map(|handle| (name.clone(), handle)))
             .collect();
 
         if let Some(reason) = shutdown_reason {
-            self.stop_all(reason, &stops, &mut handles).await;
+            stop_all(&state, reason, &stops, &mut handles).await;
         }
 
         for (name, handle) in handles {
@@ -362,18 +378,28 @@ impl<'a> StackSupervisor<'a> {
     fn handle_control(
         &self,
         command: Control,
-        slots: &mut BTreeMap<ServiceName, Slot>,
+        state: &mut RunState,
         running: &mut usize,
         run_options: RunOptions,
         reports: &mpsc::UnboundedSender<ServiceReport>,
     ) {
+        let command = match command {
+            Control::Reload { config, plan, ack } => {
+                let result = self.reload(state, running, *config, plan, run_options, reports);
+                let _ = ack.send(result);
+                return;
+            }
+            other => other,
+        };
+
         let service = match &command {
             Control::Start { service, .. }
             | Control::Stop { service, .. }
             | Control::Restart { service, .. } => service.clone(),
+            Control::Reload { .. } => unreachable!("handled above"),
         };
 
-        let Some(slot) = slots.get_mut(&service) else {
+        let Some(slot) = state.slots.get_mut(&service) else {
             let ack = into_ack(command);
             let _ = ack.send(Err(format!("{service} is not part of the running stack")));
             return;
@@ -418,38 +444,233 @@ impl<'a> StackSupervisor<'a> {
                 slot.pending = Some(ack);
                 let _ = stop.send(Some(ShutdownReason::Requested));
             }
+            Control::Reload { .. } => unreachable!("handled above"),
         }
     }
 
-    /// Stop the stack in reverse dependency order, waiting for each service
-    /// before moving on to the ones it depends on.
-    async fn stop_all(
+    /// Swap the running configuration for a freshly validated one.
+    ///
+    /// Only the difference is acted on: removed services are stopped, added
+    /// ones are started, and changed ones are restarted.  Services whose
+    /// definition is untouched keep running, including their uptime and
+    /// restart counters.
+    fn reload(
         &self,
-        reason: ShutdownReason,
-        stops: &BTreeMap<ServiceName, crate::runtime::ShutdownTx>,
-        handles: &mut BTreeMap<ServiceName, JoinHandle<()>>,
-    ) {
-        for name in self.plan.iter().rev() {
-            let Some(stop) = stops.get(name) else {
+        state: &mut RunState,
+        running: &mut usize,
+        config: Config,
+        plan: Vec<ServiceName>,
+        run_options: RunOptions,
+        reports: &mpsc::UnboundedSender<ServiceReport>,
+    ) -> Result<String, String> {
+        // Applying a difference on top of a half-finished command would make
+        // the outcome depend on the order the two complete in.
+        if let Some(busy) = state
+            .slots
+            .iter()
+            .find(|(_, slot)| slot.pending.is_some())
+            .map(|(name, _)| name.clone())
+        {
+            return Err(format!("{busy} is busy with another command"));
+        }
+
+        let diff = state.diff(&config, &plan);
+        let config = Arc::new(config);
+        state.config = config.clone();
+        state.plan = plan;
+
+        for name in &diff.removed {
+            let Some(slot) = state.slots.get_mut(name) else {
                 continue;
             };
-            let _ = stop.send(Some(reason));
-
-            let Some(mut handle) = handles.remove(name) else {
-                continue;
-            };
-            let grace = self
-                .config
-                .services
-                .get(name)
-                .map(|service| service.shutdown_timeout)
-                .unwrap_or_default()
-                + STOP_GRACE;
-
-            if tokio::time::timeout(grace, &mut handle).await.is_err() {
-                tracing::warn!(service = %name, ?grace, "service did not stop in time; detaching");
-                handle.abort();
+            match slot.stop.clone() {
+                Some(stop) => {
+                    slot.retired = true;
+                    slot.restart_when_stopped = false;
+                    let _ = stop.send(Some(ShutdownReason::Requested));
+                }
+                None => {
+                    state.slots.remove(name);
+                }
             }
+        }
+
+        for name in &diff.added {
+            let Some(service) = config.services.get(name).cloned() else {
+                continue;
+            };
+            state.insert_slot(name, Arc::new(service));
+        }
+
+        for name in &diff.changed {
+            let Some(service) = config.services.get(name).cloned() else {
+                continue;
+            };
+            let Some(slot) = state.slots.get_mut(name) else {
+                continue;
+            };
+            slot.service = Arc::new(service);
+            // A service that was stopped on purpose stays stopped; it picks
+            // the new definition up when it is started again.
+            if let Some(stop) = slot.stop.clone() {
+                slot.restart_when_stopped = true;
+                let _ = stop.send(Some(ShutdownReason::Requested));
+            }
+        }
+
+        // New slots are wired to their dependencies before they are spawned,
+        // exactly like they would be on a fresh start.
+        state.rewire_dependencies();
+
+        for name in &diff.added {
+            if let Some(slot) = state.slots.get_mut(name) {
+                slot.spawn(self.events.clone(), run_options, reports.clone());
+                *running += 1;
+            }
+        }
+
+        if diff.is_empty() {
+            return Ok("no changes".to_string());
+        }
+        Ok(format!(
+            "{} added, {} changed, {} removed",
+            diff.added.len(),
+            diff.changed.len(),
+            diff.removed.len()
+        ))
+    }
+}
+
+/// The parts of a running stack that config reloads may change.
+struct RunState {
+    config: Arc<Config>,
+    plan: Vec<ServiceName>,
+    slots: BTreeMap<ServiceName, Slot>,
+}
+
+impl RunState {
+    /// Add an idle slot for a service.
+    ///
+    /// Dependencies are wired up separately, once every slot exists: a
+    /// service must be able to subscribe to slots added after it.
+    fn insert_slot(&mut self, name: &ServiceName, service: Arc<Service>) {
+        let (state_tx, state_rx) = watch::channel(Readiness::Pending);
+        drop(state_rx);
+        self.slots.insert(
+            name.clone(),
+            Slot {
+                service,
+                deps: Vec::new(),
+                readiness: Arc::new(state_tx),
+                stop: None,
+                handle: None,
+                restart_when_stopped: false,
+                retired: false,
+                pending: None,
+            },
+        );
+    }
+
+    /// Point every slot at the readiness of the dependencies it currently has.
+    fn rewire_dependencies(&mut self) {
+        let readiness: BTreeMap<ServiceName, Arc<watch::Sender<Readiness>>> = self
+            .slots
+            .iter()
+            .map(|(name, slot)| (name.clone(), slot.readiness.clone()))
+            .collect();
+
+        for (name, slot) in self.slots.iter_mut() {
+            let Some(service) = self.config.services.get(name) else {
+                continue;
+            };
+            slot.deps = service
+                .depends_on
+                .iter()
+                .filter_map(|dep| {
+                    readiness
+                        .get(dep)
+                        .map(|sender| (dep.clone(), sender.subscribe()))
+                })
+                .collect();
+        }
+    }
+
+    /// Compare the running configuration with a new one.
+    fn diff(&self, config: &Config, plan: &[ServiceName]) -> ConfigDiff {
+        let mut diff = ConfigDiff::default();
+
+        for name in plan {
+            match self.slots.get(name) {
+                Some(slot) if slot.retired => diff.added.push(name.clone()),
+                Some(slot) => {
+                    if config.services.get(name) != Some(slot.service.as_ref()) {
+                        diff.changed.push(name.clone());
+                    }
+                }
+                None => diff.added.push(name.clone()),
+            }
+        }
+
+        for name in self.slots.keys() {
+            if !plan.contains(name) {
+                diff.removed.push(name.clone());
+            }
+        }
+
+        diff
+    }
+}
+
+/// What a configuration reload changes about the running stack.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ConfigDiff {
+    added: Vec<ServiceName>,
+    changed: Vec<ServiceName>,
+    removed: Vec<ServiceName>,
+}
+
+impl ConfigDiff {
+    fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.changed.is_empty() && self.removed.is_empty()
+    }
+}
+
+/// Stop the stack in reverse dependency order, waiting for each service
+/// before moving on to the ones it depends on.
+async fn stop_all(
+    state: &RunState,
+    reason: ShutdownReason,
+    stops: &BTreeMap<ServiceName, crate::runtime::ShutdownTx>,
+    handles: &mut BTreeMap<ServiceName, JoinHandle<()>>,
+) {
+    // Services dropped by a reload are no longer in the plan but may still be
+    // winding down, so they are stopped first.
+    let retired = stops
+        .keys()
+        .filter(|name| !state.plan.contains(name))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for name in retired.iter().chain(state.plan.iter().rev()) {
+        let Some(stop) = stops.get(name) else {
+            continue;
+        };
+        let _ = stop.send(Some(reason));
+
+        let Some(mut handle) = handles.remove(name) else {
+            continue;
+        };
+        let grace = state
+            .config
+            .services
+            .get(name)
+            .map(|service| service.shutdown_timeout)
+            .unwrap_or_default()
+            + STOP_GRACE;
+
+        if tokio::time::timeout(grace, &mut handle).await.is_err() {
+            tracing::warn!(service = %name, ?grace, "service did not stop in time; detaching");
+            handle.abort();
         }
     }
 }
@@ -470,9 +691,10 @@ async fn next_control(control: &mut Option<ControlRx>) -> Control {
 /// Take the acknowledgement channel out of a command.
 fn into_ack(command: Control) -> Ack {
     match command {
-        Control::Start { ack, .. } | Control::Stop { ack, .. } | Control::Restart { ack, .. } => {
-            ack
-        }
+        Control::Start { ack, .. }
+        | Control::Stop { ack, .. }
+        | Control::Restart { ack, .. }
+        | Control::Reload { ack, .. } => ack,
     }
 }
 
@@ -681,6 +903,178 @@ mod tests {
 
     fn name(raw: &str) -> ServiceName {
         crate::validation::validate_service_name(raw).expect("valid test name")
+    }
+
+    /// Build a validated config from TOML, as if it had been read from disk.
+    fn config(toml: &str) -> Config {
+        let raw: crate::raw::RawConfig = toml::from_str(toml).expect("valid test toml");
+        crate::validation::validate_raw(raw, std::path::Path::new("/tmp/servicrab.toml"))
+            .expect("valid test config")
+            .0
+    }
+
+    /// A run state holding idle slots for every service in the config.
+    fn state_for(cfg: Config) -> RunState {
+        let plan = crate::runtime::plan_stack(&cfg, &[]).expect("plannable test config");
+        let mut state = RunState {
+            config: Arc::new(cfg),
+            plan: Vec::new(),
+            slots: BTreeMap::new(),
+        };
+        for name in &plan {
+            let service = state
+                .config
+                .services
+                .get(name)
+                .cloned()
+                .expect("planned service exists");
+            state.insert_slot(name, Arc::new(service));
+        }
+        state.plan = plan;
+        state.rewire_dependencies();
+        state
+    }
+
+    const BASE: &str = r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["sleep", "60"]
+[services.worker]
+command = ["sleep", "60"]
+"#;
+
+    #[test]
+    fn an_unchanged_config_produces_an_empty_diff() {
+        let state = state_for(config(BASE));
+        let cfg = config(BASE);
+        let plan = crate::runtime::plan_stack(&cfg, &[]).unwrap();
+
+        let diff = state.diff(&cfg, &plan);
+        assert!(diff.is_empty(), "{diff:?}");
+    }
+
+    #[test]
+    fn a_new_service_is_reported_as_added() {
+        let state = state_for(config(BASE));
+        let cfg = config(&format!(
+            "{BASE}
+[services.cache]
+command = [\"sleep\", \"60\"]
+"
+        ));
+        let plan = crate::runtime::plan_stack(&cfg, &[]).unwrap();
+
+        let diff = state.diff(&cfg, &plan);
+        assert_eq!(diff.added, vec![name("cache")]);
+        assert!(diff.changed.is_empty());
+        assert!(diff.removed.is_empty());
+    }
+
+    #[test]
+    fn a_dropped_service_is_reported_as_removed() {
+        let state = state_for(config(BASE));
+        let cfg = config(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["sleep", "60"]
+"#,
+        );
+        let plan = crate::runtime::plan_stack(&cfg, &[]).unwrap();
+
+        let diff = state.diff(&cfg, &plan);
+        assert_eq!(diff.removed, vec![name("worker")]);
+        assert!(diff.added.is_empty());
+        assert!(diff.changed.is_empty());
+    }
+
+    #[test]
+    fn an_edited_service_is_reported_as_changed() {
+        let state = state_for(config(BASE));
+        let cfg = config(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["sleep", "90"]
+[services.worker]
+command = ["sleep", "60"]
+"#,
+        );
+        let plan = crate::runtime::plan_stack(&cfg, &[]).unwrap();
+
+        let diff = state.diff(&cfg, &plan);
+        assert_eq!(diff.changed, vec![name("api")]);
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
+    }
+
+    #[test]
+    fn a_changed_environment_counts_as_a_change() {
+        let state = state_for(config(BASE));
+        let cfg = config(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["sleep", "60"]
+env = { PORT = "8080" }
+[services.worker]
+command = ["sleep", "60"]
+"#,
+        );
+        let plan = crate::runtime::plan_stack(&cfg, &[]).unwrap();
+
+        assert_eq!(state.diff(&cfg, &plan).changed, vec![name("api")]);
+    }
+
+    #[test]
+    fn a_retired_slot_is_added_again_rather_than_reused() {
+        let mut state = state_for(config(BASE));
+        state
+            .slots
+            .get_mut(&name("worker"))
+            .expect("slot exists")
+            .retired = true;
+
+        let cfg = config(BASE);
+        let plan = crate::runtime::plan_stack(&cfg, &[]).unwrap();
+        assert_eq!(state.diff(&cfg, &plan).added, vec![name("worker")]);
+    }
+
+    #[test]
+    fn dependencies_are_rewired_after_a_reload() {
+        let mut state = state_for(config(BASE));
+        assert!(state.slots[&name("api")].deps.is_empty());
+
+        let cfg = config(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["sleep", "60"]
+depends_on = ["worker"]
+[services.worker]
+command = ["sleep", "60"]
+"#,
+        );
+        state.plan = crate::runtime::plan_stack(&cfg, &[]).unwrap();
+        state.config = Arc::new(cfg);
+        state.rewire_dependencies();
+
+        let deps: Vec<ServiceName> = state.slots[&name("api")]
+            .deps
+            .iter()
+            .map(|(dep, _)| dep.clone())
+            .collect();
+        assert_eq!(deps, vec![name("worker")]);
     }
 
     #[test]

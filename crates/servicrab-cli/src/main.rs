@@ -221,6 +221,15 @@ enum Commands {
         config: Option<std::path::PathBuf>,
     },
 
+    /// Re-read the configuration and apply it to the running daemon.
+    /// Linux and macOS only.
+    Reload {
+        /// Path to the configuration file.  If omitted, discovers
+        /// servicrab.toml by walking up from the current directory.
+        #[arg(long, short = 'c')]
+        config: Option<std::path::PathBuf>,
+    },
+
     /// Show what the background daemon is doing.  Linux and macOS only.
     Status {
         /// Path to the configuration file.  If omitted, discovers
@@ -344,6 +353,7 @@ fn main() {
         Commands::Restart { services, config } => {
             commands::daemon::restart(config.as_deref(), &services)
         }
+        Commands::Reload { config } => commands::daemon::reload(config.as_deref()),
         Commands::Status { config, json } => commands::daemon::status(config.as_deref(), json),
         Commands::Down { config } => commands::daemon::down(config.as_deref()),
         Commands::Daemon { config, no_restart } => {

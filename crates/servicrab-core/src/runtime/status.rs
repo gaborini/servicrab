@@ -94,6 +94,22 @@ impl StatusRegistry {
         }
     }
 
+    /// Bring the registry in line with a reloaded configuration.
+    ///
+    /// Services that are still present keep their state, so a reload does not
+    /// reset uptime or restart counters for anything it did not touch.
+    pub fn sync(&mut self, services: impl IntoIterator<Item = (ServiceName, bool)>) {
+        let mut order = Vec::new();
+        for (name, has_health) in services {
+            self.services
+                .entry(name.clone())
+                .or_insert_with(|| Entry::new(has_health));
+            order.push(name);
+        }
+        self.services.retain(|name, _| order.contains(name));
+        self.order = order;
+    }
+
     /// Fold one event into the registry.
     pub fn apply(&mut self, event: &ServiceEvent) {
         let Some(entry) = self.services.get_mut(&event.service) else {
@@ -212,6 +228,45 @@ mod tests {
         // The second service has no health check at all.
         assert_eq!(snapshot[1].health, Health::None);
         assert!(snapshot[0].pid.is_none());
+    }
+
+    #[test]
+    fn sync_adds_and_drops_services_without_disturbing_the_rest() {
+        let mut registry = registry();
+        registry.apply(&event("db", EventKind::Started { pgid: 42 }));
+        registry.apply(&event("db", EventKind::State(ServiceState::Running)));
+
+        registry.sync([(name("db"), true), (name("cache"), false)]);
+
+        let snapshot = registry.snapshot();
+        let names: Vec<&str> = snapshot.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["db", "cache"]);
+        // The service that survived the reload kept its state.
+        assert_eq!(snapshot[0].state, ServiceState::Running);
+        assert_eq!(snapshot[0].pid, Some(42));
+        assert_eq!(snapshot[1].state, ServiceState::Pending);
+    }
+
+    #[test]
+    fn sync_reports_services_in_the_new_order() {
+        let mut registry = registry();
+        registry.sync([(name("api"), false), (name("db"), true)]);
+
+        let names: Vec<String> = registry
+            .snapshot()
+            .iter()
+            .map(|s| s.name.to_string())
+            .collect();
+        assert_eq!(names, vec!["api".to_string(), "db".to_string()]);
+    }
+
+    #[test]
+    fn events_for_dropped_services_are_ignored() {
+        let mut registry = registry();
+        registry.sync([(name("api"), false)]);
+        registry.apply(&event("db", EventKind::Started { pgid: 7 }));
+
+        assert_eq!(registry.snapshot().len(), 1);
     }
 
     #[test]
