@@ -93,6 +93,24 @@ pub enum EventKind {
         /// Why the last probe failed.
         message: String,
     },
+    /// A watched path changed and a restart was requested.
+    WatchTriggered {
+        /// The first changed path, in sort order.
+        path: std::path::PathBuf,
+        /// How many paths changed in this batch.
+        changed: usize,
+    },
+    /// A watch-triggered restart was refused by the supervisor.
+    WatchFailed {
+        /// Why the restart did not happen.
+        message: String,
+    },
+    /// The watched tree is larger than the scan limit, so changes beyond it
+    /// go unnoticed.
+    WatchTruncated {
+        /// How many files the watcher is willing to scan.
+        limit: usize,
+    },
     /// The service failed fatally.
     Failed {
         /// A human-readable description of the failure.

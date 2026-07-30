@@ -57,6 +57,13 @@ name = "my-project"
 #   shutdown_signal       term | int | quit | hup  (default: term)
 #   shutdown_timeout      Wait this long before forcibly killing (default: 10s)
 #
+# Optional [services.<name>.watch] block — restart on file changes:
+#   paths         Files/directories to watch, relative to the service's cwd
+#   ignore        Names, "dir/prefix" or "*.ext" entries never to watch
+#                 (.git and .servicrab are always ignored)
+#   interval      How often the tree is scanned (default: 1s)
+#   debounce      Quiet period before the restart fires (default: 300ms)
+#
 # Optional [services.<name>.logs] block:
 #   enabled       Write this service's output to a log file (default: true,
 #                 only has an effect when [project.logs] exists)
@@ -102,6 +109,10 @@ autostart = false
 
 [services.worker.env]
 DATABASE_URL = "postgres://localhost/mydb"
+
+# [services.worker.watch]
+# paths = ["src", "package.json"]
+# ignore = ["target", "node_modules", "*.log"]
 "#;
 
 /// Run the `init` subcommand.

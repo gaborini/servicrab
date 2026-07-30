@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use crate::config::{
     Config, HealthCheck, HealthProbe, LogSettings, Project, ProjectName, RestartPolicy, Service,
-    ServiceName, ShutdownSignal, UnhealthyAction,
+    ServiceName, ShutdownSignal, UnhealthyAction, WatchSettings,
 };
 use crate::error::{ConfigError, ConfigWarning};
 use crate::graph::topological_sort;
-use crate::raw::{RawConfig, RawEnvFile, RawHealthCheck, RawRestartPolicy};
+use crate::raw::{RawConfig, RawEnvFile, RawHealthCheck, RawRestartPolicy, RawWatch};
 
 /// The only supported schema version.
 const SUPPORTED_VERSION: u32 = 1;
@@ -196,6 +196,11 @@ pub fn validate_raw(
 
         let log_to_file = raw_svc.logs.as_ref().map_or(true, |logs| logs.enabled);
 
+        let watch = raw_svc
+            .watch
+            .as_ref()
+            .and_then(|raw_watch| validate_watch(raw_watch, &cwd, raw_name, &mut errors));
+
         // restart_max_delay >= restart_delay
         if restart_max_delay < restart_delay {
             errors.push(ConfigError::RestartMaxDelayTooSmall {
@@ -262,6 +267,7 @@ pub fn validate_raw(
                 shutdown_timeout,
                 health,
                 log_to_file,
+                watch,
             },
         );
     }
@@ -579,6 +585,97 @@ fn parse_duration_field(
     }
 
     dur
+}
+
+// ── Watch settings validation ──────────────────────────────────────────────
+
+/// Ignore entries that are always applied, on top of what the config asks for.
+const ALWAYS_IGNORED: [&str; 2] = [".git", ".servicrab"];
+
+/// Validate a `[services.<name>.watch]` table.
+fn validate_watch(
+    raw: &RawWatch,
+    cwd: &Path,
+    service: &str,
+    errors: &mut Vec<ConfigError>,
+) -> Option<WatchSettings> {
+    let mut paths = Vec::new();
+
+    if raw.paths.is_empty() {
+        errors.push(ConfigError::InvalidWatch {
+            service: service.to_string(),
+            reason: "paths must list at least one file or directory".to_string(),
+        });
+    }
+
+    for entry in &raw.paths {
+        if entry.is_empty() {
+            errors.push(ConfigError::InvalidWatch {
+                service: service.to_string(),
+                reason: "paths must not contain an empty entry".to_string(),
+            });
+            continue;
+        }
+
+        let candidate = PathBuf::from(entry);
+        let resolved = if candidate.is_absolute() {
+            candidate
+        } else {
+            cwd.join(candidate)
+        };
+
+        match resolved.canonicalize() {
+            Ok(path) => paths.push(path),
+            Err(e) => errors.push(ConfigError::InvalidWatch {
+                service: service.to_string(),
+                reason: format!("path {} cannot be watched: {e}", resolved.display()),
+            }),
+        }
+    }
+
+    let interval = parse_duration_field(
+        raw.interval.as_deref(),
+        "watch.interval",
+        Duration::from_secs(1),
+        service,
+        DUR_100MS,
+        DUR_1H,
+        errors,
+    );
+    let debounce = parse_duration_field(
+        raw.debounce.as_deref(),
+        "watch.debounce",
+        Duration::from_millis(300),
+        service,
+        Duration::from_millis(50),
+        DUR_1H,
+        errors,
+    );
+
+    let mut ignore: Vec<String> = ALWAYS_IGNORED.iter().map(|s| (*s).to_string()).collect();
+    for entry in &raw.ignore {
+        if entry.is_empty() {
+            errors.push(ConfigError::InvalidWatch {
+                service: service.to_string(),
+                reason: "ignore must not contain an empty entry".to_string(),
+            });
+            continue;
+        }
+        if !ignore.iter().any(|existing| existing == entry) {
+            ignore.push(entry.clone());
+        }
+    }
+
+    if paths.is_empty() {
+        return None;
+    }
+
+    Some(WatchSettings {
+        paths,
+        ignore,
+        interval,
+        debounce,
+    })
 }
 
 // ── Log settings validation ────────────────────────────────────────────────
@@ -1573,6 +1670,7 @@ command = ["echo"]
                         shutdown_timeout: None,
                         health: None,
                         logs: None,
+                        watch: None,
                     },
                 );
                 m
@@ -1758,6 +1856,65 @@ _SVCRAB_TEST_KEY = "service"
         let (cfg, _) = result.unwrap();
         let svc = &cfg.services[&ServiceName("s".into())];
         assert_eq!(svc.env.get("K").map(String::as_str), Some("service"));
+    }
+
+    // ── watch ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_watch_block_resolves_paths_against_the_service_cwd() {
+        let toml = "version=1\n[project]\nname=\"p\"\n[services.s]\ncommand=[\"echo\"]\n[services.s.watch]\npaths=[\"src\"]\n";
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let path = dir.path().join("servicrab.toml");
+        std::fs::write(&path, toml).unwrap();
+        let raw: RawConfig = toml::from_str(toml).unwrap();
+        let (cfg, _) = validate_raw(raw, &path).unwrap();
+
+        let watch = cfg.services[&ServiceName("s".into())]
+            .watch
+            .as_ref()
+            .expect("watch settings");
+        assert_eq!(watch.paths.len(), 1);
+        assert!(watch.paths[0].ends_with("src"));
+        assert_eq!(watch.interval, Duration::from_secs(1));
+        assert_eq!(watch.debounce, Duration::from_millis(300));
+    }
+
+    #[test]
+    fn watch_always_ignores_git_and_servicrab_state() {
+        let toml = "version=1\n[project]\nname=\"p\"\n[services.s]\ncommand=[\"echo\"]\n[services.s.watch]\npaths=[\"src\"]\nignore=[\"target\"]\n";
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let path = dir.path().join("servicrab.toml");
+        std::fs::write(&path, toml).unwrap();
+        let raw: RawConfig = toml::from_str(toml).unwrap();
+        let (cfg, _) = validate_raw(raw, &path).unwrap();
+
+        let watch = cfg.services[&ServiceName("s".into())]
+            .watch
+            .as_ref()
+            .expect("watch settings");
+        for entry in [".git", ".servicrab", "target"] {
+            assert!(
+                watch.ignore.iter().any(|i| i == entry),
+                "{entry} should be ignored, got {:?}",
+                watch.ignore
+            );
+        }
+    }
+
+    #[test]
+    fn a_watch_interval_below_the_minimum_is_a_config_error() {
+        let toml = "version=1\n[project]\nname=\"p\"\n[services.s]\ncommand=[\"echo\"]\n[services.s.watch]\npaths=[\"src\"]\ninterval=\"1ms\"\n";
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let path = dir.path().join("servicrab.toml");
+        std::fs::write(&path, toml).unwrap();
+        let raw: RawConfig = toml::from_str(toml).unwrap();
+        let errs = validate_raw(raw, &path).unwrap_err();
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ConfigError::DurationOutOfRange { field, .. } if *field == "watch.interval")));
     }
 
     #[test]
@@ -2026,6 +2183,7 @@ restart_delay = "2s"
                 shutdown_timeout: None,
                 health: None,
                 logs: None,
+                watch: None,
             },
         );
         RawConfig {

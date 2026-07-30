@@ -15,6 +15,7 @@ Think of it as a minimal, zero-dependency alternative to [overmind](https://gith
 - `servicrab run <service>` — supervise a single service in the foreground with live stdout/stderr, restart policy, and process-group shutdown (Linux/macOS)
 - `servicrab up` — run your whole stack in the foreground: dependency-ordered start, interleaved and colour-prefixed output, reverse-order shutdown (Linux/macOS)
 - Health checks: `command`, `http` and `tcp` probes with readiness gating and automatic restart of unhealthy services
+- `servicrab watch` — restart a service as soon as its sources change, with ignore rules and debouncing
 - Log files: opt-in per-service capture with size-based rotation, plus `servicrab logs [-f]` to read and follow them
 - Background daemon: `servicrab start` / `status` / `stop` / `restart` / `down`, with a documented JSON-over-Unix-socket protocol (Linux/macOS)
 - Restart policies: `never`, `on-failure`, `always`, with exponential backoff
@@ -124,6 +125,7 @@ if you want shell semantics.
 | `servicrab list [--config PATH] [--json]` | List all services with their restart policies |
 | `servicrab run <SERVICE> [--config PATH] [--no-restart]` | Supervise one service in the foreground |
 | `servicrab up [SERVICE...] [--config PATH] [--no-restart] [--no-prefix] [--timestamps] [--abort-on-failure]` | Supervise a whole stack in the foreground |
+| `servicrab watch [SERVICE...] [--config PATH] [--no-restart] [--no-prefix] [--timestamps] [--abort-on-failure]` | Like `up`, and restart services when their watched files change |
 | `servicrab logs [SERVICE...] [--config PATH] [-f] [-n N] [--no-prefix]` | Show (and follow) the captured log files |
 | `servicrab start [--config PATH] [--no-restart]` | Start the stack in the background |
 | `servicrab status [--config PATH] [--json]` | Show what the background daemon is doing |
@@ -402,6 +404,49 @@ all of them are powers of 1024.
 
 ---
 
+## Restart on file change
+
+Add a `[watch]` block to a service and it restarts whenever anything under the
+watched paths changes:
+
+```toml
+[services.api]
+command = ["node", "server.js"]
+cwd = "./api"
+
+[services.api.watch]
+paths = ["src", "package.json"]      # relative to the service's cwd
+ignore = ["node_modules", "*.log"]   # names, "dir/prefix" or "*.ext"
+interval = "1s"                      # how often the tree is scanned
+debounce = "300ms"                   # quiet period before restarting
+```
+
+```bash
+servicrab watch          # like `up`, but insists that something is watched
+servicrab up             # honours [watch] too, without the check
+servicrab start          # so does the background daemon
+```
+
+```console
+api | ▶ started (pgid 40311)
+api | ↻ server.js changed; restarting
+api | ◼ stopping: stopped on request
+api | ▶ started (pgid 40388)
+```
+
+`.git` and `.servicrab` are always ignored. The watcher polls rather than
+using inotify or FSEvents: one code path on every platform, no extra
+dependency, and a scan is just a comparison of file sizes and modification
+times. A `cargo build` that rewrites a hundred files causes **one** restart,
+because the watcher waits for `debounce` of quiet before acting.
+
+A watch-triggered restart travels the same control channel as
+`servicrab restart`, so it behaves identically — including under the daemon.
+Trees larger than 20 000 files are reported once and scanned only up to that
+limit; narrow `paths` or add `ignore` entries if you hit it.
+
+---
+
 ## Environment files
 
 Anything you would otherwise repeat in `[project.env]` or
@@ -608,7 +653,7 @@ cargo test -p servicrab-core config::tests
 ### Phase 3 (current) — Stack management
 - [x] `.env` file support per project and per service
 - [x] Shell completions (`servicrab completions <SHELL>`)
-- [ ] `servicrab watch` — restart on file changes (à la `watchexec`)
+- [x] `servicrab watch` — restart on file changes, with ignore rules and debouncing
 - [ ] Config hot-reload
 
 ### Phase 4 — Platform integration (optional)

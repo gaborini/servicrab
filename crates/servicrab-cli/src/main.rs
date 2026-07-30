@@ -9,6 +9,8 @@
 //!   service in the foreground (Linux/macOS)
 //! - `servicrab up [SERVICE...]` — run a whole stack in the foreground
 //!   (Linux/macOS)
+//! - `servicrab watch [SERVICE...]` — `up` with restart-on-file-change
+//!   (Linux/macOS)
 //!
 //! - `servicrab logs [SERVICE...]` — read the captured log files
 //! - `servicrab completions <SHELL>` — print a shell completion script
@@ -94,6 +96,36 @@ enum Commands {
     /// order, interleave their output, and stop them in reverse order on
     /// Ctrl+C.  Linux and macOS only.
     Up {
+        /// Services to start.  Their dependencies are always started too.
+        /// With no names, every service with autostart = true is started.
+        services: Vec<String>,
+
+        /// Path to the configuration file.  If omitted, discovers
+        /// servicrab.toml by walking up from the current directory.
+        #[arg(long, short = 'c')]
+        config: Option<std::path::PathBuf>,
+
+        /// Never restart services, whatever their configured policy says.
+        #[arg(long, default_value_t = false)]
+        no_restart: bool,
+
+        /// Do not prefix output lines with the service name.
+        #[arg(long, default_value_t = false)]
+        no_prefix: bool,
+
+        /// Prefix output lines with a UTC timestamp.
+        #[arg(long, default_value_t = false)]
+        timestamps: bool,
+
+        /// Stop the whole stack as soon as one service fails.
+        #[arg(long, default_value_t = false)]
+        abort_on_failure: bool,
+    },
+
+    /// Run a stack in the foreground and restart services when their watched
+    /// files change.  Identical to `up`, except that it refuses to start when
+    /// no selected service declares a [watch] block.  Linux and macOS only.
+    Watch {
         /// Services to start.  Their dependencies are always started too.
         /// With no names, every service with autostart = true is started.
         services: Vec<String>,
@@ -240,7 +272,7 @@ fn main() {
     // Either way `RUST_LOG` wins (e.g. `RUST_LOG=debug servicrab up`).
     let default_filter = match cli.command {
         Commands::Run { .. } => "servicrab_core=info",
-        Commands::Up { .. } => "error",
+        Commands::Up { .. } | Commands::Watch { .. } => "error",
         // The daemon's log file is the only trace it leaves, so it keeps the
         // full lifecycle history.
         Commands::Daemon { .. } => "servicrab=info,servicrab_core=info",
@@ -282,6 +314,25 @@ fn main() {
                 no_prefix,
                 timestamps,
                 abort_on_failure,
+                require_watch: false,
+            },
+        ),
+        Commands::Watch {
+            services,
+            config,
+            no_restart,
+            no_prefix,
+            timestamps,
+            abort_on_failure,
+        } => commands::up::run(
+            &services,
+            config.as_deref(),
+            commands::up::UpOptions {
+                no_restart,
+                no_prefix,
+                timestamps,
+                abort_on_failure,
+                require_watch: true,
             },
         ),
         Commands::Start {

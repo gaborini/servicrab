@@ -140,6 +140,25 @@ impl StatusRegistry {
             }
             EventKind::Failed { message } => entry.message = Some(message.clone()),
             EventKind::Finished { summary } => entry.message = Some(summary.clone()),
+            EventKind::WatchTriggered { path, changed } => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                entry.message = Some(if *changed == 1 {
+                    format!("restarting: {name} changed")
+                } else {
+                    format!("restarting: {name} and {} more changed", changed - 1)
+                });
+            }
+            EventKind::WatchFailed { message } => {
+                entry.message = Some(format!("watch: {message}"));
+            }
+            EventKind::WatchTruncated { limit } => {
+                entry.message = Some(format!(
+                    "watch: more than {limit} files; narrow `paths` or add `ignore` entries"
+                ));
+            }
             // Log lines are far too frequent to keep, and `Exited` is already
             // reflected by the state transition that follows it.
             EventKind::Log { .. } | EventKind::Exited { .. } | EventKind::Stopping { .. } => {}

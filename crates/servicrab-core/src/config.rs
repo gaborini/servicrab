@@ -237,6 +237,43 @@ pub struct HealthCheck {
 
 // ── Service ────────────────────────────────────────────────────────────────
 
+/// Validated file-watching settings for a service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WatchSettings {
+    /// Absolute paths (files or directories) to watch.
+    pub paths: Vec<PathBuf>,
+    /// Names, path prefixes or `*.ext` patterns that are never watched.
+    pub ignore: Vec<String>,
+    /// How often the watched paths are scanned.
+    pub interval: Duration,
+    /// How long the tree must stay unchanged before the restart fires.
+    pub debounce: Duration,
+}
+
+impl WatchSettings {
+    /// Whether `relative` — a path relative to one of the watched roots —
+    /// matches any ignore entry.
+    ///
+    /// An entry matches when it equals a path component, when it is a prefix
+    /// of the relative path, or when it is a `*.ext` pattern matching the file
+    /// extension.
+    pub fn is_ignored(&self, relative: &std::path::Path) -> bool {
+        self.ignore.iter().any(|entry| {
+            if let Some(ext) = entry.strip_prefix("*.") {
+                return relative
+                    .extension()
+                    .is_some_and(|actual| actual.to_string_lossy() == ext);
+            }
+            if entry.contains('/') {
+                return relative.starts_with(entry);
+            }
+            relative
+                .components()
+                .any(|c| c.as_os_str().to_string_lossy() == *entry)
+        })
+    }
+}
+
 /// Validated configuration for a single managed service.
 #[derive(Debug, Clone, Serialize)]
 pub struct Service {
@@ -277,6 +314,9 @@ pub struct Service {
     /// Whether this service's output is written to a log file (only relevant
     /// when the project declares `[project.logs]`).
     pub log_to_file: bool,
+    /// Optional file-watching settings; when set, the supervisor restarts the
+    /// service after a change under the watched paths.
+    pub watch: Option<WatchSettings>,
 }
 
 // ── Config ─────────────────────────────────────────────────────────────────
