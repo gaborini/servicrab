@@ -166,6 +166,17 @@ pub enum ConfigError {
         "service {service:?}: unknown [health] on_unhealthy {value:?}; expected one of: restart, ignore"
     )]
     InvalidUnhealthyAction { service: String, value: String },
+
+    /// An `env_file` could not be read or parsed.
+    #[error("{scope}: env_file {path} could not be loaded: {reason}")]
+    InvalidEnvFile {
+        /// `"project"` or `service "name"`, used as the message prefix.
+        scope: String,
+        /// The path as resolved against the config directory.
+        path: PathBuf,
+        /// Human-readable reason.
+        reason: String,
+    },
 }
 
 /// A non-fatal configuration warning.

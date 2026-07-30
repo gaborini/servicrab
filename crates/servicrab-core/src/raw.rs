@@ -37,9 +37,33 @@ pub struct RawProject {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 
+    /// Dotenv-style file(s) loaded for every service, before `env`.
+    #[serde(default)]
+    pub env_file: Option<RawEnvFile>,
+
     /// Optional file-logging settings (`[project.logs]`).
     #[serde(default)]
     pub logs: Option<RawLogs>,
+}
+
+/// One path or a list of paths, as accepted by the `env_file` keys.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum RawEnvFile {
+    /// `env_file = ".env"`
+    One(String),
+    /// `env_file = [".env", ".env.local"]`
+    Many(Vec<String>),
+}
+
+impl RawEnvFile {
+    /// The declared paths, in declaration order.
+    pub fn paths(&self) -> &[String] {
+        match self {
+            RawEnvFile::One(p) => std::slice::from_ref(p),
+            RawEnvFile::Many(ps) => ps,
+        }
+    }
 }
 
 /// Raw file-logging settings (`[project.logs]`).
@@ -86,6 +110,10 @@ pub struct RawService {
     /// Service-level environment variables.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+
+    /// Dotenv-style file(s) loaded for this service, before `env`.
+    #[serde(default)]
+    pub env_file: Option<RawEnvFile>,
 
     /// Services that must be started before this one.
     #[serde(default)]

@@ -1,6 +1,7 @@
 //! CLI subcommand implementations.
 
 pub mod check;
+pub mod completions;
 pub mod daemon;
 pub mod init;
 pub mod list;
