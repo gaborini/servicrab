@@ -53,6 +53,24 @@ Docs: update README roadmap
 
 ---
 
+## Releasing
+
+1. Update `version` in the workspace `Cargo.toml` and move the `Unreleased`
+   entries in `CHANGELOG.md` under the new version heading.
+2. Merge that to `main` and check CI is green.
+3. Tag it and push the tag:
+
+   ```sh
+   git tag -a v0.2.0 -m "v0.2.0"
+   git push origin v0.2.0
+   ```
+
+The `Release` workflow builds `x86_64` and `aarch64` binaries for Linux and
+macOS, attaches them (with `.sha256` files) to a GitHub release, and takes the
+release notes from the matching `CHANGELOG.md` section.
+
+---
+
 ## Reporting issues
 
 Please include:

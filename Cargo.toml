@@ -12,7 +12,17 @@ edition = "2021"
 authors = ["servicrab contributors"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/gaborini/servicrab"
+homepage = "https://github.com/gaborini/servicrab"
+keywords = ["process", "supervisor", "daemon", "cli", "devtools"]
+categories = ["command-line-utilities", "development-tools"]
 rust-version = "1.75"
+
+# Release builds ship to other machines: strip them, and let the optimiser see
+# the whole crate graph.  The extra build time only lands on `--release`.
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
 
 [workspace.dependencies]
 # Async runtime
@@ -42,5 +52,5 @@ thiserror = "2"
 anyhow = "1"
 
 # Internal crates
-servicrab-core = { path = "crates/servicrab-core" }
-servicrab-protocol = { path = "crates/servicrab-protocol" }
+servicrab-core = { path = "crates/servicrab-core", version = "0.1.0" }
+servicrab-protocol = { path = "crates/servicrab-protocol", version = "0.1.0" }
