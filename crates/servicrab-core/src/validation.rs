@@ -135,8 +135,17 @@ pub fn validate_raw(
             continue;
         }
 
+        // With `include`, a service's relative paths belong to the file that
+        // declared it, so that a fragment can be moved with the directory it
+        // describes.  Without one, that file is the config itself.
+        let svc_dir = raw_svc
+            .origin
+            .as_deref()
+            .map(resolve_source_dir)
+            .unwrap_or_else(|| source_dir.clone());
+
         // cwd
-        let cwd = resolve_cwd(raw_svc.cwd.as_deref(), &source_dir, raw_name, &mut errors);
+        let cwd = resolve_cwd(raw_svc.cwd.as_deref(), &svc_dir, raw_name, &mut errors);
 
         // Service env
         let svc_env = validate_service_env(&raw_svc.env, raw_name, &mut errors);
@@ -144,7 +153,7 @@ pub fn validate_raw(
         // Service env files
         let (svc_env_files, svc_file_env) = load_env_files(
             raw_svc.env_file.as_ref(),
-            &source_dir,
+            &svc_dir,
             &format!("service {raw_name:?}"),
             &mut errors,
         );
@@ -1719,6 +1728,7 @@ command = ["echo"]
         // validation function directly.
         let raw = crate::raw::RawConfig {
             version: 1,
+            include: None,
             project: crate::raw::RawProject {
                 logs: None,
                 name: "p".into(),
@@ -1730,6 +1740,7 @@ command = ["echo"]
                 m.insert(
                     "s".to_string(),
                     crate::raw::RawService {
+                        origin: None,
                         command: vec!["exe\0cutable".to_string()],
                         cwd: None,
                         env: Default::default(),
@@ -2418,6 +2429,7 @@ restart_delay = "2s"
         services.insert(
             "s".to_string(),
             RawService {
+                origin: None,
                 command: vec!["echo".to_string()],
                 cwd: None,
                 env: env.into_iter().collect(),
@@ -2438,6 +2450,7 @@ restart_delay = "2s"
         );
         RawConfig {
             version: 1,
+            include: None,
             project: crate::raw::RawProject {
                 logs: None,
                 name: "p".into(),

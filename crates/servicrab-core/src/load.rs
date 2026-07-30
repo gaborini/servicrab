@@ -30,7 +30,8 @@ pub fn discover_config(start_dir: &Path) -> Result<PathBuf, ConfigError> {
     })
 }
 
-/// Read, parse, and validate a `servicrab.toml` from the given path.
+/// Read, parse, and validate a `servicrab.toml` from the given path, following
+/// any `include` it declares.
 ///
 /// Returns the validated [`Config`] and any non-fatal [`ConfigWarning`]s, or
 /// a list of [`ConfigError`]s that prevented successful loading.
@@ -42,12 +43,19 @@ pub fn load(path: &Path) -> Result<(Config, Vec<ConfigWarning>), Vec<ConfigError
         }]
     })?;
 
-    let raw: RawConfig = toml::from_str(&raw_str).map_err(|e| {
+    let mut raw: RawConfig = toml::from_str(&raw_str).map_err(|e| {
         vec![ConfigError::Parse {
             path: path.to_path_buf(),
             source: e,
         }]
     })?;
+
+    // Fatal on its own: validating half a config would report services as
+    // missing when they are merely in a file that could not be read.
+    let include_errors = crate::include::merge(&mut raw, path);
+    if !include_errors.is_empty() {
+        return Err(include_errors);
+    }
 
     validate_raw(raw, path)
 }
