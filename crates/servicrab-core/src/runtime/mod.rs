@@ -53,7 +53,8 @@ pub use health::{HealthMonitor, HealthSignal};
 pub use logs::{LogRouter, LogWriter};
 pub use plan::{known_services, lookup_service, plan_stack};
 pub use stack::{
-    Readiness, ServiceReport, ServiceResult, StackOptions, StackOutcome, StackSupervisor,
+    control_channel, Ack, Control, ControlRx, ControlTx, Readiness, ServiceReport, ServiceResult,
+    StackOptions, StackOutcome, StackSupervisor,
 };
 pub use status::{Health, ServiceStatus, StatusRegistry};
 

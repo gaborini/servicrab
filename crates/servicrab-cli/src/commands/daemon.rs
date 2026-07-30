@@ -53,8 +53,16 @@ mod imp {
         server::serve(&cfg, &paths, server::DaemonOptions { no_restart })
     }
 
-    /// Spawn a detached daemon and wait until it answers.
-    pub fn start(config: Option<&Path>, no_restart: bool) -> Result<i32, String> {
+    /// Start the daemon, or individual services inside a running one.
+    pub fn start(
+        config: Option<&Path>,
+        services: &[String],
+        no_restart: bool,
+    ) -> Result<i32, String> {
+        if !services.is_empty() {
+            return control(config, services, |name| Request::StartService { name });
+        }
+
         let (cfg, config_path, paths) = setup(config)?;
 
         if client::is_running(&paths.socket) {
@@ -131,6 +139,50 @@ mod imp {
             )
         );
         Ok(0)
+    }
+
+    /// Stop individual services without touching the rest of the stack.
+    pub fn stop(config: Option<&Path>, services: &[String]) -> Result<i32, String> {
+        control(config, services, |name| Request::StopService { name })
+    }
+
+    /// Restart individual services.
+    pub fn restart(config: Option<&Path>, services: &[String]) -> Result<i32, String> {
+        control(config, services, |name| Request::RestartService { name })
+    }
+
+    /// Send one per-service command per name, reporting each outcome.
+    fn control(
+        config: Option<&Path>,
+        services: &[String],
+        build: impl Fn(String) -> Request,
+    ) -> Result<i32, String> {
+        let (cfg, _, paths) = setup(config)?;
+        if !client::is_running(&paths.socket) {
+            return Err(format!(
+                "no daemon is running for {} — start one with `servicrab start`",
+                cfg.project.name
+            ));
+        }
+
+        let color = style::color_enabled();
+        let mut failed = false;
+        for name in services {
+            match client::send(&paths.socket, &build(name.clone())) {
+                Ok(Response::Ok { message }) => println!(
+                    "{} {}",
+                    style::paint(color, GREEN, "✓"),
+                    message.unwrap_or_else(|| format!("{name} done"))
+                ),
+                Ok(Response::Error { message }) => {
+                    eprintln!("{} {message}", style::paint(color, RED, "✗"));
+                    failed = true;
+                }
+                Ok(other) => return Err(format!("unexpected response from the daemon: {other:?}")),
+                Err(err) => return Err(err.to_string()),
+            }
+        }
+        Ok(if failed { 1 } else { 0 })
     }
 
     /// Print what the daemon is doing.
@@ -296,7 +348,19 @@ mod imp {
         Err(UNSUPPORTED.to_string())
     }
 
-    pub fn start(_config: Option<&Path>, _no_restart: bool) -> Result<i32, String> {
+    pub fn start(
+        _config: Option<&Path>,
+        _services: &[String],
+        _no_restart: bool,
+    ) -> Result<i32, String> {
+        Err(UNSUPPORTED.to_string())
+    }
+
+    pub fn stop(_config: Option<&Path>, _services: &[String]) -> Result<i32, String> {
+        Err(UNSUPPORTED.to_string())
+    }
+
+    pub fn restart(_config: Option<&Path>, _services: &[String]) -> Result<i32, String> {
         Err(UNSUPPORTED.to_string())
     }
 
@@ -309,4 +373,4 @@ mod imp {
     }
 }
 
-pub use imp::{daemon, down, start, status};
+pub use imp::{daemon, down, restart, start, status, stop};

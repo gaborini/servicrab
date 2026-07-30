@@ -336,6 +336,125 @@ restart = "always"
     panic!("the daemon never wrote {}", log.display());
 }
 
+/// A stack with one long-lived service, used by the control tests.
+fn one_service(dir: &Path) -> PathBuf {
+    let svc = resident(dir, "api.sh");
+    config(
+        dir,
+        &format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}"]
+restart = "always"
+"#,
+            svc.display()
+        ),
+    )
+}
+
+#[test]
+fn a_single_service_can_be_stopped_and_started_again() {
+    let dir = TempDir::new().unwrap();
+    let cfg = one_service(dir.path());
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("api to run", |s| s.contains("running"));
+
+    let (code, stdout, stderr) = cli(&["stop", "api"], &cfg);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.contains("api stopped"), "{stdout}");
+
+    let status = daemon.status();
+    assert!(status.contains("stopped"), "{status}");
+
+    // The daemon is still there, so the service can come back.
+    let (code, stdout, _) = cli(&["start", "api"], &cfg);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("api started"), "{stdout}");
+    daemon.wait_for_status("api to run again", |s| s.contains("running"));
+}
+
+#[test]
+fn restart_replaces_the_process() {
+    let dir = TempDir::new().unwrap();
+    let cfg = one_service(dir.path());
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("api to run", |s| s.contains("running"));
+    let before = pid_of(&daemon);
+
+    let (code, stdout, stderr) = cli(&["restart", "api"], &cfg);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.contains("api restarted"), "{stdout}");
+
+    daemon.wait_for_status("a new process", |_| pid_of(&daemon) != before);
+    assert_ne!(pid_of(&daemon), before);
+}
+
+#[test]
+fn stopping_an_already_stopped_service_is_not_an_error() {
+    let dir = TempDir::new().unwrap();
+    let cfg = one_service(dir.path());
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("api to run", |s| s.contains("running"));
+
+    assert_eq!(cli(&["stop", "api"], &cfg).0, 0);
+    let (code, stdout, _) = cli(&["stop", "api"], &cfg);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("already stopped"), "{stdout}");
+}
+
+#[test]
+fn starting_a_running_service_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let cfg = one_service(dir.path());
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("api to run", |s| s.contains("running"));
+
+    let (code, _, stderr) = cli(&["start", "api"], &cfg);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("already running"), "{stderr}");
+}
+
+#[test]
+fn per_service_commands_need_a_daemon() {
+    let dir = TempDir::new().unwrap();
+    let cfg = one_service(dir.path());
+
+    let (code, _, stderr) = cli(&["stop", "api"], &cfg);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("no daemon is running"), "{stderr}");
+}
+
+#[test]
+fn an_unknown_service_is_rejected_by_the_daemon() {
+    let dir = TempDir::new().unwrap();
+    let cfg = one_service(dir.path());
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("api to run", |s| s.contains("running"));
+
+    let (code, _, stderr) = cli(&["restart", "nope"], &cfg);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("unknown service"), "{stderr}");
+    assert!(stderr.contains("api"), "{stderr}");
+}
+
+/// The pid the daemon reports for `api`, or 0 when it is not running.
+fn pid_of(daemon: &Daemon) -> i64 {
+    let (_, stdout, _) = cli(&["status", "--json"], &daemon.config);
+    let parsed: serde_json::Value = match serde_json::from_str(&stdout) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    parsed["services"][0]["pid"].as_i64().unwrap_or(0)
+}
+
 #[test]
 fn a_foreground_daemon_stops_on_sigterm() {
     let dir = TempDir::new().unwrap();

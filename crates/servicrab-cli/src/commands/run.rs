@@ -131,6 +131,9 @@ fn exit_code(outcome: RunOutcome) -> i32 {
         RunOutcome::Stopped { reason } => match reason {
             ShutdownReason::UserInterrupt => EXIT_SIGINT,
             ShutdownReason::Terminated => EXIT_SIGTERM,
+            // `run` supervises a single service with no daemon around it, so
+            // nobody can ask for a targeted stop; treat it as a clean one.
+            ShutdownReason::Requested => 0,
             ShutdownReason::RestartLimit
             | ShutdownReason::StackFailure
             | ShutdownReason::Unhealthy => 1,
