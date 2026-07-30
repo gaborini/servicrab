@@ -18,6 +18,7 @@ Think of it as a minimal, zero-dependency alternative to [overmind](https://gith
 - `servicrab watch` — restart a service as soon as its sources change, with ignore rules and debouncing
 - Log files: opt-in per-service capture with size-based rotation, plus `servicrab logs [-f]` to read and follow them
 - Background daemon: `servicrab start` / `status` / `stop` / `restart` / `down`, with a documented JSON-over-Unix-socket protocol (Linux/macOS)
+- `servicrab start --wait` — block until every service is ready (health checks included), with an exit code that says whether it worked
 - `servicrab reload` — apply config changes to a running stack without stopping the services you did not touch
 - `servicrab events` — follow a running stack live: logs, state changes, restarts and health verdicts, as text or JSON
 - `servicrab generate systemd|launchd` — hand the stack over to the init system, with `systemctl reload` wired to `servicrab reload`
@@ -164,7 +165,7 @@ if you want shell semantics.
 | `servicrab up [SERVICE...] [--config PATH] [--no-restart] [--no-prefix] [--timestamps] [--abort-on-failure] [--json]` | Supervise a whole stack in the foreground |
 | `servicrab watch [SERVICE...] [--config PATH] [--no-restart] [--no-prefix] [--timestamps] [--abort-on-failure] [--json]` | Like `up`, and restart services when their watched files change |
 | `servicrab logs [SERVICE...] [--config PATH] [-f] [-n N] [--no-prefix]` | Show (and follow) the captured log files |
-| `servicrab start [--config PATH] [--no-restart]` | Start the stack in the background |
+| `servicrab start [SERVICE...] [--config PATH] [--no-restart] [--wait] [--timeout DUR]` | Start the stack in the background, optionally waiting until it is ready |
 | `servicrab status [--config PATH] [--json]` | Show what the background daemon is doing |
 | `servicrab stop <SERVICE...> [--config PATH]` | Stop individual services in the running daemon |
 | `servicrab restart <SERVICE...> [--config PATH]` | Restart individual services |
@@ -596,6 +597,41 @@ db       running      41231     4m30s         0  healthy
 api      running      41244     4m12s         1  -
 worker   backoff          -         -         3  -
   worker: stopped (exit code 1), last status: exit code 1
+```
+
+### Waiting for the stack to be ready
+
+`start` returns as soon as the daemon is up, which is not the same as the stack
+being usable. `--wait` returns when it actually is:
+
+```bash
+servicrab start --wait                 # ... 60s by default
+servicrab start --wait --timeout 2m    # give it longer
+servicrab start api --wait             # wait for one service inside a running daemon
+```
+
+A service counts as ready when it is running and — if it declares a health
+check — that check has passed. A one-shot service that has already exited counts
+as ready too: a migration that finished is not something to keep waiting for.
+This is the same definition the supervisor uses to decide when a dependent may
+start, so `--wait` returns exactly when the last dependent would have been
+released.
+
+The exit code is the point:
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Every service is ready |
+| `1` | A service gave up (failed, or stopped unhealthy), or the timeout ran out |
+
+Either way the daemon is left running — a stack that came up wrong is easier to
+diagnose alive, with `status`, `logs` and `events`. Which makes this a usable CI
+step:
+
+```bash
+servicrab start --wait --timeout 90s || { servicrab status; servicrab logs -n 100; exit 1; }
+./run-integration-tests
+servicrab down
 ```
 
 The daemon keeps its runtime state next to the config file, in

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `servicrab start --wait` returns only once every service is ready — running,
+  and health-checked if it declares a health check — with `--timeout` to bound
+  the wait (60s by default). A one-shot service that has already exited counts
+  as ready, which is the same definition the supervisor uses to release a
+  dependent. The exit code says whether it worked, so a CI script can stop
+  guessing with `sleep`. The daemon is left running on failure, because a stack
+  that came up wrong is easier to diagnose alive.
 - `servicrab man` prints the man page in roff, or writes one page per command
   into a directory with `--output`. Release tarballs now ship the generated
   pages under `man/`. The pages come from the same command definitions as

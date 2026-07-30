@@ -48,6 +48,21 @@ fn cli(args: &[&str], config_path: &Path) -> (i32, String, String) {
     )
 }
 
+/// Start a servicrab subcommand without waiting for it, for the tests that need
+/// to act while it is still running.
+fn spawn_cli(args: &[&str], config_path: &Path) -> Child {
+    Command::new(binary())
+        .args(args)
+        .arg("--config")
+        .arg(config_path)
+        .env_remove("RUST_LOG")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to run servicrab")
+}
+
 /// A long-lived service that exits cleanly on SIGTERM.
 fn resident(dir: &Path, name: &str) -> PathBuf {
     script(
@@ -64,8 +79,22 @@ struct Daemon {
 
 impl Daemon {
     fn start(config: &Path) -> Self {
-        let (code, stdout, stderr) = cli(&["start"], config);
+        Self::start_with(config, &[])
+    }
+
+    fn start_with(config: &Path, args: &[&str]) -> Self {
+        let mut argv = vec!["start"];
+        argv.extend_from_slice(args);
+        let (code, stdout, stderr) = cli(&argv, config);
         assert_eq!(code, 0, "start failed: {stdout}{stderr}");
+        Self {
+            config: config.to_path_buf(),
+        }
+    }
+
+    /// Only the cleanup half: for tests that run `start` themselves because
+    /// they are about how it fails.
+    fn guard(config: &Path) -> Self {
         Self {
             config: config.to_path_buf(),
         }
@@ -176,6 +205,174 @@ restart = "always"
     let (code, stdout, _) = cli(&["status"], &cfg);
     assert_eq!(code, 1);
     assert!(stdout.contains("no daemon is running"), "{stdout}");
+}
+
+// ── start --wait ───────────────────────────────────────────────────────────
+
+/// A stack whose service can only pass its health check once the test says so.
+///
+/// The gate is a file this test creates, not a sleep: whether the service is
+/// ready is then a fact the test controls rather than a race it hopes to win on
+/// a loaded machine. Returns `(config path, gate path)`.
+fn gated_by_a_marker(dir: &Path) -> (PathBuf, PathBuf) {
+    let gate = dir.join("open-the-gate");
+    script(
+        dir,
+        "db.sh",
+        "trap 'exit 0' TERM INT\nwhile true; do sleep 0.1; done",
+    );
+    script(dir, "probe.sh", &format!("test -f {}", gate.display()));
+    let cfg = config(
+        dir,
+        &format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.db]
+command = ["{db}"]
+restart = "always"
+[services.db.health]
+command = ["{probe}"]
+interval = "100ms"
+start_period = "30s"
+"#,
+            db = dir.join("db.sh").display(),
+            probe = dir.join("probe.sh").display()
+        ),
+    );
+    (cfg, gate)
+}
+
+#[test]
+fn start_wait_returns_only_once_the_health_check_is_green() {
+    let dir = TempDir::new().unwrap();
+    let (cfg, gate) = gated_by_a_marker(dir.path());
+    let daemon = Daemon::guard(&cfg);
+
+    let mut start = spawn_cli(&["start", "--wait", "--timeout", "20s"], &cfg);
+
+    // The probe cannot pass while the gate is closed, so an exit here is the
+    // supervisor claiming a readiness it cannot have observed.
+    daemon.wait_for_status("db to be running", |status| status.contains("running"));
+    assert!(
+        start.try_wait().unwrap().is_none(),
+        "--wait returned before the health check could pass"
+    );
+
+    fs::write(&gate, "go").unwrap();
+    assert_eq!(wait_bounded(&mut start), 0);
+
+    let (code, stdout, _) = cli(&["status"], &cfg);
+    assert_eq!(code, 0, "{stdout}");
+    assert!(stdout.contains("healthy"), "not healthy:\n{stdout}");
+}
+
+/// The counterpart: plain `start` returns while the stack is still starting.
+/// This is the difference the flag exists for, and it keeps the test above from
+/// being a tautology.
+#[test]
+fn start_without_wait_returns_before_the_health_check_is_green() {
+    let dir = TempDir::new().unwrap();
+    let (cfg, _gate) = gated_by_a_marker(dir.path());
+
+    let _daemon = Daemon::start(&cfg);
+
+    let (_, stdout, _) = cli(&["status"], &cfg);
+    assert!(
+        !stdout.contains("healthy"),
+        "the gate is closed, so the probe cannot have passed:\n{stdout}"
+    );
+}
+
+#[test]
+fn start_wait_gives_up_when_a_service_never_becomes_healthy() {
+    let dir = TempDir::new().unwrap();
+    let svc = resident(dir.path(), "api.sh");
+    script(dir.path(), "probe.sh", "exit 1");
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{api}"]
+restart = "never"
+[services.api.health]
+command = ["{probe}"]
+interval = "100ms"
+start_period = "10s"
+retries = 100
+"#,
+            api = svc.display(),
+            probe = dir.path().join("probe.sh").display()
+        ),
+    );
+
+    // The daemon outlives the failed wait on purpose, so `down` still has work.
+    let _daemon = Daemon::guard(&cfg);
+    let (code, stdout, stderr) = cli(&["start", "--wait", "--timeout", "1s"], &cfg);
+
+    assert_eq!(code, 1, "{stdout}{stderr}");
+    assert!(stderr.contains("timed out"), "{stderr}");
+    assert!(stderr.contains("api"), "{stderr}");
+
+    // A stack that came up wrong is easier to diagnose alive.
+    let (code, stdout, _) = cli(&["status"], &cfg);
+    assert_eq!(code, 0, "the daemon should still be running:\n{stdout}");
+}
+
+#[test]
+fn start_wait_reports_a_service_that_gave_up() {
+    let dir = TempDir::new().unwrap();
+    let svc = script(dir.path(), "api.sh", "exit 3");
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}"]
+restart = "on-failure"
+max_restarts = 1
+restart_delay = "50ms"
+"#,
+            svc.display()
+        ),
+    );
+
+    let _daemon = Daemon::guard(&cfg);
+    let (code, stdout, stderr) = cli(&["start", "--wait", "--timeout", "10s"], &cfg);
+
+    assert_eq!(code, 1, "{stdout}{stderr}");
+    assert!(stderr.contains("api"), "{stderr}");
+}
+
+#[test]
+fn timeout_without_wait_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let svc = resident(dir.path(), "api.sh");
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}"]
+"#,
+            svc.display()
+        ),
+    );
+
+    let (code, _, stderr) = cli(&["start", "--timeout", "5s"], &cfg);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("--wait"), "{stderr}");
 }
 
 /// Connecting to the socket is enough to start and stop every service in the
