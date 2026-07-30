@@ -39,7 +39,7 @@ clap_mangen = "0.3"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-toml = "0.8"
+toml = "1"
 
 # Duration parsing
 humantime = "2"
