@@ -19,6 +19,7 @@ Think of it as a minimal, zero-dependency alternative to [overmind](https://gith
 - `servicrab check` — validate your config before running anything
 - `servicrab list` — see all services and their restart policies at a glance
 - `servicrab run <service>` — supervise a single service in the foreground with live stdout/stderr, restart policy, and process-group shutdown (Linux/macOS)
+- `servicrab exec <service> -- <cmd>` — run anything in a service's environment and working directory, whether or not the service is up
 - `servicrab up` — run your whole stack in the foreground: dependency-ordered start, interleaved and colour-prefixed output, reverse-order shutdown (Linux/macOS)
 - Health checks: `command`, `http` and `tcp` probes with readiness gating and automatic restart of unhealthy services
 - `servicrab watch` — restart a service as soon as its sources change, with ignore rules and debouncing
@@ -169,6 +170,7 @@ if you want shell semantics.
 | `servicrab check [--config PATH]` | Parse and validate the config file |
 | `servicrab list [--config PATH] [--json]` | List all services with their restart policies |
 | `servicrab run <SERVICE> [--config PATH] [--no-restart]` | Supervise one service in the foreground |
+| `servicrab exec <SERVICE> [--config PATH] -- <COMMAND>...` | Run a command in a service's environment and working directory |
 | `servicrab up [SERVICE...] [--config PATH] [--no-restart] [--no-prefix] [--timestamps] [--abort-on-failure] [--json]` | Supervise a whole stack in the foreground |
 | `servicrab watch [SERVICE...] [--config PATH] [--no-restart] [--no-prefix] [--timestamps] [--abort-on-failure] [--json]` | Like `up`, and restart services when their watched files change |
 | `servicrab logs [SERVICE...] [--config PATH] [-f] [-n N] [--no-prefix]` | Show (and follow) the captured log files |
@@ -298,6 +300,44 @@ exits, so no descendant outlives the run.
 
 `servicrab run` supports **Linux and macOS**. Windows is out of scope for now;
 the command reports an unsupported-platform error there.
+
+---
+
+## Running a command in a service's environment
+
+```sh
+servicrab exec api -- printenv DATABASE_URL   # what would the service see?
+servicrab exec api -- npm run migrate         # a one-off, with the right env
+servicrab exec db -- psql                     # interactive, with $PGPASSWORD
+```
+
+`exec` reproduces the environment a service *would* get — its merged `env`, its
+`env_file` layers, and its working directory — and runs something else in it.
+That is the same layering the supervisor applies, computed by the same code, so
+what you see is what the service gets.
+
+The command inherits servicrab's stdin, stdout and stderr, so interactive tools
+work, pipes work, and nothing of servicrab's own ends up in the output. Its exit
+status becomes servicrab's:
+
+| Situation | Exit code |
+|---|---|
+| The command exited | the command's own exit code |
+| The command was killed by signal *N* | `128 + N` |
+| The command was not found | `127` |
+| The command was found but not executable | `126` |
+| Unknown service, or a config that does not load | `1` |
+
+Everything after the service name belongs to the command, including its own
+flags, so `servicrab exec api -- ls --all` passes `--all` to `ls`. Use `--` to
+make that explicit; a value that could be mistaken for one of servicrab's own
+options needs it.
+
+Unlike `docker exec`, this does **not** enter a running process: there is no
+namespace to join, and no daemon is involved. That cuts both ways. It works on a
+stack that is not running, which is what makes it useful for debugging a service
+that will not start — but it cannot show you anything the process changed about
+its own environment after it started.
 
 ---
 

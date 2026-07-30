@@ -5,6 +5,36 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `servicrab exec <SERVICE> -- <COMMAND>...`, for the questions that start with
+  "but what does the service actually see?":
+
+  ```sh
+  servicrab exec api -- printenv DATABASE_URL
+  servicrab exec api -- npm run migrate
+  servicrab exec db -- psql
+  ```
+
+  It runs the command with the service's merged environment, its `env_file`
+  layers and its working directory, assembled by the same code that starts the
+  service, so the two cannot drift apart. The command inherits servicrab's
+  stdio — interactive tools and pipes work, and nothing of servicrab's own
+  reaches the output — and its exit status is passed through, with `127` for a
+  command that does not exist and `126` for one that is not executable, as a
+  shell would.
+
+  Unlike `docker exec` it does not enter a running process: no daemon is
+  involved and no namespace is joined. That is the point. Debugging a service
+  that refuses to start is exactly when there is nothing to attach to, and it is
+  also the limit — a variable the process changed after startup is not visible
+  here.
+
+  Everything after the service name belongs to the command, including its own
+  flags.
+
 ## [0.2.0] - 2026-07-30
 
 Mostly about the config file: a stack of a dozen services can now be split
@@ -244,5 +274,6 @@ config commands work and the runtime reports `UnsupportedPlatform`.
 - `servicrab up --json` and `servicrab watch --json` emit the same event lines
   the daemon streams, for scripts and wrappers.
 
+[Unreleased]: https://github.com/gaborini/servicrab/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/gaborini/servicrab/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/gaborini/servicrab/releases/tag/v0.1.0

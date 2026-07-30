@@ -67,6 +67,15 @@ asked, not that they never failed.
 \fB1\fR
 The command failed: an invalid configuration, no daemon running, an unknown
 service, or a service that exhausted its restart budget.
+.TP
+\fB126\fR, \fB127\fR
+\fBexec\fR could not run the command: found but not executable (126), or not
+found (127).  These follow the shell convention, so a script can tell a missing
+command from one that ran and failed.
+.TP
+\fBanything else\fR
+\fBexec\fR and \fBrun\fR pass through the status of the process they ran: its own
+exit code, or \fB128+N\fR when a signal \fIN\fR killed it.
 .SH SEE ALSO
 Full documentation, including the configuration reference, at
 \fBhttps://github.com/gaborini/servicrab\fR

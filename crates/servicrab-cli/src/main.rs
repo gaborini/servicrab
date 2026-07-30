@@ -7,6 +7,8 @@
 //! - `servicrab list [--config PATH] [--json]` — list services
 //! - `servicrab run <SERVICE> [--config PATH] [--no-restart]` — run one
 //!   service in the foreground (Linux/macOS)
+//! - `servicrab exec <SERVICE> -- <COMMAND>...` — run a command in a service's
+//!   environment
 //! - `servicrab up [SERVICE...]` — run a whole stack in the foreground
 //!   (Linux/macOS)
 //! - `servicrab watch [SERVICE...]` — `up` with restart-on-file-change
@@ -97,6 +99,29 @@ enum Commands {
         /// Never restart the service, whatever the configured policy says.
         #[arg(long, default_value_t = false)]
         no_restart: bool,
+    },
+
+    /// Run a command in a service's environment: its merged env, env_file
+    /// layers and working directory.  Does not need the service to be running.
+    Exec {
+        /// Name of the service whose environment to use, as defined in
+        /// [services.<name>].
+        service: String,
+
+        /// Path to the configuration file.  If omitted, discovers
+        /// servicrab.toml by walking up from the current directory.
+        #[arg(long, short = 'c')]
+        config: Option<std::path::PathBuf>,
+
+        /// The command to run, after `--`.  Everything from here on belongs to
+        /// the command, including its own flags.
+        #[arg(
+            required = true,
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "COMMAND"
+        )]
+        command: Vec<String>,
     },
 
     /// Run a whole stack in the foreground: start every service in dependency
@@ -420,6 +445,11 @@ fn main() {
             config,
             no_restart,
         } => commands::run::run(&service, config.as_deref(), no_restart),
+        Commands::Exec {
+            service,
+            config,
+            command,
+        } => commands::exec::run(&service, &command, config.as_deref()),
         Commands::Up {
             services,
             config,
