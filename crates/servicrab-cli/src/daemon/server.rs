@@ -12,14 +12,15 @@ use servicrab_core::runtime::stack::{Control, ControlTx, StackOptions, StackSupe
 use servicrab_core::runtime::{control_channel, shutdown_channel, wait_for_shutdown};
 use servicrab_core::{
     event_channel, load, plan_stack, Config, EventKind, EventReceiver, EventSender, LogRouter,
-    ServiceName, ServiceState, ShutdownReason, SignalWatcher, StatusRegistry,
+    ServiceName, ShutdownReason, SignalWatcher, StatusRegistry,
 };
-use servicrab_protocol::{decode, encode, Event, Request, Response};
+use servicrab_protocol::{decode, encode, Request, Response};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 
 use super::paths::DaemonPaths;
+use crate::wire::{to_wire_event, to_wire_status};
 
 /// How many events a slow subscriber may fall behind before it is told that
 /// it missed some.  Log lines dominate the stream, so this is generous.
@@ -373,74 +374,6 @@ async fn stream_events(
     }
 }
 
-/// Translate a runtime event into its wire form.
-fn to_wire_event(kind: &EventKind) -> Event {
-    use servicrab_core::ExitReason;
-
-    match kind {
-        EventKind::State(state) => Event::State {
-            state: to_wire_state(*state),
-        },
-        EventKind::Started { pgid } => Event::Started { pgid: *pgid },
-        EventKind::Log { stream, line } => Event::Log {
-            stream: match stream {
-                servicrab_core::Stream::Stdout => servicrab_protocol::Stream::Stdout,
-                servicrab_core::Stream::Stderr => servicrab_protocol::Stream::Stderr,
-            },
-            line: line.clone(),
-        },
-        EventKind::Exited { reason, uptime } => Event::Exited {
-            reason: reason.to_string(),
-            code: match reason {
-                ExitReason::Code(code) => Some(*code),
-                _ => None,
-            },
-            signal: match reason {
-                ExitReason::Signal(signal) => Some(*signal),
-                _ => None,
-            },
-            uptime_ms: uptime.as_millis() as u64,
-        },
-        EventKind::Backoff { delay, attempt } => Event::Backoff {
-            delay_ms: delay.as_millis() as u64,
-            attempt: *attempt,
-        },
-        EventKind::Skipped { dependency } => Event::Skipped {
-            dependency: dependency.to_string(),
-        },
-        EventKind::Stopping { reason } => Event::Stopping {
-            reason: reason.to_string(),
-        },
-        EventKind::Finished { summary } => Event::Finished {
-            summary: summary.clone(),
-        },
-        EventKind::Healthy => Event::Healthy,
-        EventKind::HealthProbeFailed {
-            message,
-            consecutive,
-            retries,
-        } => Event::HealthProbeFailed {
-            message: message.clone(),
-            consecutive: *consecutive,
-            retries: *retries,
-        },
-        EventKind::Unhealthy { message } => Event::Unhealthy {
-            message: message.clone(),
-        },
-        EventKind::WatchTriggered { path, changed } => Event::WatchTriggered {
-            path: path.display().to_string(),
-            changed: *changed,
-        },
-        EventKind::WatchFailed { message } => Event::WatchFailed {
-            message: message.clone(),
-        },
-        EventKind::WatchTruncated { limit } => Event::WatchTruncated { limit: *limit },
-        EventKind::Failed { message } => Event::Failed {
-            message: message.clone(),
-        },
-    }
-}
-
 async fn respond(request: Request, session: &Session) -> Response {
     match request {
         Request::Ping => Response::Pong {
@@ -454,7 +387,7 @@ async fn respond(request: Request, session: &Session) -> Response {
                 };
             };
             Response::Status {
-                services: registry.snapshot().iter().map(to_wire).collect(),
+                services: registry.snapshot().iter().map(to_wire_status).collect(),
             }
         }
         Request::Shutdown => {
@@ -633,39 +566,6 @@ async fn command(
         Err(_) => Response::Error {
             message: "the stack stopped before the command completed".to_string(),
         },
-    }
-}
-
-/// Convert a runtime status into its wire representation.
-fn to_wire_state(state: ServiceState) -> servicrab_protocol::ServiceState {
-    use servicrab_protocol::ServiceState as Wire;
-
-    match state {
-        ServiceState::Pending => Wire::Pending,
-        ServiceState::Starting => Wire::Starting,
-        ServiceState::Running => Wire::Running,
-        ServiceState::Backoff => Wire::Backoff,
-        ServiceState::Stopping => Wire::Stopping,
-        ServiceState::Stopped => Wire::Stopped,
-        ServiceState::Exited => Wire::Exited,
-        ServiceState::Failed => Wire::Failed,
-    }
-}
-
-fn to_wire(status: &servicrab_core::ServiceStatus) -> servicrab_protocol::ServiceInfo {
-    servicrab_protocol::ServiceInfo {
-        name: status.name.to_string(),
-        state: to_wire_state(status.state),
-        pid: status.pid,
-        uptime_secs: status.uptime.map(|d| d.as_secs()),
-        restarts: status.restarts,
-        health: match status.health {
-            servicrab_core::Health::None => servicrab_protocol::Health::None,
-            servicrab_core::Health::Starting => servicrab_protocol::Health::Starting,
-            servicrab_core::Health::Healthy => servicrab_protocol::Health::Healthy,
-            servicrab_core::Health::Unhealthy => servicrab_protocol::Health::Unhealthy,
-        },
-        message: status.message.clone(),
     }
 }
 

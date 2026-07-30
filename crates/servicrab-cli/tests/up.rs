@@ -685,3 +685,81 @@ shutdown_timeout = "1s"
         "a descendant outlived the stack shutdown"
     );
 }
+
+#[test]
+fn json_mode_emits_one_protocol_event_per_line() {
+    let dir = TempDir::new().unwrap();
+    let hello = script(dir.path(), "hello.sh", "echo hi\necho oops >&2");
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.hello]
+command = ["{}"]
+"#,
+            hello.display()
+        ),
+    );
+
+    let (code, stdout, stderr) = up(&cfg, &["--json"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+
+    let events: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("{line:?}: {e}")))
+        .collect();
+    assert!(!events.is_empty(), "no events on stdout");
+    assert!(events.iter().all(|e| e["type"] == "event"));
+    assert!(events.iter().all(|e| e["service"] == "hello"));
+
+    // Captured output keeps its stream, and both streams end up on stdout.
+    let logs: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["event"]["kind"] == "log")
+        .collect();
+    assert_eq!(logs.len(), 2, "{stdout}");
+    assert_eq!(logs[0]["event"]["line"], "hi");
+    assert_eq!(logs[0]["event"]["stream"], "stdout");
+    assert_eq!(logs[1]["event"]["line"], "oops");
+    assert_eq!(logs[1]["event"]["stream"], "stderr");
+
+    // The lifecycle is there too, in order.
+    let kinds: Vec<&str> = events
+        .iter()
+        .filter_map(|e| e["event"]["kind"].as_str())
+        .collect();
+    assert!(kinds.contains(&"started"), "{kinds:?}");
+    assert!(kinds.contains(&"exited"), "{kinds:?}");
+    assert_eq!(kinds.last(), Some(&"finished"), "{kinds:?}");
+}
+
+#[test]
+fn json_mode_keeps_the_banner_off_stdout() {
+    let dir = TempDir::new().unwrap();
+    let hello = script(dir.path(), "hello.sh", "echo hi");
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.hello]
+command = ["{}"]
+"#,
+            hello.display()
+        ),
+    );
+
+    let (_, stdout, _) = up(&cfg, &["--json"]);
+    assert!(!stdout.contains("servicrab up"), "{stdout}");
+    for line in stdout.lines() {
+        assert!(
+            serde_json::from_str::<serde_json::Value>(line).is_ok(),
+            "not JSON: {line:?}"
+        );
+    }
+}

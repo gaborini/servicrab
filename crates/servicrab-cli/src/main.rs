@@ -28,6 +28,7 @@ use tracing_subscriber::EnvFilter;
 mod commands;
 mod daemon;
 mod style;
+mod wire;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -120,6 +121,11 @@ enum Commands {
         /// Stop the whole stack as soon as one service fails.
         #[arg(long, default_value_t = false)]
         abort_on_failure: bool,
+
+        /// Print one JSON event per line on stdout instead of rendering for a
+        /// terminal.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Run a stack in the foreground and restart services when their watched
@@ -150,6 +156,11 @@ enum Commands {
         /// Stop the whole stack as soon as one service fails.
         #[arg(long, default_value_t = false)]
         abort_on_failure: bool,
+
+        /// Print one JSON event per line on stdout instead of rendering for a
+        /// terminal.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Show the captured log files of one or more services.  Requires a
@@ -367,6 +378,7 @@ fn main() {
             no_prefix,
             timestamps,
             abort_on_failure,
+            json,
         } => commands::up::run(
             &services,
             config.as_deref(),
@@ -376,6 +388,7 @@ fn main() {
                 timestamps,
                 abort_on_failure,
                 require_watch: false,
+                json,
             },
         ),
         Commands::Watch {
@@ -385,6 +398,7 @@ fn main() {
             no_prefix,
             timestamps,
             abort_on_failure,
+            json,
         } => commands::up::run(
             &services,
             config.as_deref(),
@@ -394,6 +408,7 @@ fn main() {
                 timestamps,
                 abort_on_failure,
                 require_watch: true,
+                json,
             },
         ),
         Commands::Start {
