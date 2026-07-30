@@ -8,8 +8,9 @@
 //! * `ForegroundRunner` wraps it with signal handling for `run`.
 //! * `stack::StackSupervisor` runs many services concurrently for `up`.
 //!
-//! A dependent waits for its dependency to be *running*, or to be *healthy*
-//! when that dependency declares a health check.
+//! What a dependent waits for is set per `depends_on` entry by its
+//! [`crate::config::DependencyCondition`], defaulting to *healthy* when the
+//! dependency declares a health check and to *running* otherwise.
 //!
 //! Only Linux and macOS are supported.  On other platforms every entry point
 //! returns [`crate::error::RuntimeError::UnsupportedPlatform`].

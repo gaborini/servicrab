@@ -95,6 +95,88 @@ pub struct RawServiceLogs {
     pub enabled: bool,
 }
 
+/// The two accepted spellings of `depends_on`.
+///
+/// The list form is the short one and says nothing about *what* it waits for;
+/// the table form spells out a condition per dependency, which is the only way
+/// to ask for something other than the default.
+#[derive(Debug)]
+pub enum RawDependsOn {
+    /// `depends_on = ["db"]`
+    Names(Vec<String>),
+    /// `depends_on = { db = { condition = "service_healthy" } }`
+    Detailed(BTreeMap<String, RawDependency>),
+}
+
+// Hand-written rather than `#[serde(untagged)]`, which is what the other
+// either-or field in this file uses.  Untagged buffers the input and reports
+// only "data did not match any variant" when both arms fail, which would turn a
+// typo inside the table — the whole reason `deny_unknown_fields` is on
+// `RawDependency` — into a message that names neither the field nor the
+// service.  Dispatching on the shape keeps the inner error intact.
+impl<'de> Deserialize<'de> for RawDependsOn {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct DependsOnVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for DependsOnVisitor {
+            type Value = RawDependsOn;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a list of service names, or a table of dependency conditions")
+            }
+
+            fn visit_seq<A>(self, seq: A) -> Result<RawDependsOn, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+                    .map(RawDependsOn::Names)
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<RawDependsOn, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                Deserialize::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(RawDependsOn::Detailed)
+            }
+        }
+
+        deserializer.deserialize_any(DependsOnVisitor)
+    }
+}
+
+impl RawDependsOn {
+    /// The declared dependencies as (name, condition) pairs.
+    ///
+    /// The list form keeps its declaration order — which is what makes a
+    /// duplicate entry visible — while the table form is sorted by name, as
+    /// TOML tables cannot repeat a key anyway.
+    pub fn entries(&self) -> Vec<(&str, Option<&str>)> {
+        match self {
+            RawDependsOn::Names(names) => names.iter().map(|n| (n.as_str(), None)).collect(),
+            RawDependsOn::Detailed(map) => map
+                .iter()
+                .map(|(name, dep)| (name.as_str(), dep.condition.as_deref()))
+                .collect(),
+        }
+    }
+}
+
+/// Raw settings for one entry of the table form of `depends_on`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawDependency {
+    /// What "ready" means for this dependency: `service_started`,
+    /// `service_healthy` or `service_completed_successfully`.  Validated by
+    /// the validation layer.
+    #[serde(default)]
+    pub condition: Option<String>,
+}
+
 /// Raw service configuration (`[services.<name>]`).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -115,9 +197,9 @@ pub struct RawService {
     #[serde(default)]
     pub env_file: Option<RawEnvFile>,
 
-    /// Services that must be started before this one.
+    /// Services that must be ready before this one starts.
     #[serde(default)]
-    pub depends_on: Vec<String>,
+    pub depends_on: Option<RawDependsOn>,
 
     /// Whether to start this service automatically.  Defaults to `true`.
     #[serde(default = "default_true")]

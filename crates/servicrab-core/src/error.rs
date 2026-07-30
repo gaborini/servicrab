@@ -93,6 +93,24 @@ pub enum ConfigError {
     #[error("dependency cycle detected: {cycle}")]
     DependencyCycle { cycle: String },
 
+    /// An unrecognised `depends_on` condition.
+    #[error("service {service:?}: unknown condition {value:?} for dependency {dep:?}; expected one of: service_started, service_healthy, service_completed_successfully")]
+    InvalidDependencyCondition {
+        service: String,
+        dep: String,
+        value: String,
+    },
+
+    /// `service_healthy` was asked of a service that has no health check, so
+    /// the condition could never be met.
+    #[error("service {service:?}: dependency {dep:?} has condition \"service_healthy\" but no [health] block, so it can never become healthy")]
+    DependencyNotHealthChecked { service: String, dep: String },
+
+    /// `service_completed_successfully` was asked of a service that is
+    /// restarted forever, so it never stays exited.
+    #[error("service {service:?}: dependency {dep:?} has condition \"service_completed_successfully\" but restart = \"always\", so it never stays exited")]
+    DependencyNeverCompletes { service: String, dep: String },
+
     /// A duration string could not be parsed.
     #[error("service {service:?}: invalid duration {value:?} for field `{field}`: {reason}")]
     InvalidDuration {

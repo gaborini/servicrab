@@ -176,9 +176,12 @@ mod imp {
 
     /// What a status snapshot says about one service's readiness.
     ///
-    /// The same three answers the supervisor's own dependency gating uses, so
-    /// `--wait` returns exactly when a dependent would have been allowed to
-    /// start.
+    /// The same three answers the supervisor's own dependency gating uses under
+    /// its *default* condition, so `--wait` returns when a dependent that did
+    /// not spell out a condition would have been allowed to start.  A spelled
+    /// out `service_completed_successfully` is not reflected: this asks whether
+    /// a service is ready, not whether it satisfies a particular dependent, and
+    /// a status snapshot carries no exit status to check.
     #[derive(Debug, PartialEq, Eq)]
     enum Readiness {
         /// Up, and health-checked if it promised a health check.

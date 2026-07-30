@@ -199,6 +199,56 @@ fn list_json_output() {
 }
 
 #[test]
+fn list_reports_the_effective_dependency_condition() {
+    let toml = r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["echo", "api"]
+depends_on = ["db", "migrate"]
+[services.migrate]
+command = ["echo", "migrate"]
+[services.db]
+command = ["echo", "db"]
+[services.db.health]
+tcp = "127.0.0.1:1"
+"#;
+    let (_dir, path) = temp_dir_with_config(toml);
+
+    let output = cmd()
+        .arg("list")
+        .arg("--config")
+        .arg(&path)
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output).unwrap()).expect("valid JSON");
+    let api = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|svc| svc["name"] == "api")
+        .expect("api in the listing");
+
+    // Neither entry spells a condition out, so both are resolved from the
+    // dependency: the health-checked one gates on a probe, the other does not.
+    assert_eq!(
+        api["depends_on"],
+        serde_json::json!([
+            { "service": "db", "condition": "service_healthy" },
+            { "service": "migrate", "condition": "service_started" },
+        ]),
+        "{json:#}"
+    );
+}
+
+#[test]
 fn list_failure_on_invalid_config() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("servicrab.toml");

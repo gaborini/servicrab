@@ -416,6 +416,126 @@ depends_on = ["db"]
     );
 }
 
+/// The condition a migration or seed step needs: the dependent starts only
+/// after the one-shot has exited, and only if it exited cleanly.
+#[test]
+fn service_completed_successfully_waits_for_the_one_shot_to_exit() {
+    let dir = TempDir::new().unwrap();
+    // The migration stays alive for a moment, so a supervisor that waited only
+    // for the process to *start* would run api while this is still going.
+    script(dir.path(), "migrate.sh", "sleep 0.5");
+    script(dir.path(), "api.sh", "true");
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+
+[project]
+name = "demo"
+
+[services.api]
+command = ["{}"]
+depends_on = {{ migrate = {{ condition = "service_completed_successfully" }} }}
+
+[services.migrate]
+command = ["{}"]
+"#,
+            dir.path().join("api.sh").display(),
+            dir.path().join("migrate.sh").display()
+        ),
+    );
+
+    let (code, stdout, stderr) = up(&cfg, &["--json"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+
+    // As in the start-order test above, the verdict comes from the supervisor's
+    // own event stream: the migration's exit must precede api's start.
+    let order: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|event| {
+            let service = event["service"].as_str()?;
+            let kind = event["event"]["kind"].as_str()?;
+            Some(format!("{service}/{kind}"))
+        })
+        .filter(|event| event == "migrate/exited" || event == "api/started")
+        .collect();
+    assert_eq!(order, vec!["migrate/exited", "api/started"], "{stdout}");
+}
+
+#[test]
+fn service_completed_successfully_skips_the_dependent_when_the_one_shot_fails() {
+    let dir = TempDir::new().unwrap();
+    script(dir.path(), "migrate.sh", "exit 1");
+    script(dir.path(), "api.sh", "echo api-started");
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+
+[project]
+name = "demo"
+
+[services.api]
+command = ["{}"]
+depends_on = {{ migrate = {{ condition = "service_completed_successfully" }} }}
+
+[services.migrate]
+command = ["{}"]
+"#,
+            dir.path().join("api.sh").display(),
+            dir.path().join("migrate.sh").display()
+        ),
+    );
+
+    let (code, stdout, stderr) = up(&cfg, &[]);
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(!stdout.contains("api-started"), "stdout: {stdout}");
+    assert!(
+        stderr.contains("never became available"),
+        "stderr: {stderr}"
+    );
+}
+
+/// The counterpart of the test above, and the reason the condition exists: the
+/// short `depends_on` form waits for the dependency to have *started* and never
+/// looks at how it ended, so the same failing migration lets api run.
+#[test]
+fn the_short_dependency_form_does_not_look_at_the_exit_status() {
+    let dir = TempDir::new().unwrap();
+    script(dir.path(), "migrate.sh", "exit 1");
+    script(dir.path(), "api.sh", "echo api-started");
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+
+[project]
+name = "demo"
+
+[services.api]
+command = ["{}"]
+depends_on = ["migrate"]
+
+[services.migrate]
+command = ["{}"]
+"#,
+            dir.path().join("api.sh").display(),
+            dir.path().join("migrate.sh").display()
+        ),
+    );
+
+    let (code, stdout, stderr) = up(&cfg, &[]);
+    assert!(stdout.contains("api-started"), "stdout: {stdout}");
+    // And the run as a whole passes: a service that exits on its own is not a
+    // stack failure, which is precisely why the exit status of a migration goes
+    // unnoticed unless something waits for it.
+    assert_eq!(code, 0, "{stdout}{stderr}");
+}
+
 #[test]
 fn ctrl_c_stops_the_whole_stack() {
     let dir = TempDir::new().unwrap();
