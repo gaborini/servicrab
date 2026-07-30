@@ -194,7 +194,7 @@ pub fn validate_raw(
             .as_ref()
             .and_then(|raw_health| validate_health(raw_health, raw_name, &mut errors));
 
-        let log_to_file = raw_svc.logs.as_ref().map_or(true, |logs| logs.enabled);
+        let log_to_file = raw_svc.logs.as_ref().is_none_or(|logs| logs.enabled);
 
         let watch = raw_svc
             .watch

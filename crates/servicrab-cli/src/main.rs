@@ -13,14 +13,12 @@
 //!   (Linux/macOS)
 //!
 //! - `servicrab logs [SERVICE...]` — read the captured log files
+//! - `servicrab start` / `stop` / `restart` / `reload` / `status` / `down` /
+//!   `daemon` — background daemon control (Linux/macOS)
+//! - `servicrab events [SERVICE...]` — follow the daemon's event stream
+//!   (Linux/macOS)
+//! - `servicrab generate <systemd|launchd>` — write an init-system unit
 //! - `servicrab completions <SHELL>` — print a shell completion script
-//! - `servicrab start` / `status` / `stop` / `restart` / `down` — background
-//!   daemon control (Linux/macOS)
-//!
-//! ## Future phases (TODOs)
-//!
-//! - TODO(phase-2): Live event streaming over the daemon socket.
-//! - TODO(phase-3): Config hot-reload (`servicrab reload`).
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;

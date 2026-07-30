@@ -4,8 +4,8 @@
 //! # Architecture
 //!
 //! This crate is intentionally dependency-light so that it can be shared by
-//! both the CLI and (in a future phase) the daemon without pulling in the full
-//! async runtime.  All I/O is delegated to callers.
+//! the CLI, its daemon, and any other client without pulling in the full async
+//! runtime.  All I/O is delegated to callers.
 //!
 //! ## Usage
 //!
@@ -13,13 +13,9 @@
 //! 2. Call [`load::load`] to read, parse, and validate the file.
 //! 3. Use the resulting [`config::Config`] as the runtime configuration.
 //!
-//! ## Future phases (TODOs)
+//! ## Not implemented yet
 //!
-//! - TODO(phase-2): Add `HealthCheck` configuration (HTTP probe, command
-//!   probe, interval, retries).
-//! - TODO(phase-2): Add a process-table abstraction for the background daemon.
-//! - TODO(phase-3): Support `include` directives to split large configs
-//!   across multiple files.
+//! - `include` directives, to split a large config across several files.
 
 pub mod config;
 pub mod envfile;

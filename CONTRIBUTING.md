@@ -22,13 +22,32 @@ Be respectful and constructive. We follow the [Rust Code of Conduct](https://www
    ```sh
    git checkout -b feat/my-feature
    ```
-4. **Make changes**, then run the checks locally before pushing:
+4. **Make changes**, then run the checks locally before pushing. These are the
+   same commands CI runs, so a clean sweep here means a green pipeline:
    ```sh
    cargo fmt --all
-   cargo clippy --all-targets --all-features -- -D warnings
-   cargo test --all
+   cargo clippy --workspace --all-targets --all-features -- -D warnings
+   cargo test --workspace --all-features
    ```
 5. **Open a pull request** against the `main` branch.
+
+---
+
+## Minimum supported Rust version
+
+Servicrab builds on Rust **1.85** and newer. A CI job checks the workspace on
+exactly that toolchain with `--locked`, so an accidental use of a newer feature
+fails the pipeline rather than a user's build.
+
+Raising the MSRV is allowed when there is a reason for it, but it is a
+deliberate change: bump `rust-version` in the workspace `Cargo.toml` (the CI job
+reads the number from there), mention it in the changelog, and say why in the
+pull request. To reproduce the job locally:
+
+```sh
+rustup toolchain install 1.85
+cargo +1.85 check --workspace --all-features --all-targets --locked
+```
 
 ---
 

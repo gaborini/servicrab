@@ -4,12 +4,8 @@
 //! durations and process outcomes as inputs and returns decisions.  The actual
 //! process handling lives in [`crate::runtime`].
 //!
-//! ## Future phases (TODOs)
-//!
-//! - TODO(phase-2): Track PID and start timestamp inside the running state once
-//!   the daemon needs to report a process table.
-//! - TODO(phase-3): Add a `Degraded` state for services that pass their health
-//!   check but report warnings.
+//! Per-process bookkeeping the daemon reports (pid, uptime, restart count)
+//! lives in [`crate::runtime::status`], not in these types.
 
 use std::time::Duration;
 

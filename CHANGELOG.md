@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The declared minimum supported Rust version is now **1.85**, up from the
+  previously documented 1.75. The old number was never true: the dependency
+  tree in `Cargo.lock` contains crates that require edition 2024, so a 1.75
+  toolchain failed before compiling a single line. Nothing in servicrab itself
+  changed — only the promise now matches reality.
+
+### Added
+
+- A CI job that checks the workspace on the declared MSRV with `--locked`, so
+  the minimum supported version is verified on every push instead of being an
+  unchecked claim in the manifest.
+
 ## [0.1.0] - 2026-07-30
 
 The first release. Supervision runs on Linux and macOS; on other platforms the
