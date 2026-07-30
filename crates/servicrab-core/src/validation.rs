@@ -273,6 +273,8 @@ pub fn validate_raw(
             })
             .collect();
 
+        let profiles = validate_profiles(&raw_svc.profiles, raw_name, &mut errors);
+
         let args = raw_svc.command[1..].to_vec();
 
         services.insert(
@@ -285,6 +287,7 @@ pub fn validate_raw(
                 env: merged_env,
                 env_files: svc_env_files,
                 depends_on,
+                profiles,
                 autostart: raw_svc.autostart,
                 restart,
                 restart_delay,
@@ -430,6 +433,35 @@ pub(crate) fn validate_service_name(name: &str) -> Result<ServiceName, ConfigErr
             name: name.to_string(),
             reason,
         })
+}
+
+/// Validate a service's `profiles`, dropping the entries that are unusable.
+///
+/// Profile names follow the service-name rules: they are typed on the command
+/// line, so `--profile` and the config have to agree on what a name may be.
+fn validate_profiles(raw: &[String], service: &str, errors: &mut Vec<ConfigError>) -> Vec<String> {
+    let mut profiles: Vec<String> = Vec::with_capacity(raw.len());
+
+    for name in raw {
+        if let Err(reason) = validate_name(name, 48) {
+            errors.push(ConfigError::InvalidProfileName {
+                service: service.to_string(),
+                profile: name.clone(),
+                reason,
+            });
+            continue;
+        }
+        if profiles.contains(name) {
+            errors.push(ConfigError::DuplicateProfile {
+                service: service.to_string(),
+                profile: name.clone(),
+            });
+            continue;
+        }
+        profiles.push(name.clone());
+    }
+
+    profiles
 }
 
 /// Core name validation (shared between project and service names).
@@ -1741,6 +1773,7 @@ command = ["echo"]
                     "s".to_string(),
                     crate::raw::RawService {
                         origin: None,
+                        profiles: Vec::new(),
                         command: vec!["exe\0cutable".to_string()],
                         cwd: None,
                         env: Default::default(),
@@ -2174,6 +2207,67 @@ shutdown_timeout = "30s"
         load_from_str(toml).expect("valid dependency should pass");
     }
 
+    // ── Profiles ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn profiles_survive_validation_in_declaration_order() {
+        let toml = "version=1\n[project]\nname=\"p\"\n[services.s]\ncommand=[\"echo\"]\nprofiles=[\"test\",\"dev\"]\n";
+        let (cfg, _) = load_from_str(toml).unwrap();
+
+        assert_eq!(
+            cfg.services[&ServiceName("s".to_string())].profiles,
+            ["test", "dev"]
+        );
+    }
+
+    #[test]
+    fn a_service_without_profiles_has_none() {
+        let toml = "version=1\n[project]\nname=\"p\"\n[services.s]\ncommand=[\"echo\"]\n";
+        let (cfg, _) = load_from_str(toml).unwrap();
+
+        assert!(cfg.services[&ServiceName("s".to_string())]
+            .profiles
+            .is_empty());
+    }
+
+    #[test]
+    fn a_profile_name_follows_the_service_name_rules() {
+        // It is typed on the command line as `--profile dev`, so the two have
+        // to agree on what a name may be.
+        let toml = "version=1\n[project]\nname=\"p\"\n[services.s]\ncommand=[\"echo\"]\nprofiles=[\"not a name\"]\n";
+        let err = expect_one_error(toml);
+
+        assert!(
+            matches!(&err, ConfigError::InvalidProfileName { service, profile, .. }
+                if service == "s" && profile == "not a name"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_profile_name_is_rejected() {
+        let toml =
+            "version=1\n[project]\nname=\"p\"\n[services.s]\ncommand=[\"echo\"]\nprofiles=[\"\"]\n";
+        let err = expect_one_error(toml);
+
+        assert!(
+            matches!(&err, ConfigError::InvalidProfileName { profile, .. } if profile.is_empty()),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_repeated_profile_is_a_typo() {
+        let toml = "version=1\n[project]\nname=\"p\"\n[services.s]\ncommand=[\"echo\"]\nprofiles=[\"dev\",\"dev\"]\n";
+        let err = expect_one_error(toml);
+
+        assert!(
+            matches!(&err, ConfigError::DuplicateProfile { service, profile }
+                if service == "s" && profile == "dev"),
+            "{err:?}"
+        );
+    }
+
     // ── Variable substitution ──────────────────────────────────────────────
 
     #[test]
@@ -2430,6 +2524,7 @@ restart_delay = "2s"
             "s".to_string(),
             RawService {
                 origin: None,
+                profiles: Vec::new(),
                 command: vec!["echo".to_string()],
                 cwd: None,
                 env: env.into_iter().collect(),

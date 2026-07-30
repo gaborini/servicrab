@@ -15,7 +15,8 @@ use servicrab_core::runtime::stack::{
 };
 use servicrab_core::{
     event_channel, load, plan_stack, resolve_config_path, spawn_watchers, watched_services, Config,
-    EventKind, EventReceiver, LogRouter, ServiceName, ShutdownReason, SignalWatcher, Stream,
+    EventKind, EventReceiver, LogRouter, Selection, ServiceName, ShutdownReason, SignalWatcher,
+    Stream,
 };
 
 use crate::style::{self, BOLD, DIM, RESET, SERVICE_COLORS};
@@ -45,7 +46,11 @@ pub struct UpOptions {
 }
 
 /// Run the `up` subcommand, returning the process exit code to use.
-pub fn run(services: &[String], config: Option<&Path>, options: UpOptions) -> Result<i32, String> {
+pub fn run(
+    selection: Selection<'_>,
+    config: Option<&Path>,
+    options: UpOptions,
+) -> Result<i32, String> {
     let path = resolve_config_path(config).map_err(|e| format!("could not find config: {e}"))?;
 
     let (cfg, warnings) = load(&path).map_err(|errors| {
@@ -62,13 +67,7 @@ pub fn run(services: &[String], config: Option<&Path>, options: UpOptions) -> Re
         eprintln!("⚠  {warning}");
     }
 
-    let plan = plan_stack(&cfg, services).map_err(|e| e.to_string())?;
-    if plan.is_empty() {
-        return Err(
-            "no services to start: none of the configured services have autostart = true"
-                .to_string(),
-        );
-    }
+    let plan = plan_stack(&cfg, selection).map_err(|e| e.to_string())?;
 
     let watched = watched_services(&cfg, &plan);
     if options.require_watch && watched.is_empty() {

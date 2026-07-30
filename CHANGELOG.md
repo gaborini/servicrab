@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Profiles, for the services you only sometimes want:
+
+  ```toml
+  [services.mailhog]
+  command = ["mailhog"]
+  profiles = ["dev"]
+  ```
+
+  A service that declares no profiles is always started; one that declares any
+  waits for `servicrab up --profile dev` (or `start`, `watch`, and `generate`,
+  which writes the flag into the unit it produces). Several `--profile` flags
+  add up, and a service in several profiles joins when any one of them is
+  enabled. `servicrab list` shows the groups, in the table and in `--json`.
+
+  Naming a service starts it whatever its profiles say, so a profiled service
+  never needs the flag to be targeted directly. Because that makes explicit
+  names a second way of selecting, passing both is refused rather than silently
+  resolved in favour of one.
+
+  Dependencies come along regardless of their profiles: a service can never run
+  without what it declares in `depends_on`. The daemon keeps the profiles it was
+  started with, so `servicrab reload` re-plans the same stack instead of the
+  smaller one a bare `start` would have produced. A `--profile` no service
+  declares is an error listing the ones that exist.
 - `include`, so a stack of a dozen services does not have to live in one file:
 
   ```toml

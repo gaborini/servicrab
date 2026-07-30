@@ -964,6 +964,7 @@ async fn wait_for_dependencies(deps: &[DependencyEdge], stop: &mut ShutdownRx) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::Selection;
 
     fn name(raw: &str) -> ServiceName {
         crate::validation::validate_service_name(raw).expect("valid test name")
@@ -979,7 +980,8 @@ mod tests {
 
     /// A run state holding idle slots for every service in the config.
     fn state_for(cfg: Config) -> RunState {
-        let plan = crate::runtime::plan_stack(&cfg, &[]).expect("plannable test config");
+        let plan =
+            crate::runtime::plan_stack(&cfg, Selection::default()).expect("plannable test config");
         let mut state = RunState {
             config: Arc::new(cfg),
             plan: Vec::new(),
@@ -1013,7 +1015,7 @@ command = ["sleep", "60"]
     fn an_unchanged_config_produces_an_empty_diff() {
         let state = state_for(config(BASE));
         let cfg = config(BASE);
-        let plan = crate::runtime::plan_stack(&cfg, &[]).unwrap();
+        let plan = crate::runtime::plan_stack(&cfg, Selection::default()).unwrap();
 
         let diff = state.diff(&cfg, &plan);
         assert!(diff.is_empty(), "{diff:?}");
@@ -1028,7 +1030,7 @@ command = ["sleep", "60"]
 command = [\"sleep\", \"60\"]
 "
         ));
-        let plan = crate::runtime::plan_stack(&cfg, &[]).unwrap();
+        let plan = crate::runtime::plan_stack(&cfg, Selection::default()).unwrap();
 
         let diff = state.diff(&cfg, &plan);
         assert_eq!(diff.added, vec![name("cache")]);
@@ -1048,7 +1050,7 @@ name = "demo"
 command = ["sleep", "60"]
 "#,
         );
-        let plan = crate::runtime::plan_stack(&cfg, &[]).unwrap();
+        let plan = crate::runtime::plan_stack(&cfg, Selection::default()).unwrap();
 
         let diff = state.diff(&cfg, &plan);
         assert_eq!(diff.removed, vec![name("worker")]);
@@ -1070,7 +1072,7 @@ command = ["sleep", "90"]
 command = ["sleep", "60"]
 "#,
         );
-        let plan = crate::runtime::plan_stack(&cfg, &[]).unwrap();
+        let plan = crate::runtime::plan_stack(&cfg, Selection::default()).unwrap();
 
         let diff = state.diff(&cfg, &plan);
         assert_eq!(diff.changed, vec![name("api")]);
@@ -1093,7 +1095,7 @@ env = { PORT = "8080" }
 command = ["sleep", "60"]
 "#,
         );
-        let plan = crate::runtime::plan_stack(&cfg, &[]).unwrap();
+        let plan = crate::runtime::plan_stack(&cfg, Selection::default()).unwrap();
 
         assert_eq!(state.diff(&cfg, &plan).changed, vec![name("api")]);
     }
@@ -1108,7 +1110,7 @@ command = ["sleep", "60"]
             .retired = true;
 
         let cfg = config(BASE);
-        let plan = crate::runtime::plan_stack(&cfg, &[]).unwrap();
+        let plan = crate::runtime::plan_stack(&cfg, Selection::default()).unwrap();
         assert_eq!(state.diff(&cfg, &plan).added, vec![name("worker")]);
     }
 
@@ -1129,7 +1131,7 @@ depends_on = ["worker"]
 command = ["sleep", "60"]
 "#,
         );
-        state.plan = crate::runtime::plan_stack(&cfg, &[]).unwrap();
+        state.plan = crate::runtime::plan_stack(&cfg, Selection::default()).unwrap();
         state.config = Arc::new(cfg);
         state.rewire_dependencies();
 

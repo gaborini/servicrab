@@ -257,6 +257,12 @@ pub struct RawService {
     #[serde(default)]
     pub depends_on: Option<RawDependsOn>,
 
+    /// Groups this service belongs to.  A service with no profiles is always
+    /// part of the stack; one with profiles joins only when a command enables
+    /// one of them.
+    #[serde(default)]
+    pub profiles: Vec<String>,
+
     /// Whether to start this service automatically.  Defaults to `true`.
     #[serde(default = "default_true")]
     pub autostart: bool,

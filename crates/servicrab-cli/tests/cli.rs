@@ -3,6 +3,7 @@
 use std::fs;
 
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use tempfile::TempDir;
 
@@ -153,6 +154,53 @@ command = ["echo", "db"]
         .stdout(contains("api"));
 }
 
+#[test]
+fn check_says_which_services_wait_for_a_profile() {
+    let toml = r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["echo", "api"]
+[services.mailhog]
+command = ["echo", "mail"]
+profiles = ["dev"]
+[services.seeder]
+command = ["echo", "seed"]
+profiles = ["dev", "test"]
+"#;
+    let (_dir, path) = temp_dir_with_config(toml);
+
+    cmd()
+        .arg("check")
+        .arg("--config")
+        .arg(&path)
+        .assert()
+        .success()
+        .stdout(contains("profile dev: mailhog, seeder"))
+        .stdout(contains("profile test: seeder"));
+}
+
+#[test]
+fn check_stays_quiet_about_profiles_when_there_are_none() {
+    let toml = r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["echo", "api"]
+"#;
+    let (_dir, path) = temp_dir_with_config(toml);
+
+    cmd()
+        .arg("check")
+        .arg("--config")
+        .arg(&path)
+        .assert()
+        .success()
+        .stdout(contains("profile").not());
+}
+
 // ── list ───────────────────────────────────────────────────────────────────
 
 #[test]
@@ -196,6 +244,52 @@ fn list_json_output() {
     assert!(first["command"].is_array());
     assert!(first["autostart"].as_bool().unwrap());
     assert_eq!(first["restart"].as_str().unwrap(), "never");
+}
+
+// ── profiles ───────────────────────────────────────────────────────────────
+
+#[test]
+fn list_reports_the_profiles_a_service_belongs_to() {
+    let toml = r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["echo"]
+[services.seeder]
+command = ["echo"]
+profiles = ["dev", "test"]
+"#;
+    let (_dir, path) = temp_dir_with_config(toml);
+
+    cmd()
+        .arg("list")
+        .arg("--config")
+        .arg(&path)
+        .assert()
+        .success()
+        .stdout(contains("profiles: dev, test"));
+
+    let output = cmd()
+        .arg("list")
+        .arg("--config")
+        .arg(&path)
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output).unwrap()).expect("valid JSON");
+    assert_eq!(json[0]["name"], "api");
+    assert_eq!(json[0]["profiles"], serde_json::json!([]), "{json:#}");
+    assert_eq!(
+        json[1]["profiles"],
+        serde_json::json!(["dev", "test"]),
+        "{json:#}"
+    );
 }
 
 // ── include ────────────────────────────────────────────────────────────────

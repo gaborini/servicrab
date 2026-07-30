@@ -36,6 +36,8 @@ struct ServiceJson<'a> {
     command: Vec<&'a str>,
     cwd: String,
     depends_on: Vec<DependencyJson<'a>>,
+    /// Empty for a service that is part of every run.
+    profiles: Vec<&'a str>,
     autostart: bool,
     restart: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,6 +66,7 @@ fn print_json(services: &std::collections::BTreeMap<ServiceName, Service>) {
                 command: cmd,
                 cwd: svc.cwd.display().to_string(),
                 depends_on: dependencies(svc, services),
+                profiles: svc.profiles.iter().map(String::as_str).collect(),
                 autostart: svc.autostart,
                 restart: match svc.restart {
                     servicrab_core::RestartPolicy::Never => "never",
@@ -137,6 +140,9 @@ fn print_table(services: &std::collections::BTreeMap<ServiceName, Service>, proj
                 .map(|dep| format!("{} ({})", dep.service, dep.condition))
                 .collect();
             println!("  depends on: {}", deps.join(", "));
+        }
+        if !svc.profiles.is_empty() {
+            println!("  profiles: {}", svc.profiles.join(", "));
         }
         if let Some(health) = &svc.health {
             println!(

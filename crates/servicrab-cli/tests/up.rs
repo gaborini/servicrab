@@ -215,6 +215,102 @@ autostart = false
     assert!(stderr.contains("no services to start"), "stderr: {stderr}");
 }
 
+// ── profiles ───────────────────────────────────────────────────────────────
+
+/// A stack whose `seeder` only runs when a profile asks for it.
+fn profiled_config(dir: &Path) -> PathBuf {
+    config(
+        dir,
+        r#"
+version = 1
+
+[project]
+name = "demo"
+
+[services.api]
+command = ["echo", "api-line"]
+
+[services.seeder]
+command = ["echo", "seeder-line"]
+profiles = ["dev"]
+"#,
+    )
+}
+
+#[test]
+fn a_profiled_service_is_left_out_by_default() {
+    let dir = TempDir::new().unwrap();
+    let cfg = profiled_config(dir.path());
+
+    let (code, stdout, _stderr) = up(&cfg, &[]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    assert!(stdout.contains("api-line"), "stdout: {stdout}");
+    assert!(!stdout.contains("seeder-line"), "stdout: {stdout}");
+}
+
+#[test]
+fn enabling_the_profile_brings_the_service_in() {
+    let dir = TempDir::new().unwrap();
+    let cfg = profiled_config(dir.path());
+
+    let (code, stdout, _stderr) = up(&cfg, &["--profile", "dev"]);
+    assert_eq!(code, 0, "stdout: {stdout}");
+    assert!(stdout.contains("api-line"), "stdout: {stdout}");
+    assert!(stdout.contains("seeder-line"), "stdout: {stdout}");
+}
+
+#[test]
+fn a_profile_no_service_declares_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let cfg = profiled_config(dir.path());
+
+    let (code, _stdout, stderr) = up(&cfg, &["--profile", "prod"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("no service is in profile"), "{stderr}");
+    assert!(
+        stderr.contains("dev"),
+        "the message should list what exists: {stderr}"
+    );
+}
+
+#[test]
+fn naming_services_and_enabling_profiles_at_once_is_refused() {
+    // Two ways of saying what to start, with no unsurprising combination —
+    // better to ask than to let one of them quietly lose.
+    let dir = TempDir::new().unwrap();
+    let cfg = profiled_config(dir.path());
+
+    let (code, _stdout, stderr) = up(&cfg, &["api", "--profile", "dev"]);
+    assert_eq!(code, 2, "clap rejects the combination: {stderr}");
+    assert!(stderr.contains("--profile"), "{stderr}");
+}
+
+#[test]
+fn a_stack_that_is_all_behind_profiles_says_so() {
+    let dir = TempDir::new().unwrap();
+    let cfg = config(
+        dir.path(),
+        r#"
+version = 1
+
+[project]
+name = "demo"
+
+[services.seeder]
+command = ["true"]
+profiles = ["dev"]
+"#,
+    );
+
+    let (code, _stdout, stderr) = up(&cfg, &[]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("no services to start"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("--profile") && stderr.contains("dev"),
+        "the message should point at the way out: {stderr}"
+    );
+}
+
 // ── output ─────────────────────────────────────────────────────────────────
 
 #[test]

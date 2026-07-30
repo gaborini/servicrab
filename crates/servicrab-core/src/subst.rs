@@ -79,9 +79,9 @@ struct Expander<'a> {
 
 impl Expander<'_> {
     fn service(&mut self, service: &mut RawService, scope: &str) {
-        // `depends_on` is left alone: its keys name services, and its
-        // conditions come from a closed set, so a variable there could only
-        // make the shape of the stack depend on who started it.
+        // `depends_on` and `profiles` are left alone: they name services,
+        // groups, and conditions from a closed set, so a variable there could
+        // only make the shape of the stack depend on who started it.
         self.list(&mut service.command, scope, "command");
         self.maybe(service.cwd.as_mut(), scope, "cwd");
         self.map_values(&mut service.env, scope, "env");
@@ -498,6 +498,7 @@ command = ["api"]
 depends_on = ["${V}"]
 [services.web]
 command = ["web"]
+profiles = ["${V}"]
 [services.web.depends_on]
 db = { condition = "${V}" }
 "#;
@@ -511,8 +512,12 @@ db = { condition = "${V}" }
         assert_eq!(raw.project.name, "${V}");
         let entries = raw.services["api"].depends_on.as_ref().unwrap().entries();
         assert_eq!(entries[0].0, "${V}");
-        let web = raw.services["web"].depends_on.as_ref().unwrap().entries();
-        assert_eq!(web[0].1, Some("${V}"));
+        let web = &raw.services["web"];
+        assert_eq!(
+            web.depends_on.as_ref().unwrap().entries()[0].1,
+            Some("${V}")
+        );
+        assert_eq!(web.profiles, ["${V}"]);
     }
 
     #[test]

@@ -51,7 +51,7 @@ pub use filewatch::{scan, spawn_watchers, watch_service, watched_services, FileS
 #[cfg(unix)]
 pub use health::{HealthMonitor, HealthSignal};
 pub use logs::{LogRouter, LogWriter};
-pub use plan::{known_services, lookup_service, plan_stack};
+pub use plan::{known_profiles, known_services, lookup_service, plan_stack, Selection};
 pub use stack::{
     control_channel, Ack, Control, ControlRx, ControlTx, Readiness, ServiceReport, ServiceResult,
     StackOptions, StackOutcome, StackSupervisor,

@@ -30,10 +30,22 @@ const STREAM_BACKLOG: usize = 4096;
 const COLLECTOR_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Options for the daemon body.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct DaemonOptions {
     /// Never restart services, whatever their configured policy says.
     pub no_restart: bool,
+    /// Profiles this daemon supervises.  Kept for the lifetime of the process,
+    /// because a reload has to plan the same stack that was started.
+    pub profiles: Vec<String>,
+}
+
+impl DaemonOptions {
+    fn selection(&self) -> servicrab_core::Selection<'_> {
+        servicrab_core::Selection {
+            services: &[],
+            profiles: &self.profiles,
+        }
+    }
 }
 
 /// Everything the socket side of the daemon may touch.
@@ -51,6 +63,9 @@ struct Session {
     project: String,
     /// Where the configuration was loaded from, so it can be re-read.
     config_path: PathBuf,
+    /// The profiles this daemon was started with: a reload has to plan the same
+    /// stack, or it would quietly drop or adopt services nobody asked about.
+    profiles: Vec<String>,
     /// Kept so reloads can rebuild the watchers.  It is dropped when the
     /// daemon stops, which is what lets the collector task finish: it ends
     /// when the last event sender is gone.
@@ -132,13 +147,7 @@ pub fn serve(
     paths: &DaemonPaths,
     options: DaemonOptions,
 ) -> Result<i32, String> {
-    let plan = plan_stack(cfg, &[]).map_err(|e| e.to_string())?;
-    if plan.is_empty() {
-        return Err(
-            "no services to start: none of the configured services have autostart = true"
-                .to_string(),
-        );
-    }
+    let plan = plan_stack(cfg, options.selection()).map_err(|e| e.to_string())?;
 
     paths.ensure_dir()?;
     // A socket file always survives its daemon, so a stale one is only an
@@ -207,6 +216,7 @@ pub fn serve(
             names: Mutex::new(plan.clone()),
             project: project.clone(),
             config_path: config_path.to_path_buf(),
+            profiles: options.profiles.clone(),
             events: Mutex::new(Some(events_tx.clone())),
             stream: stream_tx,
             watchers: Mutex::new(Vec::new()),
@@ -473,7 +483,11 @@ async fn reload(session: &Session) -> Response {
         tracing::warn!("{warning}");
     }
 
-    let plan = match plan_stack(&cfg, &[]) {
+    let selection = servicrab_core::Selection {
+        services: &[],
+        profiles: &session.profiles,
+    };
+    let plan = match plan_stack(&cfg, selection) {
         Ok(plan) => plan,
         Err(err) => {
             return Response::Error {
@@ -481,11 +495,6 @@ async fn reload(session: &Session) -> Response {
             }
         }
     };
-    if plan.is_empty() {
-        return Response::Error {
-            message: "no services would be left running: none have autostart = true".to_string(),
-        };
-    }
 
     // The registry is updated first so that events from services the reload
     // adds are not dropped for lack of an entry.

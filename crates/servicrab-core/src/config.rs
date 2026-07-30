@@ -355,6 +355,10 @@ pub struct Service {
     pub env_files: Vec<PathBuf>,
     /// Validated dependencies that must be ready before this one starts.
     pub depends_on: Vec<Dependency>,
+    /// Groups this service belongs to, in declaration order.  Empty means the
+    /// service is part of every run; otherwise a command has to enable one of
+    /// these profiles for it to be started on its own.
+    pub profiles: Vec<String>,
     /// Whether the supervisor should start this service automatically.
     pub autostart: bool,
     /// Restart policy.
