@@ -51,3 +51,18 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --all-features
+
+  package:
+    name: package (crates.io dry run)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Catches missing manifest metadata and files left out of the package
+      # long before a release tag depends on them.
+      - name: Package every crate
+        run: cargo package --workspace --locked

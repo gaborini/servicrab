@@ -30,6 +30,26 @@ Think of it as a minimal, zero-dependency alternative to [overmind](https://gith
 
 ## Installation
 
+### Prebuilt binaries
+
+Every release ships a tarball per platform (`x86_64` and `aarch64` for both
+Linux and macOS) on the
+[releases page](https://github.com/gaborini/servicrab/releases), each with a
+`.sha256` next to it:
+
+```sh
+tag=$(curl -fsSL https://api.github.com/repos/gaborini/servicrab/releases/latest | grep -m1 tag_name | cut -d\" -f4)
+target=$(uname -m)-$([ "$(uname -s)" = Darwin ] && echo apple-darwin || echo unknown-linux-gnu)
+curl -fsSL "https://github.com/gaborini/servicrab/releases/download/${tag}/servicrab-${tag#v}-${target}.tar.gz" | tar -xz
+sudo install "servicrab-${tag#v}-${target}/servicrab" /usr/local/bin/
+```
+
+### From crates.io
+
+```sh
+cargo install servicrab
+```
+
 ### From source
 
 ```sh
@@ -787,11 +807,16 @@ cargo test -p servicrab-core config::tests
 - [x] `servicrab watch` — restart on file changes, with ignore rules and debouncing
 - [x] Config hot-reload (`servicrab reload`)
 
-### Phase 4 (current) — Platform integration
+### Phase 4 — Platform integration ✅
 - [x] systemd unit generation (`servicrab generate systemd`)
 - [x] launchd plist generation (`servicrab generate launchd`)
 - [x] Live event streaming over the socket (`servicrab events`, `subscribe`)
 - [x] `--json` event stream for `up` and `watch`
+
+### Phase 5 (current) — Release engineering
+- [x] Publishable crate metadata and a `CHANGELOG.md`
+- [x] Tagged releases with prebuilt Linux and macOS binaries (x86_64 + aarch64)
+- [ ] Published to crates.io
 
 ---
 
