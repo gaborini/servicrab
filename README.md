@@ -16,7 +16,7 @@ Think of it as a minimal, zero-dependency alternative to [overmind](https://gith
 - `servicrab up` — run your whole stack in the foreground: dependency-ordered start, interleaved and colour-prefixed output, reverse-order shutdown (Linux/macOS)
 - Health checks: `command`, `http` and `tcp` probes with readiness gating and automatic restart of unhealthy services
 - Log files: opt-in per-service capture with size-based rotation, plus `servicrab logs [-f]` to read and follow them
-- Background daemon: `servicrab start` / `status` / `down`, with a documented JSON-over-Unix-socket protocol (Linux/macOS)
+- Background daemon: `servicrab start` / `status` / `stop` / `restart` / `down`, with a documented JSON-over-Unix-socket protocol (Linux/macOS)
 - Restart policies: `never`, `on-failure`, `always`, with exponential backoff
 - Per-service environment variables and working directories
 - Dependency declarations and a deterministic start order
@@ -126,6 +126,8 @@ if you want shell semantics.
 | `servicrab logs [SERVICE...] [--config PATH] [-f] [-n N] [--no-prefix]` | Show (and follow) the captured log files |
 | `servicrab start [--config PATH] [--no-restart]` | Start the stack in the background |
 | `servicrab status [--config PATH] [--json]` | Show what the background daemon is doing |
+| `servicrab stop <SERVICE...> [--config PATH]` | Stop individual services in the running daemon |
+| `servicrab restart <SERVICE...> [--config PATH]` | Restart individual services |
 | `servicrab down [--config PATH]` | Stop the daemon and every service it supervises |
 | `servicrab daemon [--config PATH] [--no-restart]` | Run the daemon in the foreground (for systemd/launchd/containers) |
 
@@ -411,6 +413,17 @@ servicrab logs -f        # follow the captured output (needs [project.logs])
 servicrab down           # stop every service in reverse order, then exit
 ```
 
+Individual services can be driven without disturbing the rest of the stack:
+
+```bash
+servicrab stop worker       # stop it; the daemon and everything else stay up
+servicrab start worker      # start it again
+servicrab restart api db    # stop and start, one service at a time
+```
+
+A service stopped this way stays stopped — the restart policy does not bring
+it back, because the stop was deliberate.
+
 ```
 SERVICE  STATE          PID    UPTIME  RESTARTS  HEALTH
 db       running      41231     4m30s         0  healthy
@@ -446,6 +459,13 @@ echo '{"type":"status"}' | nc -U .servicrab/daemon.sock
 | `{"type":"ping"}` | `{"type":"pong","project":"…","pid":123}` |
 | `{"type":"status"}` | `{"type":"status","services":[…]}` |
 | `{"type":"shutdown"}` | `{"type":"ok","message":"stopping the stack"}` |
+| `{"type":"start_service","name":"api"}` | `{"type":"ok","message":"api started"}` |
+| `{"type":"stop_service","name":"api"}` | `{"type":"ok","message":"api stopped"}` |
+| `{"type":"restart_service","name":"api"}` | `{"type":"ok","message":"api restarted"}` |
+
+`stop_service` and `restart_service` only answer once the service has actually
+stopped (and, for a restart, been replaced), so scripts can rely on the reply
+instead of polling.
 
 The wire types live in the `servicrab-protocol` crate, which depends on
 neither the runtime nor Tokio.
@@ -519,7 +539,7 @@ cargo test -p servicrab-core config::tests
 - [x] Detached daemon per project with a Unix-socket JSON API
 - [x] `servicrab start` / `status` / `down` / `daemon`
 - [x] Status snapshot: state, pid, uptime, restarts, health
-- [ ] Per-service `stop` / `restart` through the daemon
+- [x] Per-service `start` / `stop` / `restart` through the daemon
 - [ ] Live event streaming over the socket
 
 ### Phase 3 — Stack management

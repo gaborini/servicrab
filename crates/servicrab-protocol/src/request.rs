@@ -15,4 +15,22 @@ pub enum Request {
 
     /// Ask the daemon to stop the whole stack and exit.
     Shutdown,
+
+    /// Start one service that is currently stopped.
+    StartService {
+        /// Service name as declared in `servicrab.toml`.
+        name: String,
+    },
+
+    /// Stop one service, leaving the rest of the stack alone.
+    StopService {
+        /// Service name as declared in `servicrab.toml`.
+        name: String,
+    },
+
+    /// Stop one service and start it again.
+    RestartService {
+        /// Service name as declared in `servicrab.toml`.
+        name: String,
+    },
 }

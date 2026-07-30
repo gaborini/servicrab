@@ -11,12 +11,12 @@
 //!   (Linux/macOS)
 //!
 //! - `servicrab logs [SERVICE...]` — read the captured log files
-//! - `servicrab start` / `status` / `down` — background daemon control
-//!   (Linux/macOS)
+//! - `servicrab start` / `status` / `stop` / `restart` / `down` — background
+//!   daemon control (Linux/macOS)
 //!
 //! ## Future phases (TODOs)
 //!
-//! - TODO(phase-2): Per-service `stop` / `restart` through the daemon.
+//! - TODO(phase-2): Live event streaming over the daemon socket.
 //! - TODO(phase-3): Config hot-reload (`servicrab reload`).
 
 use clap::{Parser, Subcommand};
@@ -144,9 +144,14 @@ enum Commands {
         no_prefix: bool,
     },
 
-    /// Start the stack in the background and return immediately.
+    /// Start the stack in the background and return immediately, or start
+    /// individual services inside an already running daemon.
     /// Linux and macOS only.
     Start {
+        /// Services to start inside a running daemon.  With no names, the
+        /// daemon itself is started.
+        services: Vec<String>,
+
         /// Path to the configuration file.  If omitted, discovers
         /// servicrab.toml by walking up from the current directory.
         #[arg(long, short = 'c')]
@@ -155,6 +160,32 @@ enum Commands {
         /// Never restart services, whatever their configured policy says.
         #[arg(long, default_value_t = false)]
         no_restart: bool,
+    },
+
+    /// Stop individual services without stopping the daemon.
+    /// Linux and macOS only.
+    Stop {
+        /// Services to stop.
+        #[arg(required = true)]
+        services: Vec<String>,
+
+        /// Path to the configuration file.  If omitted, discovers
+        /// servicrab.toml by walking up from the current directory.
+        #[arg(long, short = 'c')]
+        config: Option<std::path::PathBuf>,
+    },
+
+    /// Restart individual services inside the running daemon.
+    /// Linux and macOS only.
+    Restart {
+        /// Services to restart.
+        #[arg(required = true)]
+        services: Vec<String>,
+
+        /// Path to the configuration file.  If omitted, discovers
+        /// servicrab.toml by walking up from the current directory.
+        #[arg(long, short = 'c')]
+        config: Option<std::path::PathBuf>,
     },
 
     /// Show what the background daemon is doing.  Linux and macOS only.
@@ -246,8 +277,14 @@ fn main() {
                 abort_on_failure,
             },
         ),
-        Commands::Start { config, no_restart } => {
-            commands::daemon::start(config.as_deref(), no_restart)
+        Commands::Start {
+            services,
+            config,
+            no_restart,
+        } => commands::daemon::start(config.as_deref(), &services, no_restart),
+        Commands::Stop { services, config } => commands::daemon::stop(config.as_deref(), &services),
+        Commands::Restart { services, config } => {
+            commands::daemon::restart(config.as_deref(), &services)
         }
         Commands::Status { config, json } => commands::daemon::status(config.as_deref(), json),
         Commands::Down { config } => commands::daemon::down(config.as_deref()),

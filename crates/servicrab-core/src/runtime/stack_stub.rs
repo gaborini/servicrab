@@ -28,6 +28,8 @@ pub struct StackOptions {
     pub no_restart: bool,
     /// Tear the whole stack down as soon as one service fails.
     pub abort_on_failure: bool,
+    /// Keep supervising even when every service has stopped.
+    pub keep_running: bool,
 }
 
 /// How one service ended during a stack run.
@@ -84,6 +86,45 @@ impl StackOutcome {
     }
 }
 
+/// Acknowledgement channel for a [`Control`] command.
+pub type Ack = tokio::sync::oneshot::Sender<Result<String, String>>;
+
+/// A command an operator sends to a running stack.
+#[derive(Debug)]
+pub enum Control {
+    /// Start a service that is not running.
+    Start {
+        /// Which service.
+        service: ServiceName,
+        /// Answered once the command completes.
+        ack: Ack,
+    },
+    /// Stop a running service.
+    Stop {
+        /// Which service.
+        service: ServiceName,
+        /// Answered once the command completes.
+        ack: Ack,
+    },
+    /// Stop a service and start it again.
+    Restart {
+        /// Which service.
+        service: ServiceName,
+        /// Answered once the command completes.
+        ack: Ack,
+    },
+}
+
+/// Sending half of the control channel.
+pub type ControlTx = tokio::sync::mpsc::UnboundedSender<Control>;
+/// Receiving half of the control channel.
+pub type ControlRx = tokio::sync::mpsc::UnboundedReceiver<Control>;
+
+/// Create a control channel.
+pub fn control_channel() -> (ControlTx, ControlRx) {
+    tokio::sync::mpsc::unbounded_channel()
+}
+
 /// Placeholder stack supervisor.
 pub struct StackSupervisor<'a> {
     plan: Vec<ServiceName>,
@@ -106,6 +147,11 @@ impl<'a> StackSupervisor<'a> {
             _options: options,
             _events: events,
         }
+    }
+
+    /// Accept per-service commands while the stack runs.
+    pub fn with_control(self, _control: ControlRx) -> Self {
+        self
     }
 
     /// The services this supervisor would start.

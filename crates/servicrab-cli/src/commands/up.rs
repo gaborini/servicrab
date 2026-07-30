@@ -67,6 +67,7 @@ pub fn run(services: &[String], config: Option<&Path>, options: UpOptions) -> Re
     let stack_options = StackOptions {
         no_restart: options.no_restart,
         abort_on_failure: options.abort_on_failure,
+        keep_running: false,
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

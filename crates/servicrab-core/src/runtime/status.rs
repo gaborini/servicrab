@@ -107,9 +107,13 @@ impl StatusRegistry {
                     entry.pid = None;
                     entry.started_at = None;
                 }
-                // A service that is starting again has not proven itself yet.
-                if matches!(state, ServiceState::Starting) && entry.health != Health::None {
-                    entry.health = Health::Starting;
+                // A service that is starting again has not proven itself yet,
+                // and whatever ended its previous run is now history.
+                if matches!(state, ServiceState::Starting) {
+                    entry.message = None;
+                    if entry.health != Health::None {
+                        entry.health = Health::Starting;
+                    }
                 }
             }
             EventKind::Started { pgid } => {
@@ -253,9 +257,11 @@ mod tests {
             .unwrap()
             .contains("connection refused"));
 
-        // A restart puts the verdict back to "not proven yet".
+        // A restart puts the verdict back to "not proven yet", and drops the
+        // note about the previous run.
         registry.apply(&event("db", EventKind::State(ServiceState::Starting)));
         assert_eq!(registry.snapshot()[0].health, Health::Starting);
+        assert!(registry.snapshot()[0].message.is_none());
     }
 
     #[test]

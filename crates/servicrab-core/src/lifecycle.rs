@@ -201,6 +201,8 @@ pub enum ShutdownReason {
     StackFailure,
     /// The service failed its health check.
     Unhealthy,
+    /// An operator asked for this specific service to stop.
+    Requested,
 }
 
 impl ShutdownReason {
@@ -209,7 +211,7 @@ impl ShutdownReason {
     pub fn is_user_requested(self) -> bool {
         matches!(
             self,
-            ShutdownReason::UserInterrupt | ShutdownReason::Terminated
+            ShutdownReason::UserInterrupt | ShutdownReason::Terminated | ShutdownReason::Requested
         )
     }
 }
@@ -221,6 +223,7 @@ impl std::fmt::Display for ShutdownReason {
             ShutdownReason::Terminated => write!(f, "supervisor terminated"),
             ShutdownReason::RestartLimit => write!(f, "restart limit exhausted"),
             ShutdownReason::StackFailure => write!(f, "another service failed"),
+            ShutdownReason::Requested => write!(f, "stopped on request"),
             ShutdownReason::Unhealthy => write!(f, "failed its health check"),
         }
     }

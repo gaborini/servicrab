@@ -36,6 +36,11 @@ pub struct StackOptions {
     pub no_restart: bool,
     /// Tear the whole stack down as soon as one service fails.
     pub abort_on_failure: bool,
+    /// Keep supervising even when every service has stopped.
+    ///
+    /// The daemon needs this: an operator may stop every service and start one
+    /// again later, which is only possible while the supervisor is alive.
+    pub keep_running: bool,
 }
 
 /// How one service ended during a stack run.
@@ -92,12 +97,106 @@ impl StackOutcome {
     }
 }
 
+/// Acknowledgement channel for a [`Control`] command.
+///
+/// The message describes what happened ("started", "restarted", …); an error
+/// explains why the command was refused.
+pub type Ack = tokio::sync::oneshot::Sender<Result<String, String>>;
+
+/// A command an operator sends to a running stack.
+#[derive(Debug)]
+pub enum Control {
+    /// Start a service that is not running.
+    Start {
+        /// Which service.
+        service: ServiceName,
+        /// Answered once the service has been spawned.
+        ack: Ack,
+    },
+    /// Stop a running service, leaving the rest of the stack alone.
+    Stop {
+        /// Which service.
+        service: ServiceName,
+        /// Answered once the service has actually stopped.
+        ack: Ack,
+    },
+    /// Stop a service and start it again.
+    Restart {
+        /// Which service.
+        service: ServiceName,
+        /// Answered once the replacement has been spawned.
+        ack: Ack,
+    },
+}
+
+/// Sending half of the control channel.
+pub type ControlTx = mpsc::UnboundedSender<Control>;
+/// Receiving half of the control channel.
+pub type ControlRx = mpsc::UnboundedReceiver<Control>;
+
+/// Create a control channel.
+pub fn control_channel() -> (ControlTx, ControlRx) {
+    mpsc::unbounded_channel()
+}
+
+/// Everything the supervisor needs to run — and re-run — one service.
+struct Slot {
+    service: Arc<Service>,
+    deps: Vec<(ServiceName, watch::Receiver<Readiness>)>,
+    readiness: Arc<watch::Sender<Readiness>>,
+    /// Present exactly while a supervision task is alive.
+    stop: Option<crate::runtime::ShutdownTx>,
+    handle: Option<JoinHandle<()>>,
+    /// Set while a stop is only the first half of a restart.
+    restart_when_stopped: bool,
+    /// The client waiting for the in-flight command to complete.
+    pending: Option<Ack>,
+}
+
+impl Slot {
+    /// Start a supervision task for this service.
+    fn spawn(
+        &mut self,
+        events: EventSender,
+        options: RunOptions,
+        reports: mpsc::UnboundedSender<ServiceReport>,
+    ) {
+        // A previous run may have left the signal at `Gone`; dependents that
+        // are still waiting must not act on that stale verdict.
+        let _ = self.readiness.send(Readiness::Pending);
+
+        let (stop_tx, stop_rx) = shutdown_channel();
+        self.stop = Some(stop_tx);
+        self.handle = Some(tokio::spawn(supervise_service(
+            Arc::clone(&self.service),
+            self.deps.clone(),
+            Arc::clone(&self.readiness),
+            stop_rx,
+            events,
+            options,
+            reports,
+        )));
+    }
+
+    fn is_running(&self) -> bool {
+        self.handle.is_some()
+    }
+
+    /// Answer the client waiting on this slot, if there is one.
+    fn answer(&mut self, result: Result<String, String>) {
+        if let Some(ack) = self.pending.take() {
+            let _ = ack.send(result);
+        }
+    }
+}
+
 /// Supervises several services concurrently.
 pub struct StackSupervisor<'a> {
     config: &'a Config,
     plan: Vec<ServiceName>,
     options: StackOptions,
     events: EventSender,
+    control: Option<ControlRx>,
 }
 
 impl<'a> StackSupervisor<'a> {
@@ -116,7 +215,14 @@ impl<'a> StackSupervisor<'a> {
             plan,
             options,
             events,
+            control: None,
         }
+    }
+
+    /// Accept per-service commands while the stack runs.
+    pub fn with_control(mut self, control: ControlRx) -> Self {
+        self.control = Some(control);
+        self
     }
 
     /// The services this supervisor will start, in start order.
@@ -126,75 +232,107 @@ impl<'a> StackSupervisor<'a> {
 
     /// Run the stack until every service has stopped or a shutdown is
     /// requested.
-    pub async fn run(self, shutdown: &mut ShutdownRx) -> StackOutcome {
+    pub async fn run(mut self, shutdown: &mut ShutdownRx) -> StackOutcome {
         let run_options = RunOptions {
             no_restart: self.options.no_restart,
             output: OutputMode::Capture,
         };
 
         let (report_tx, mut report_rx) = mpsc::unbounded_channel::<ServiceReport>();
-        let mut states: BTreeMap<ServiceName, watch::Receiver<Readiness>> = BTreeMap::new();
-        let mut stops: BTreeMap<ServiceName, crate::runtime::ShutdownTx> = BTreeMap::new();
-        let mut handles: BTreeMap<ServiceName, JoinHandle<()>> = BTreeMap::new();
+        let mut slots: BTreeMap<ServiceName, Slot> = BTreeMap::new();
 
         for name in &self.plan {
             let Some(service) = self.config.services.get(name) else {
                 continue;
             };
-            let service = Arc::new(service.clone());
-
             let (state_tx, state_rx) = watch::channel(Readiness::Pending);
-            let (stop_tx, stop_rx) = shutdown_channel();
 
-            // Dependencies always appear earlier in the plan, so their state
-            // channels already exist.
+            // Dependencies always appear earlier in the plan, so their slots
+            // already exist.
             let deps: Vec<(ServiceName, watch::Receiver<Readiness>)> = service
                 .depends_on
                 .iter()
-                .filter_map(|dep| states.get(dep).map(|rx| (dep.clone(), rx.clone())))
+                .filter_map(|dep| {
+                    slots
+                        .get(dep)
+                        .map(|slot| (dep.clone(), slot.readiness.subscribe()))
+                })
                 .collect();
 
-            states.insert(name.clone(), state_rx);
-            stops.insert(name.clone(), stop_tx);
-
-            handles.insert(
-                name.clone(),
-                tokio::spawn(supervise_service(
-                    service,
-                    deps,
-                    state_tx,
-                    stop_rx,
-                    self.events.clone(),
-                    run_options,
-                    report_tx.clone(),
-                )),
-            );
+            let mut slot = Slot {
+                service: Arc::new(service.clone()),
+                deps,
+                readiness: Arc::new(state_tx),
+                stop: None,
+                handle: None,
+                restart_when_stopped: false,
+                pending: None,
+            };
+            drop(state_rx);
+            slot.spawn(self.events.clone(), run_options, report_tx.clone());
+            slots.insert(name.clone(), slot);
         }
 
-        drop(report_tx);
-
-        let total = handles.len();
-        let mut reports: Vec<ServiceReport> = Vec::with_capacity(total);
+        let mut running = slots.len();
+        let mut reports: Vec<ServiceReport> = Vec::with_capacity(running);
         let mut shutdown_reason: Option<ShutdownReason> = None;
 
-        while reports.len() < total {
+        loop {
+            // Without a control channel the stack is done when its services
+            // are; the daemon instead waits to be told to stop.
+            if running == 0 && !self.options.keep_running {
+                break;
+            }
+
             tokio::select! {
                 reason = wait_for_shutdown(shutdown) => {
                     shutdown_reason = Some(reason);
                     break;
                 }
-                report = report_rx.recv() => {
-                    let Some(report) = report else { break };
+                Some(report) = report_rx.recv() => {
+                    running -= 1;
                     let failed = report.result.is_failure();
                     tracing::debug!(service = %report.service, "service finished");
+
+                    if let Some(slot) = slots.get_mut(&report.service) {
+                        slot.stop = None;
+                        slot.handle = None;
+                        if slot.restart_when_stopped {
+                            slot.restart_when_stopped = false;
+                            slot.spawn(self.events.clone(), run_options, report_tx.clone());
+                            running += 1;
+                            slot.answer(Ok("restarted".to_string()));
+                        } else {
+                            slot.answer(Ok("stopped".to_string()));
+                        }
+                    }
+
                     reports.push(report);
                     if failed && self.options.abort_on_failure {
                         shutdown_reason = Some(ShutdownReason::StackFailure);
                         break;
                     }
                 }
+                command = next_control(&mut self.control) => {
+                    self.handle_control(
+                        command,
+                        &mut slots,
+                        &mut running,
+                        run_options,
+                        &report_tx,
+                    );
+                }
             }
         }
+
+        let stops: BTreeMap<ServiceName, crate::runtime::ShutdownTx> = slots
+            .iter()
+            .filter_map(|(name, slot)| slot.stop.clone().map(|stop| (name.clone(), stop)))
+            .collect();
+        let mut handles: BTreeMap<ServiceName, JoinHandle<()>> = slots
+            .iter_mut()
+            .filter_map(|(name, slot)| slot.handle.take().map(|handle| (name.clone(), handle)))
+            .collect();
 
         if let Some(reason) = shutdown_reason {
             self.stop_all(reason, &stops, &mut handles).await;
@@ -207,7 +345,9 @@ impl<'a> StackSupervisor<'a> {
         }
 
         // Every task has finished, so the remaining reports are already
-        // queued.
+        // queued.  The supervisor holds the last sender, so the channel is
+        // drained rather than waited on.
+        drop(report_tx);
         while let Some(report) = report_rx.recv().await {
             reports.push(report);
         }
@@ -215,6 +355,69 @@ impl<'a> StackSupervisor<'a> {
         StackOutcome {
             reports,
             shutdown: shutdown_reason,
+        }
+    }
+
+    /// Apply one operator command to the running stack.
+    fn handle_control(
+        &self,
+        command: Control,
+        slots: &mut BTreeMap<ServiceName, Slot>,
+        running: &mut usize,
+        run_options: RunOptions,
+        reports: &mpsc::UnboundedSender<ServiceReport>,
+    ) {
+        let service = match &command {
+            Control::Start { service, .. }
+            | Control::Stop { service, .. }
+            | Control::Restart { service, .. } => service.clone(),
+        };
+
+        let Some(slot) = slots.get_mut(&service) else {
+            let ack = into_ack(command);
+            let _ = ack.send(Err(format!("{service} is not part of the running stack")));
+            return;
+        };
+
+        // A slot can only track one command at a time; queuing them would
+        // make "stop then restart" ambiguous.
+        if slot.pending.is_some() {
+            let ack = into_ack(command);
+            let _ = ack.send(Err(format!(
+                "{service} is already busy with another command"
+            )));
+            return;
+        }
+
+        match command {
+            Control::Start { ack, .. } => {
+                if slot.is_running() {
+                    let _ = ack.send(Err(format!("{service} is already running")));
+                    return;
+                }
+                slot.spawn(self.events.clone(), run_options, reports.clone());
+                *running += 1;
+                let _ = ack.send(Ok("started".to_string()));
+            }
+            Control::Stop { ack, .. } => {
+                let Some(stop) = slot.stop.clone() else {
+                    let _ = ack.send(Ok("already stopped".to_string()));
+                    return;
+                };
+                slot.pending = Some(ack);
+                let _ = stop.send(Some(ShutdownReason::Requested));
+            }
+            Control::Restart { ack, .. } => {
+                let Some(stop) = slot.stop.clone() else {
+                    slot.spawn(self.events.clone(), run_options, reports.clone());
+                    *running += 1;
+                    let _ = ack.send(Ok("started".to_string()));
+                    return;
+                };
+                slot.restart_when_stopped = true;
+                slot.pending = Some(ack);
+                let _ = stop.send(Some(ShutdownReason::Requested));
+            }
         }
     }
 
@@ -251,6 +454,28 @@ impl<'a> StackSupervisor<'a> {
     }
 }
 
+/// Wait for the next operator command, or forever when there is no control
+/// channel.
+async fn next_control(control: &mut Option<ControlRx>) -> Control {
+    match control {
+        Some(rx) => match rx.recv().await {
+            Some(command) => command,
+            // Every client is gone; the stack keeps running unattended.
+            None => std::future::pending().await,
+        },
+        None => std::future::pending().await,
+    }
+}
+
+/// Take the acknowledgement channel out of a command.
+fn into_ack(command: Control) -> Ack {
+    match command {
+        Control::Start { ack, .. } | Control::Stop { ack, .. } | Control::Restart { ack, .. } => {
+            ack
+        }
+    }
+}
+
 /// Whether a service may start yet.
 enum DependencyWait {
     /// Every dependency is available.
@@ -281,7 +506,7 @@ pub enum Readiness {
 async fn supervise_service(
     service: Arc<Service>,
     deps: Vec<(ServiceName, watch::Receiver<Readiness>)>,
-    readiness: watch::Sender<Readiness>,
+    readiness: Arc<watch::Sender<Readiness>>,
     mut stop: ShutdownRx,
     events: EventSender,
     options: RunOptions,

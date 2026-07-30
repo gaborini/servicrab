@@ -8,11 +8,11 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use servicrab_core::runtime::stack::{StackOptions, StackSupervisor};
-use servicrab_core::runtime::{shutdown_channel, wait_for_shutdown};
+use servicrab_core::runtime::stack::{Control, ControlTx, StackOptions, StackSupervisor};
+use servicrab_core::runtime::{control_channel, shutdown_channel, wait_for_shutdown};
 use servicrab_core::{
-    event_channel, plan_stack, Config, EventKind, EventReceiver, LogRouter, ServiceState,
-    ShutdownReason, SignalWatcher, StatusRegistry,
+    event_channel, plan_stack, Config, EventKind, EventReceiver, LogRouter, ServiceName,
+    ServiceState, ShutdownReason, SignalWatcher, StatusRegistry,
 };
 use servicrab_protocol::{decode, encode, Request, Response};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -57,11 +57,15 @@ pub fn serve(cfg: &Config, paths: &DaemonPaths, options: DaemonOptions) -> Resul
         (name.clone(), has_health)
     }))));
 
+    let names: Vec<ServiceName> = plan.clone();
     let logs = crate::commands::logs::router_for(cfg);
     let project = cfg.project.name.to_string();
     let stack_options = StackOptions {
         no_restart: options.no_restart,
         abort_on_failure: false,
+        // An operator may stop every service and start one again later, which
+        // is only possible while the supervisor is alive.
+        keep_running: true,
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -85,18 +89,22 @@ pub fn serve(cfg: &Config, paths: &DaemonPaths, options: DaemonOptions) -> Resul
         });
 
         let (events_tx, events_rx) = event_channel();
+        let (control_tx, control_rx) = control_channel();
         let collector = tokio::spawn(collect(events_rx, Arc::clone(&registry), logs));
         let server = tokio::spawn(accept_loop(
             listener,
             Arc::clone(&registry),
             stop_tx.clone(),
+            control_tx,
+            names.clone(),
             project.clone(),
         ));
 
         write_pid(&paths.pid)?;
         tracing::info!(project = %project, socket = %paths.socket.display(), "daemon ready");
 
-        let supervisor = StackSupervisor::new(cfg, plan, stack_options, events_tx);
+        let supervisor =
+            StackSupervisor::new(cfg, plan, stack_options, events_tx).with_control(control_rx);
         let outcome = supervisor.run(&mut stop_rx).await;
 
         server.abort();
@@ -137,10 +145,13 @@ async fn collect(
 }
 
 /// Serve clients until the task is cancelled.
+#[allow(clippy::too_many_arguments)]
 async fn accept_loop(
     listener: UnixListener,
     registry: Arc<Mutex<StatusRegistry>>,
     stop: servicrab_core::runtime::ShutdownTx,
+    control: ControlTx,
+    names: Vec<ServiceName>,
     project: String,
 ) {
     loop {
@@ -149,11 +160,13 @@ async fn accept_loop(
         };
         let registry = Arc::clone(&registry);
         let stop = stop.clone();
+        let control = control.clone();
+        let names = names.clone();
         let project = project.clone();
         // One task per client keeps a stuck reader from blocking everybody
         // else.
         tokio::spawn(async move {
-            handle_client(stream, registry, stop, project).await;
+            handle_client(stream, registry, stop, control, names, project).await;
         });
     }
 }
@@ -162,6 +175,8 @@ async fn handle_client(
     stream: UnixStream,
     registry: Arc<Mutex<StatusRegistry>>,
     stop: servicrab_core::runtime::ShutdownTx,
+    control: ControlTx,
+    names: Vec<ServiceName>,
     project: String,
 ) {
     let (read_half, mut write_half) = stream.into_split();
@@ -172,7 +187,7 @@ async fn handle_client(
             continue;
         }
         let response = match decode::<Request>(&line) {
-            Ok(request) => respond(request, &registry, &stop, &project),
+            Ok(request) => respond(request, &registry, &stop, &control, &names, &project).await,
             Err(err) => Response::Error {
                 message: err.to_string(),
             },
@@ -188,10 +203,12 @@ async fn handle_client(
     }
 }
 
-fn respond(
+async fn respond(
     request: Request,
     registry: &Arc<Mutex<StatusRegistry>>,
     stop: &servicrab_core::runtime::ShutdownTx,
+    control: &ControlTx,
+    names: &[ServiceName],
     project: &str,
 ) -> Response {
     match request {
@@ -215,10 +232,70 @@ fn respond(
                 message: Some("stopping the stack".to_string()),
             }
         }
+        Request::StartService { name } => {
+            command(control, names, &name, |service, ack| Control::Start {
+                service,
+                ack,
+            })
+            .await
+        }
+        Request::StopService { name } => {
+            command(control, names, &name, |service, ack| Control::Stop {
+                service,
+                ack,
+            })
+            .await
+        }
+        Request::RestartService { name } => {
+            command(control, names, &name, |service, ack| Control::Restart {
+                service,
+                ack,
+            })
+            .await
+        }
         // `Request` is `#[non_exhaustive]`, so an older daemon can still be
         // asked something it does not know about.
         _ => Response::Error {
             message: "this daemon does not support that request".to_string(),
+        },
+    }
+}
+
+/// Send one per-service command to the supervisor and wait for its verdict.
+async fn command(
+    control: &ControlTx,
+    names: &[ServiceName],
+    name: &str,
+    build: impl FnOnce(ServiceName, servicrab_core::runtime::stack::Ack) -> Control,
+) -> Response {
+    let Some(service) = names.iter().find(|known| known.as_str() == name) else {
+        return Response::Error {
+            message: format!(
+                "unknown service {name:?}; this daemon supervises: {}",
+                names
+                    .iter()
+                    .map(|n| n.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+    };
+
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    if control.send(build(service.clone(), ack_tx)).is_err() {
+        return Response::Error {
+            message: "the supervisor is no longer accepting commands".to_string(),
+        };
+    }
+
+    match ack_rx.await {
+        Ok(Ok(message)) => Response::Ok {
+            message: Some(format!("{name} {message}")),
+        },
+        Ok(Err(message)) => Response::Error { message },
+        // The ack channel is dropped when the stack shuts down mid-command.
+        Err(_) => Response::Error {
+            message: "the stack stopped before the command completed".to_string(),
         },
     }
 }
