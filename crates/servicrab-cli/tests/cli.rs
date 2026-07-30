@@ -198,6 +198,73 @@ fn list_json_output() {
     assert_eq!(first["restart"].as_str().unwrap(), "never");
 }
 
+// ── include ────────────────────────────────────────────────────────────────
+
+/// Write a root config that includes `services/db.toml`, plus that fragment.
+fn temp_dir_with_include(root_extra: &str, fragment: &str) -> (TempDir, std::path::PathBuf) {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join("services")).unwrap();
+    fs::write(dir.path().join("services/db.toml"), fragment).unwrap();
+
+    let path = dir.path().join("servicrab.toml");
+    let root = format!(
+        "version = 1\ninclude = [\"services/db.toml\"]\n[project]\nname = \"demo\"\n{root_extra}"
+    );
+    fs::write(&path, root).unwrap();
+    (dir, path)
+}
+
+#[test]
+fn an_included_service_is_part_of_the_stack() {
+    let (_dir, path) = temp_dir_with_include(
+        "[services.api]\ncommand = [\"echo\", \"api\"]\ndepends_on = [\"db\"]\n",
+        "[services.db]\ncommand = [\"echo\", \"db\"]\n",
+    );
+
+    cmd()
+        .arg("check")
+        .arg("--config")
+        .arg(&path)
+        .assert()
+        .success()
+        .stdout(contains("db"))
+        .stdout(contains("api"));
+}
+
+#[test]
+fn a_relative_path_in_a_fragment_belongs_to_the_fragment() {
+    // `cwd = "."` in services/db.toml means the services directory, so that a
+    // fragment can be moved together with what it describes.
+    let (dir, path) =
+        temp_dir_with_include("", "[services.db]\ncommand = [\"pwd\"]\ncwd = \".\"\n");
+    let services = dir.path().join("services").canonicalize().unwrap();
+
+    cmd()
+        .arg("run")
+        .arg("db")
+        .arg("--config")
+        .arg(&path)
+        .assert()
+        .success()
+        .stdout(contains(services.to_str().unwrap()));
+}
+
+#[test]
+fn a_missing_include_is_reported_with_both_files() {
+    let (_dir, path) = temp_dir_with_config(
+        "version = 1\ninclude = [\"services/db.toml\"]\n[project]\nname = \"demo\"\n",
+    );
+
+    cmd()
+        .arg("check")
+        .arg("--config")
+        .arg(&path)
+        .assert()
+        .failure()
+        .stderr(contains("servicrab.toml"))
+        .stderr(contains("services/db.toml"));
+}
+
 // ── variable substitution ──────────────────────────────────────────────────
 
 /// The config a substitution test loads: one value from the environment, one

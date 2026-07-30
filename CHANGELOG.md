@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `include`, so a stack of a dozen services does not have to live in one file:
+
+  ```toml
+  version = 1
+  include = ["services/db.toml", "services/api.toml"]
+  ```
+
+  An included file holds `[services.<name>]` tables and may include further
+  files; `version` and `[project]` stay in the config every command is pointed
+  at, not least because the project name decides where the daemon keeps its
+  socket.
+
+  Relative paths in an included file belong to that file — its own `include`
+  entries, and the `cwd` and `env_file` of the services it declares — so a
+  fragment can be moved together with the code it describes.
+
+  Merging is not overriding: two files declaring the same service, an `include`
+  cycle, the same file included twice, and `version` or `[project]` in an
+  included file are all configuration errors, reported with the file names
+  involved. `include` paths are not `${VAR}`-substituted, because which files
+  make up a config should not depend on who ran it.
 - `${VAR}` substitution in every value of `servicrab.toml`, so a committed
   config can serve checkouts that disagree about where things live:
 

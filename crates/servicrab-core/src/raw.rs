@@ -8,6 +8,7 @@
 //! names produce a hard error rather than being silently ignored.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use serde::Deserialize;
 
@@ -18,12 +19,61 @@ pub struct RawConfig {
     /// Schema version; must be `1`.
     pub version: u32,
 
+    /// Other files whose services belong to this config.  Emptied by
+    /// [`crate::load::load`], which merges what they declare into `services`.
+    #[serde(default)]
+    pub include: Option<RawInclude>,
+
     /// Project-level metadata.
     pub project: RawProject,
 
     /// Service definitions.  The outer `BTreeMap` key is the service name.
     #[serde(default)]
     pub services: BTreeMap<String, RawService>,
+}
+
+/// An included file: services, and possibly further includes.
+///
+/// `version` and `[project]` are the root config's business, so they are named
+/// here only to be rejected with a message that says where they belong.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawFragment {
+    /// Files this one includes in turn.
+    #[serde(default)]
+    pub include: Option<RawInclude>,
+
+    /// Service definitions.
+    #[serde(default)]
+    pub services: BTreeMap<String, RawService>,
+
+    /// Set when the file declares `version`.
+    #[serde(default)]
+    pub version: Option<serde::de::IgnoredAny>,
+
+    /// Set when the file declares `[project]`.
+    #[serde(default)]
+    pub project: Option<serde::de::IgnoredAny>,
+}
+
+/// One path or a list of paths, as accepted by `include`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum RawInclude {
+    /// `include = "services/db.toml"`
+    One(String),
+    /// `include = ["services/db.toml", "services/api.toml"]`
+    Many(Vec<String>),
+}
+
+impl RawInclude {
+    /// The declared paths, in declaration order.
+    pub fn paths(&self) -> &[String] {
+        match self {
+            RawInclude::One(p) => std::slice::from_ref(p),
+            RawInclude::Many(ps) => ps,
+        }
+    }
 }
 
 /// Raw project metadata (`[project]`).
@@ -181,11 +231,17 @@ pub struct RawDependency {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawService {
+    /// Which file declared this service, filled in by [`crate::load::load`]
+    /// rather than by TOML: with `include`, the file a service came from is
+    /// what its relative paths resolve against.
+    #[serde(skip)]
+    pub origin: Option<PathBuf>,
+
     /// Command to execute: first element is the executable, rest are arguments.
     pub command: Vec<String>,
 
-    /// Working directory (relative paths are resolved against the config
-    /// file's parent directory by the validation layer).
+    /// Working directory (relative paths are resolved against the parent
+    /// directory of the file that declared the service).
     #[serde(default)]
     pub cwd: Option<String>,
 

@@ -8,7 +8,9 @@ Think of it as a minimal, zero-dependency alternative to [overmind](https://gith
 
 ## Features (v0.1)
 
-- Declare your entire local stack in a single `servicrab.toml`
+- Declare your entire local stack in one `servicrab.toml`, or split it across
+  files with `include`
+- `${VAR}` substitution in every config value, strict about unset variables
 - `servicrab init` — scaffold a config in seconds
 - `servicrab check` — validate your config before running anything
 - `servicrab list` — see all services and their restart policies at a glance
@@ -589,6 +591,51 @@ receives. (Values in `servicrab.toml` are — see
 unterminated quote or a line without `=` is a configuration error, reported by
 `servicrab check` with the file name and line number — the stack never starts
 with a half-loaded environment.
+
+---
+
+## Splitting a config across files
+
+A config that describes a dozen services is easier to live with in pieces, so
+`include` pulls services in from other files:
+
+```toml
+version = 1
+include = ["services/db.toml", "services/api.toml"]   # or a single path
+
+[project]
+name = "my-project"
+```
+
+```toml
+# services/db.toml
+[services.db]
+command = ["postgres", "-D", "data"]
+```
+
+An included file holds `[services.<name>]` tables and, if it likes, an
+`include` of its own. `version` and `[project]` stay in `servicrab.toml`: it is
+the file every command is pointed at, and the project name decides where the
+daemon keeps its socket.
+
+**Relative paths in an included file belong to that file.** Both its own
+`include` entries and the `cwd` and `env_file` of the services it declares
+resolve against its directory, so `services/db.toml` can say `cwd = "."` and
+mean `services/`, and a fragment can be moved together with the code it
+describes.
+
+Merging is not overriding. Each of these is a configuration error, reported by
+`servicrab check` with both file names:
+
+- two files declaring the same service — an `include` that quietly replaced a
+  service would be a fine way to spend an afternoon wondering which file is in
+  charge;
+- an `include` cycle, printed as the chain of files that closes it;
+- the same file included from two places;
+- `version` or `[project]` in an included file.
+
+`include` paths are not `${VAR}`-substituted, for the same reason the project
+name is not: which files make up a config should not depend on who ran it.
 
 ---
 

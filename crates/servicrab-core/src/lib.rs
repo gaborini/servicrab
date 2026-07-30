@@ -10,17 +10,15 @@
 //! ## Usage
 //!
 //! 1. Discover or specify the path to `servicrab.toml`.
-//! 2. Call [`load::load`] to read, parse, and validate the file.
+//! 2. Call [`load::load`] to read, parse, and validate the file — including
+//!    any files it pulls in with `include`.
 //! 3. Use the resulting [`config::Config`] as the runtime configuration.
-//!
-//! ## Not implemented yet
-//!
-//! - `include` directives, to split a large config across several files.
 
 pub mod config;
 pub mod envfile;
 pub mod error;
 pub mod graph;
+mod include;
 pub mod lifecycle;
 pub mod load;
 pub mod raw;

@@ -28,6 +28,57 @@ pub enum ConfigError {
     #[error("could not discover servicrab.toml starting from {dir}")]
     ConfigNotFound { dir: PathBuf },
 
+    /// An included file could not be read.
+    #[error("{included_by} includes {path}, which could not be read: {source}")]
+    IncludeRead {
+        /// The file whose `include` names `path`.
+        included_by: PathBuf,
+        /// The path as resolved against the including file's directory.
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// An included file declares something only the root config may.
+    #[error("{path} is included by {included_by}, so it cannot declare {field}; that belongs in the config that includes it")]
+    IncludeNotAFragment {
+        /// The included file.
+        path: PathBuf,
+        /// The file whose `include` names `path`.
+        included_by: PathBuf,
+        /// `version` or `[project]`.
+        field: String,
+    },
+
+    /// The `include` graph contains a cycle.
+    #[error("include cycle detected: {cycle}")]
+    IncludeCycle {
+        /// The files that include each other, joined with ` -> `.
+        cycle: String,
+    },
+
+    /// The same file is included from two places.
+    #[error("{path} is included by both {first} and {second}; a file may only be included once")]
+    IncludeTwice {
+        /// The file included twice.
+        path: PathBuf,
+        /// The file that included it first.
+        first: PathBuf,
+        /// The file that included it again.
+        second: PathBuf,
+    },
+
+    /// Two files declare the same service.
+    #[error("service {service:?} is declared in both {first} and {second}")]
+    DuplicateService {
+        /// The service name declared twice.
+        service: String,
+        /// The file that declared it first.
+        first: PathBuf,
+        /// The file that declared it again.
+        second: PathBuf,
+    },
+
     /// The `version` field is not `1`.
     #[error("unsupported schema version {version}; only version 1 is supported")]
     UnsupportedVersion { version: u32 },

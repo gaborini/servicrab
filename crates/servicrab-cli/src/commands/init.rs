@@ -21,6 +21,13 @@ name = "my-project"
 # [project.env]
 # RUST_LOG = "info"
 
+# ── Splitting this file up ────────────────────────────────────────────────────
+# Services may live in other files.  Paths are relative to this file; an
+# included file holds [services.*] tables (and may include further files), while
+# version and [project] stay here.  Relative paths inside an included file are
+# relative to *it*.
+# include = ["services/db.toml", "services/api.toml"]
+
 # ── Variables ─────────────────────────────────────────────────────────────────
 # Any value below may refer to the environment servicrab runs in:
 #   ${VAR}             the value; an error if VAR is not set
