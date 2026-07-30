@@ -56,6 +56,9 @@ cargo install servicrab
 
 ### From source
 
+Building from source needs Rust **1.85** or newer (the minimum supported
+version, enforced by CI):
+
 ```sh
 git clone https://github.com/gaborini/servicrab
 cd servicrab
@@ -756,14 +759,21 @@ servicrab/
 cargo fmt --all
 
 # Lint (warnings are errors in CI)
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # Test
-cargo test --all
+cargo test --workspace --all-features
 
 # Run a specific test
 cargo test -p servicrab-core config::tests
+
+# Check against the minimum supported Rust version
+rustup toolchain install 1.85
+cargo +1.85 check --workspace --all-features --all-targets --locked
 ```
+
+The commands above are exactly what CI runs, so a clean local sweep means a
+green pipeline.
 
 ---
 

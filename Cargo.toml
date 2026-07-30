@@ -15,7 +15,10 @@ repository = "https://github.com/gaborini/servicrab"
 homepage = "https://github.com/gaborini/servicrab"
 keywords = ["process", "supervisor", "daemon", "cli", "devtools"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.75"
+# Minimum supported Rust version.  Verified by a dedicated CI job — do not
+# raise it without checking the dependency tree, and do not lower it without
+# proving the lockfile still builds.
+rust-version = "1.85"
 
 # Release builds ship to other machines: strip them, and let the optimiser see
 # the whole crate graph.  The extra build time only lands on `--release`.

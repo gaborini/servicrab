@@ -52,6 +52,33 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-features
 
+  msrv:
+    name: msrv (minimum supported Rust version)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      # An MSRV nobody checks is a guess.  Read it from the manifest so the
+      # job cannot drift away from what the crates promise.
+      - name: Read rust-version from the workspace manifest
+        id: msrv
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Workspace MSRV: ${version}"
+
+      - name: Install the MSRV toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      # --locked matters: the promise is about the versions we ship in
+      # Cargo.lock, not about whatever resolves today.
+      - name: Check the workspace on the MSRV
+        run: cargo check --workspace --all-features --all-targets --locked
+
   package:
     name: package (crates.io dry run)
     runs-on: ubuntu-latest

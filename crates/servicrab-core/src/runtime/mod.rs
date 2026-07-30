@@ -8,14 +8,11 @@
 //! * `ForegroundRunner` wraps it with signal handling for `run`.
 //! * `stack::StackSupervisor` runs many services concurrently for `up`.
 //!
+//! A dependent waits for its dependency to be *running*, or to be *healthy*
+//! when that dependency declares a health check.
+//!
 //! Only Linux and macOS are supported.  On other platforms every entry point
 //! returns [`crate::error::RuntimeError::UnsupportedPlatform`].
-//!
-//! ## Future phases (TODOs)
-//!
-//! - TODO(phase-3): Replace "dependency is running" with "dependency is
-//!   healthy" once health probes exist.
-//! - TODO(phase-2): Persist captured output to log files for the daemon.
 
 use tokio::sync::watch;
 
