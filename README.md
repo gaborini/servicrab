@@ -583,10 +583,66 @@ EMPTY=
 PORT=3000                 # trailing comments are stripped
 ```
 
-There is no variable expansion: what is written is what the service receives.
-A missing file, an unterminated quote or a line without `=` is a configuration
-error, reported by `servicrab check` with the file name and line number — the
-stack never starts with a half-loaded environment.
+The file's own contents are never expanded: what is written is what the service
+receives. (Values in `servicrab.toml` are — see
+[Variables in the config](#variables-in-the-config).) A missing file, an
+unterminated quote or a line without `=` is a configuration error, reported by
+`servicrab check` with the file name and line number — the stack never starts
+with a half-loaded environment.
+
+---
+
+## Variables in the config
+
+Every value in `servicrab.toml` can refer to the environment of whoever runs
+`servicrab`, so one committed config can serve checkouts that disagree about
+where things live:
+
+```toml
+[services.api]
+command = ["${NODE:-node}", "server.js"]
+cwd = "${WORKSPACE}/api"
+
+[services.api.env]
+DATABASE_URL = "postgres://localhost:${PG_PORT:-5432}/app"
+```
+
+| Written | Expands to |
+|---|---|
+| `${VAR}` | the value; **an error** when `VAR` is not set |
+| `${VAR:-default}` | `default` when `VAR` is unset or empty |
+| `${VAR-default}` | `default` when `VAR` is unset |
+| `$${VAR}` | a literal `${VAR}` |
+
+An unset variable stops the load and names itself:
+
+```
+error: ✗ servicrab.toml has 1 error(s):
+  • service "api": cwd refers to ${WORKSPACE}, which is not set;
+    use ${WORKSPACE:-default} if it may be absent
+```
+
+That is the point of the feature: a `cwd` that quietly became `/`, or a
+`command` that quietly lost an argument, is harder to diagnose than a config
+that refuses to start.
+
+Three details are worth knowing:
+
+- **The braces are required.** A bare `$` is never special, so the shell
+  snippets that fill a process manager's config keep working —
+  `command = ["sh", "-c", "echo $HOME; echo $$"]` reaches the shell verbatim.
+  This is the one place the syntax narrows Docker Compose's.
+- **Values come from the environment only**, not from `[project.env]`,
+  `[services.<name>.env]` or an `env_file`. Those describe what the *service*
+  will see; substitution happens earlier, while the config is still being read.
+- **Names are not substituted.** The project name and the service names are
+  literal, and so are table keys: `${...}` in an `[services.<name>.env]` key
+  stays as written. The project name in particular decides where the daemon
+  keeps its socket, and a control socket that moves with the environment would
+  be a debugging trap.
+
+Expansion happens before every other check, and it does not recurse: a value
+that expands to `${SOMETHING}` is left at that.
 
 ---
 

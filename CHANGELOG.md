@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `${VAR}` substitution in every value of `servicrab.toml`, so a committed
+  config can serve checkouts that disagree about where things live:
+
+  ```toml
+  [services.api]
+  command = ["${NODE:-node}", "server.js"]
+  cwd = "${WORKSPACE}/api"
+  ```
+
+  `${VAR:-default}` falls back when the variable is unset or empty, `${VAR-default}`
+  only when it is unset, and `$${VAR}` is a literal `${VAR}`. An unset variable
+  with no default is a configuration error naming the variable and the field,
+  not an empty string: a `cwd` that silently became `/` or a `command` that
+  silently lost an argument is worse than a config that refuses to load.
+
+  Unlike Docker Compose, the braces are required — a bare `$` is never special.
+  Half the commands in a process manager are shell snippets, and eating the `$i`
+  of `while ...; do echo $i; done` at load time, against the wrong environment,
+  would cost more than it saves.
+
+  Values are read from the environment servicrab runs in, not from
+  `[project.env]`, `[services.<name>.env]` or an `env_file`, which describe what
+  the *service* will see. Table keys and the project and service names are not
+  substituted; the project name decides where the daemon keeps its socket, and a
+  control socket that moves with the environment would be a debugging trap.
 - Docker-Compose-style conditions on `depends_on`, spelled with the table form:
 
   ```toml

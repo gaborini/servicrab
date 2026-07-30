@@ -39,6 +39,16 @@ pub fn validate_raw(
     let mut errors: Vec<ConfigError> = Vec::new();
     let mut warnings: Vec<ConfigWarning> = Vec::new();
 
+    // ── 0. Variable substitution ──────────────────────────────────────────
+    // Before anything else, and fatal on its own: every check below inspects
+    // these strings, and reporting that `${PORT}` is not a valid port number
+    // would be an answer to the wrong question.
+    let mut raw = raw;
+    let subst_errors = crate::subst::expand_raw(&mut raw, &std::env::vars().collect());
+    if !subst_errors.is_empty() {
+        return Err(subst_errors);
+    }
+
     // ── 1. Schema version ─────────────────────────────────────────────────
     if raw.version != SUPPORTED_VERSION {
         errors.push(ConfigError::UnsupportedVersion {
@@ -2151,6 +2161,49 @@ shutdown_timeout = "30s"
     fn valid_dependency_passes() {
         let toml = "version=1\n[project]\nname=\"p\"\n[services.a]\ncommand=[\"echo\"]\n[services.b]\ncommand=[\"echo\"]\ndepends_on=[\"a\"]\n";
         load_from_str(toml).expect("valid dependency should pass");
+    }
+
+    // ── Variable substitution ──────────────────────────────────────────────
+
+    #[test]
+    fn values_are_expanded_before_they_are_validated() {
+        // `PATH` rather than a variable the test sets: `set_var` is unsound to
+        // call while other tests run in the same process.
+        let path = std::env::var("PATH").expect("PATH is set");
+        let toml = r#"
+version = 1
+[project]
+name = "p"
+[services.api]
+command = ["echo"]
+[services.api.env]
+COPIED = "${PATH}"
+"#;
+        let (cfg, _) = load_from_str(toml).unwrap();
+        let api = &cfg.services[&ServiceName("api".to_string())];
+
+        assert_eq!(api.env["COPIED"], path);
+    }
+
+    #[test]
+    fn an_undefined_variable_fails_the_load() {
+        let toml = r#"
+version = 1
+[project]
+name = "p"
+[services.api]
+command = ["echo"]
+cwd = "${SERVICRAB_TEST_UNSET_VARIABLE}"
+"#;
+        let err = expect_one_error(toml);
+
+        // And it is the only error: reporting that the directory does not exist
+        // would be an answer to the wrong question.
+        assert!(
+            matches!(&err, ConfigError::UndefinedVariable { field, variable, .. }
+                if field == "cwd" && variable == "SERVICRAB_TEST_UNSET_VARIABLE"),
+            "{err:?}"
+        );
     }
 
     // ── Dependency conditions ──────────────────────────────────────────────

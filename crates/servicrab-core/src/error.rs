@@ -196,6 +196,28 @@ pub enum ConfigError {
         reason: String,
     },
 
+    /// A value refers to a variable that is not set.
+    #[error("{scope}: {field} refers to ${{{variable}}}, which is not set; use ${{{variable}:-default}} if it may be absent")]
+    UndefinedVariable {
+        /// `"project"` or `service "name"`, used as the message prefix.
+        scope: String,
+        /// Which value, e.g. `command[1]` or `env.PORT`.
+        field: String,
+        /// The variable that was referenced.
+        variable: String,
+    },
+
+    /// A value contains a `${...}` that is not one of the accepted forms.
+    #[error("{scope}: {field} has an invalid substitution: {reason}")]
+    InvalidSubstitution {
+        /// `"project"` or `service "name"`, used as the message prefix.
+        scope: String,
+        /// Which value, e.g. `command[1]` or `env.PORT`.
+        field: String,
+        /// Human-readable reason.
+        reason: String,
+    },
+
     /// A `[watch]` block is unusable.
     #[error("service {service:?}: [watch] {reason}")]
     InvalidWatch {
