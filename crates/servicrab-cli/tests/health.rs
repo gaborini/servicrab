@@ -187,10 +187,11 @@ retries = 2
 fn an_unhealthy_service_is_restarted() {
     let dir = TempDir::new().unwrap();
     let runs = dir.path().join("runs.txt");
-    let flag = dir.path().join("healthy");
 
-    // The probe fails on the first run and succeeds once the service has been
-    // restarted, so the run must end cleanly after exactly one restart.
+    // The probe answers "unhealthy" for the first run of the service and
+    // "healthy" from the second one on.  It keys off the service's own run
+    // log rather than off its own invocation count, so the answer does not
+    // depend on how many times it happens to be called per run.
     script(
         dir.path(),
         "svc.sh",
@@ -200,8 +201,8 @@ fn an_unhealthy_service_is_restarted() {
         dir.path(),
         "probe.sh",
         &format!(
-            "if [ -f {flag} ]; then exit 0; fi\necho x > {flag}\nexit 1",
-            flag = flag.display()
+            "[ \"$(wc -l < {runs} 2>/dev/null || echo 0)\" -ge 2 ]",
+            runs = runs.display()
         ),
     );
 
