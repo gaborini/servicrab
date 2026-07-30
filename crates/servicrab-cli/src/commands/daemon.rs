@@ -14,6 +14,25 @@ use crate::daemon::DaemonPaths;
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long to wait for a stopping daemon to disappear.
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long `--wait` waits for readiness when `--timeout` is not given.
+///
+/// Generous on purpose: this has to cover a health check's `start_period` plus
+/// a probe interval or two, and a wait that gives up too early is worse than
+/// one that takes a moment.
+const WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+/// How often `--wait` asks the daemon for a status snapshot.
+const WAIT_POLL: Duration = Duration::from_millis(100);
+
+/// Options for `servicrab start`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StartOptions {
+    /// Never restart services, whatever their configured policy says.
+    pub no_restart: bool,
+    /// Return only once every started service is ready.
+    pub wait: bool,
+    /// How long to wait for that; [`WAIT_TIMEOUT`] when absent.
+    pub timeout: Option<Duration>,
+}
 
 /// Load the config the daemon commands all need.
 pub(crate) fn setup(config: Option<&Path>) -> Result<(Config, PathBuf, DaemonPaths), String> {
@@ -62,10 +81,15 @@ mod imp {
     pub fn start(
         config: Option<&Path>,
         services: &[String],
-        no_restart: bool,
+        options: StartOptions,
     ) -> Result<i32, String> {
         if !services.is_empty() {
-            return control(config, services, |name| Request::StartService { name });
+            let code = control(config, services, |name| Request::StartService { name })?;
+            if code != 0 || !options.wait {
+                return Ok(code);
+            }
+            let (_, _, paths) = setup(config)?;
+            return wait_for_ready(&paths.socket, services, options.timeout);
         }
 
         let (cfg, config_path, paths) = setup(config)?;
@@ -97,7 +121,7 @@ mod imp {
             .stdin(std::process::Stdio::null())
             .stdout(log)
             .stderr(errors);
-        if no_restart {
+        if options.no_restart {
             command.arg("--no-restart");
         }
         // A new session detaches the daemon from this terminal, so Ctrl+C here
@@ -143,7 +167,136 @@ mod imp {
                 )
             )
         );
+
+        if options.wait {
+            return wait_for_ready(&paths.socket, &[], options.timeout);
+        }
         Ok(0)
+    }
+
+    /// What a status snapshot says about one service's readiness.
+    ///
+    /// The same three answers the supervisor's own dependency gating uses, so
+    /// `--wait` returns exactly when a dependent would have been allowed to
+    /// start.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Readiness {
+        /// Up, and health-checked if it promised a health check.
+        Ready,
+        /// Not there yet, but still on its way.
+        Waiting,
+        /// It will not become ready without someone intervening.
+        Gone(String),
+    }
+
+    fn readiness(service: &ServiceInfo) -> Readiness {
+        use servicrab_protocol::{Health, ServiceState};
+
+        match service.state {
+            ServiceState::Running => match service.health {
+                Health::None | Health::Healthy => Readiness::Ready,
+                // An unhealthy service may still be restarted back into shape,
+                // so this is a wait rather than a verdict.  A verdict this
+                // client does not know about is one to wait out, not to read as
+                // readiness.
+                Health::Starting | Health::Unhealthy | _ => Readiness::Waiting,
+            },
+            // A one-shot service — a migration, a build step — has done its job.
+            // Unless it was stopped precisely because it was unhealthy.
+            ServiceState::Exited if service.health != Health::Unhealthy => Readiness::Ready,
+            ServiceState::Exited => Readiness::Gone("exited unhealthy".to_string()),
+            ServiceState::Failed => Readiness::Gone(
+                service
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "failed".to_string()),
+            ),
+            ServiceState::Stopped => Readiness::Gone("stopped".to_string()),
+            ServiceState::Pending
+            | ServiceState::Starting
+            | ServiceState::Backoff
+            | ServiceState::Stopping
+            // Same reasoning for a state added by a newer daemon: wait, and let
+            // the timeout be the one to give up.
+            | _ => Readiness::Waiting,
+        }
+    }
+
+    /// Poll the daemon until every service in `only` (or all of them) is ready.
+    ///
+    /// The daemon is left running either way: a stack that came up wrong is
+    /// easier to diagnose alive, with `status`, `logs` and `events`.
+    fn wait_for_ready(
+        socket: &Path,
+        only: &[String],
+        timeout: Option<Duration>,
+    ) -> Result<i32, String> {
+        let timeout = timeout.unwrap_or(WAIT_TIMEOUT);
+        let deadline = std::time::Instant::now() + timeout;
+        let color = style::color_enabled();
+
+        loop {
+            let services = match client::send(socket, &Request::Status) {
+                Ok(Response::Status { services }) => services,
+                Ok(Response::Error { message }) => return Err(message),
+                Ok(other) => return Err(format!("unexpected response from the daemon: {other:?}")),
+                Err(client::ClientError::NotRunning) => {
+                    return Err("the daemon stopped while waiting for the stack".to_string())
+                }
+                Err(err) => return Err(err.to_string()),
+            };
+
+            let watched: Vec<&ServiceInfo> = services
+                .iter()
+                .filter(|service| only.is_empty() || only.contains(&service.name))
+                .collect();
+
+            let mut waiting: Vec<&str> = Vec::new();
+            let mut gone: Vec<(&str, String)> = Vec::new();
+            for service in &watched {
+                match readiness(service) {
+                    Readiness::Ready => {}
+                    Readiness::Waiting => waiting.push(&service.name),
+                    Readiness::Gone(why) => gone.push((&service.name, why)),
+                }
+            }
+
+            if !gone.is_empty() {
+                for (name, why) in &gone {
+                    eprintln!("{} {name}: {why}", style::paint(color, RED, "✗"));
+                }
+                return Ok(1);
+            }
+
+            if waiting.is_empty() {
+                println!(
+                    "{} {} service(s) ready",
+                    style::paint(color, GREEN, "✓"),
+                    watched.len()
+                );
+                return Ok(0);
+            }
+
+            if std::time::Instant::now() >= deadline {
+                eprintln!(
+                    "{} timed out after {}: still waiting for {}",
+                    style::paint(color, RED, "✗"),
+                    humantime::format_duration(timeout),
+                    waiting.join(", ")
+                );
+                eprintln!(
+                    "{}",
+                    style::paint(
+                        color,
+                        DIM,
+                        "  the daemon is still running — see `servicrab status` and `servicrab logs`"
+                    )
+                );
+                return Ok(1);
+            }
+
+            std::thread::sleep(WAIT_POLL);
+        }
     }
 
     /// Stop individual services without touching the rest of the stack.
@@ -389,7 +542,7 @@ mod imp {
     pub fn start(
         _config: Option<&Path>,
         _services: &[String],
-        _no_restart: bool,
+        _options: StartOptions,
     ) -> Result<i32, String> {
         Err(UNSUPPORTED.to_string())
     }

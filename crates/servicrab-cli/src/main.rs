@@ -13,8 +13,9 @@
 //!   (Linux/macOS)
 //!
 //! - `servicrab logs [SERVICE...]` — read the captured log files
-//! - `servicrab start` / `stop` / `restart` / `reload` / `status` / `down` /
-//!   `daemon` — background daemon control (Linux/macOS)
+//! - `servicrab start [--wait [--timeout DUR]]` / `stop` / `restart` /
+//!   `reload` / `status` / `down` / `daemon` — background daemon control
+//!   (Linux/macOS)
 //! - `servicrab events [SERVICE...]` — follow the daemon's event stream
 //!   (Linux/macOS)
 //! - `servicrab generate <systemd|launchd>` — write an init-system unit
@@ -28,6 +29,12 @@ mod commands;
 mod daemon;
 mod style;
 mod wire;
+
+/// Parse a `--timeout` value, using the same duration syntax as the config
+/// file (`30s`, `2m`, `1m30s`).
+fn parse_duration(text: &str) -> Result<std::time::Duration, String> {
+    humantime::parse_duration(text).map_err(|e| format!("invalid duration {text:?}: {e}"))
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -203,6 +210,16 @@ enum Commands {
         /// Never restart services, whatever their configured policy says.
         #[arg(long, default_value_t = false)]
         no_restart: bool,
+
+        /// Return only once every started service is ready — running, and
+        /// health-checked if it declares a health check.  Exits non-zero if a
+        /// service fails or the timeout runs out.
+        #[arg(long, default_value_t = false)]
+        wait: bool,
+
+        /// How long --wait waits before giving up, e.g. `90s` or `2m`.
+        #[arg(long, requires = "wait", value_parser = parse_duration)]
+        timeout: Option<std::time::Duration>,
     },
 
     /// Stop individual services without stopping the daemon.
@@ -422,7 +439,17 @@ fn main() {
             services,
             config,
             no_restart,
-        } => commands::daemon::start(config.as_deref(), &services, no_restart),
+            wait,
+            timeout,
+        } => commands::daemon::start(
+            config.as_deref(),
+            &services,
+            commands::daemon::StartOptions {
+                no_restart,
+                wait,
+                timeout,
+            },
+        ),
         Commands::Stop { services, config } => commands::daemon::stop(config.as_deref(), &services),
         Commands::Restart { services, config } => {
             commands::daemon::restart(config.as_deref(), &services)
