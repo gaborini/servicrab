@@ -21,6 +21,14 @@ name = "my-project"
 # [project.env]
 # RUST_LOG = "info"
 
+# ── Variables ─────────────────────────────────────────────────────────────────
+# Any value below may refer to the environment servicrab runs in:
+#   ${VAR}             the value; an error if VAR is not set
+#   ${VAR:-default}    default if VAR is unset or empty
+#   ${VAR-default}     default if VAR is unset
+#   $${VAR}            a literal ${VAR}
+# The braces are required, so a bare $ in a shell snippet is left alone.
+
 # ── Environment files ─────────────────────────────────────────────────────────
 # Dotenv-style files loaded for every service.  Paths are relative to this file.
 # Layering, later wins:  shell env -> project env_file -> [project.env]

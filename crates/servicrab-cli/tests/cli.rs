@@ -198,6 +198,61 @@ fn list_json_output() {
     assert_eq!(first["restart"].as_str().unwrap(), "never");
 }
 
+// ── variable substitution ──────────────────────────────────────────────────
+
+/// The config a substitution test loads: one value from the environment, one
+/// with a default.
+fn config_with_variables() -> &'static str {
+    r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["${SERVICRAB_TEST_EXE}", "--port=${SERVICRAB_TEST_PORT:-3000}"]
+"#
+}
+
+#[test]
+fn values_are_taken_from_the_environment() {
+    let (_dir, path) = temp_dir_with_config(config_with_variables());
+
+    let output = cmd()
+        .arg("list")
+        .arg("--config")
+        .arg(&path)
+        .arg("--json")
+        .env("SERVICRAB_TEST_EXE", "echo")
+        .env_remove("SERVICRAB_TEST_PORT")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output).unwrap()).expect("valid JSON");
+    assert_eq!(
+        json[0]["command"],
+        serde_json::json!(["echo", "--port=3000"]),
+        "{json:#}"
+    );
+}
+
+#[test]
+fn an_unset_variable_is_reported_rather_than_emptied() {
+    let (_dir, path) = temp_dir_with_config(config_with_variables());
+
+    cmd()
+        .arg("check")
+        .arg("--config")
+        .arg(&path)
+        .env_remove("SERVICRAB_TEST_EXE")
+        .assert()
+        .failure()
+        .stderr(contains("SERVICRAB_TEST_EXE"))
+        .stderr(contains("command[0]"));
+}
+
 #[test]
 fn list_reports_the_effective_dependency_condition() {
     let toml = r#"
