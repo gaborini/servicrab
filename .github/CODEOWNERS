@@ -1,0 +1,4 @@
+# Requests a review from the maintainer on every pull request, so nothing waits
+# because nobody was asked.  This does not restrict who may approve: the
+# pull-request rule on `main` decides that.
+*   @gaborini

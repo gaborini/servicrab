@@ -4,6 +4,7 @@ A **lightweight, cross-platform process supervisor** for local development stack
 
 Think of it as a minimal, zero-dependency alternative to [overmind](https://github.com/DarthSim/overmind) or [Honcho](https://github.com/nicksylett/honcho), with a roadmap toward daemon-based management and a local API.
 
+[![CI](https://github.com/gaborini/servicrab/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gaborini/servicrab/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/servicrab.svg)](https://crates.io/crates/servicrab)
 [![MSRV](https://img.shields.io/badge/rustc-1.85%2B-blue.svg)](https://github.com/gaborini/servicrab#from-source)
 

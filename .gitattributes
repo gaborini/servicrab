@@ -1,0 +1,5 @@
+# Every text file is stored with LF in the repository, whatever the machine that
+# committed it uses.  Every file here is LF today, so this changes nothing now;
+# it is here so that a checkout on Windows cannot introduce CRLF later and turn
+# an unrelated pull request into a whole-file diff.
+* text=auto
