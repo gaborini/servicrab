@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `restart = "unless-stopped"`, for the service you sometimes run yourself:
+
+  ```toml
+  [services.api]
+  command = ["node", "server.js"]
+  restart = "unless-stopped"
+  ```
+
+  It restarts exactly like `always`, except that a service stopped with
+  `servicrab stop` stays stopped across `servicrab down` and the next
+  `servicrab start`. A hand-stopped service was already left alone for as long
+  as its daemon lived, whatever its policy; what this policy adds is the memory.
+  `servicrab start api` hands the service back.
+
+  The memory is a list of names in `.servicrab/stopped`, plain text so that
+  deleting it — or a line of it — forgets a stop. It records every hand stop but
+  only `unless-stopped` services act on it, so adopting this changes nothing
+  about an existing stack. Dependents of a held-back service start out stopped
+  too: a service cannot run without what it declares in `depends_on`, and
+  starting one to wait for something nobody will start is not better than
+  leaving it alone. `start --wait` does not wait for either kind, and
+  `servicrab up` ignores the whole thing — a foreground run has nothing to
+  remember.
 - Profiles, for the services you only sometimes want:
 
   ```toml

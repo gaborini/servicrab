@@ -70,7 +70,10 @@ name = "my-project"
 #                 profiles only starts when a command enables one of them
 #                 (`servicrab up --profile dev`); without any, it always starts
 #   autostart     Whether to start automatically (default: true)
-#   restart       never | on-failure | always  (default: never)
+#   restart       never | on-failure | always | unless-stopped (default: never)
+#                 unless-stopped restarts like always, except that a service
+#                 you stopped with `servicrab stop` stays stopped even after
+#                 `servicrab down` and `servicrab start`
 #   restart_delay         Minimum backoff before first restart (default: 1s)
 #   restart_max_delay     Maximum backoff cap (default: 30s)
 #   max_restarts          Give up after this many attempts (default: 10)

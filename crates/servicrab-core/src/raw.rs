@@ -387,6 +387,9 @@ pub enum RawRestartPolicy {
     OnFailure,
     /// Always restart.
     Always,
+    /// Always restart, but do not start again after a daemon restart when the
+    /// service was stopped by hand.
+    UnlessStopped,
 }
 
 fn default_true() -> bool {

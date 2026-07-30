@@ -163,6 +163,7 @@ pub fn validate_raw(
             RawRestartPolicy::Never => RestartPolicy::Never,
             RawRestartPolicy::OnFailure => RestartPolicy::OnFailure,
             RawRestartPolicy::Always => RestartPolicy::Always,
+            RawRestartPolicy::UnlessStopped => RestartPolicy::UnlessStopped,
         };
 
         // Durations
@@ -345,7 +346,10 @@ pub fn validate_raw(
                     });
                 }
                 Some(DependencyCondition::ServiceCompletedSuccessfully)
-                    if target.restart == RawRestartPolicy::Always =>
+                    if matches!(
+                        target.restart,
+                        RawRestartPolicy::Always | RawRestartPolicy::UnlessStopped
+                    ) =>
                 {
                     errors.push(ConfigError::DependencyNeverCompletes {
                         service: raw_name.clone(),
@@ -2087,6 +2091,18 @@ _SVCRAB_TEST_KEY = "service"
     }
 
     #[test]
+    fn restart_policy_unless_stopped() {
+        let (cfg, _) = load_from_str(
+            "version=1\n[project]\nname=\"p\"\n[services.s]\ncommand=[\"echo\"]\nrestart=\"unless-stopped\"\n",
+        )
+        .expect("valid config");
+        assert_eq!(
+            cfg.services[&ServiceName("s".into())].restart,
+            RestartPolicy::UnlessStopped
+        );
+    }
+
+    #[test]
     fn restart_policy_always() {
         let (cfg, _) = load_from_str(
             "version=1\n[project]\nname=\"p\"\n[services.s]\ncommand=[\"echo\"]\nrestart=\"always\"\n",
@@ -2410,6 +2426,18 @@ tcp = "127.0.0.1:1"
         let err = expect_one_error(&with_condition(
             "service_completed_successfully",
             r#"restart = "always""#,
+        ));
+        assert!(
+            matches!(&err, ConfigError::DependencyNeverCompletes { service, dep }
+                if service == "b" && dep == "a"),
+            "{err:?}"
+        );
+
+        // `unless-stopped` restarts just as unconditionally, so it can never
+        // reach a completed run either.
+        let err = expect_one_error(&with_condition(
+            "service_completed_successfully",
+            r#"restart = "unless-stopped""#,
         ));
         assert!(
             matches!(&err, ConfigError::DependencyNeverCompletes { service, dep }

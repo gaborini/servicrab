@@ -20,6 +20,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 
 use super::paths::DaemonPaths;
+use super::stopped;
 use crate::wire::{to_wire_event, to_wire_status};
 
 /// How many events a slow subscriber may fall behind before it is told that
@@ -66,6 +67,8 @@ struct Session {
     /// The profiles this daemon was started with: a reload has to plan the same
     /// stack, or it would quietly drop or adopt services nobody asked about.
     profiles: Vec<String>,
+    /// Where the hand-stopped services are remembered.
+    stopped: PathBuf,
     /// Kept so reloads can rebuild the watchers.  It is dropped when the
     /// daemon stops, which is what lets the collector task finish: it ends
     /// when the last event sender is gone.
@@ -79,6 +82,17 @@ struct Session {
 }
 
 impl Session {
+    /// Remember, or forget, that an operator stopped `service` by hand.
+    ///
+    /// Only `restart = "unless-stopped"` acts on this, and only when a stack is
+    /// started, so a file we could not write costs nothing right now — it is
+    /// logged and the command still succeeds.
+    fn remember(&self, service: &str, is_stopped: bool) {
+        if let Err(problem) = stopped::record(&self.stopped, service, is_stopped) {
+            tracing::warn!("{problem}");
+        }
+    }
+
     fn known_names(&self) -> Vec<ServiceName> {
         self.names
             .lock()
@@ -148,6 +162,18 @@ pub fn serve(
     options: DaemonOptions,
 ) -> Result<i32, String> {
     let plan = plan_stack(cfg, options.selection()).map_err(|e| e.to_string())?;
+    let held_back = stopped::held_back(cfg, &plan, &stopped::read(&paths.stopped));
+    if !held_back.is_empty() {
+        tracing::info!(
+            services = %held_back
+                .iter()
+                .map(ServiceName::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+            file = %paths.stopped.display(),
+            "leaving hand-stopped services (and their dependents) stopped"
+        );
+    }
 
     paths.ensure_dir()?;
     // A socket file always survives its daemon, so a stale one is only an
@@ -217,6 +243,7 @@ pub fn serve(
             project: project.clone(),
             config_path: config_path.to_path_buf(),
             profiles: options.profiles.clone(),
+            stopped: paths.stopped.clone(),
             events: Mutex::new(Some(events_tx.clone())),
             stream: stream_tx,
             watchers: Mutex::new(Vec::new()),
@@ -232,8 +259,9 @@ pub fn serve(
         write_pid(&paths.pid)?;
         tracing::info!(project = %project, socket = %paths.socket.display(), "daemon ready");
 
-        let supervisor =
-            StackSupervisor::new(cfg, plan, stack_options, events_tx).with_control(control_rx);
+        let supervisor = StackSupervisor::new(cfg, plan, stack_options, events_tx)
+            .with_control(control_rx)
+            .with_stopped(held_back);
         let outcome = supervisor.run(&mut stop_rx).await;
 
         // Dropping the last event senders is what ends the collector, so the
@@ -427,25 +455,39 @@ async fn respond(request: Request, session: &Session) -> Response {
             }
         }
         Request::StartService { name } => {
-            command(session, &name, |service, ack| Control::Start {
+            let response = command(session, &name, |service, ack| Control::Start {
                 service,
                 ack,
             })
-            .await
+            .await;
+            // Starting a service is how an operator takes back a stop, whether
+            // it happened in this daemon or in an earlier one.
+            if matches!(response, Response::Ok { .. }) {
+                session.remember(&name, false);
+            }
+            response
         }
         Request::StopService { name } => {
-            command(session, &name, |service, ack| Control::Stop {
+            let response = command(session, &name, |service, ack| Control::Stop {
                 service,
                 ack,
             })
-            .await
+            .await;
+            if matches!(response, Response::Ok { .. }) {
+                session.remember(&name, true);
+            }
+            response
         }
         Request::RestartService { name } => {
-            command(session, &name, |service, ack| Control::Restart {
+            let response = command(session, &name, |service, ack| Control::Restart {
                 service,
                 ack,
             })
-            .await
+            .await;
+            if matches!(response, Response::Ok { .. }) {
+                session.remember(&name, false);
+            }
+            response
         }
         Request::Reload => reload(session).await,
         // `Request` is `#[non_exhaustive]`, so an older daemon can still be

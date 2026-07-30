@@ -177,6 +177,42 @@ fn list(profiles: &[String]) -> String {
     }
 }
 
+/// `seeds` plus every planned service that transitively depends on one of
+/// them.
+///
+/// A service cannot run without what it declares in `depends_on`, so whoever
+/// leaves a service out has to leave its dependents out too — starting them
+/// would only produce dependents that wait for something nobody is going to
+/// start.  Names outside `plan` are ignored, in both the seeds and the result.
+pub fn with_dependents(
+    config: &Config,
+    plan: &[ServiceName],
+    seeds: &BTreeSet<ServiceName>,
+) -> BTreeSet<ServiceName> {
+    let mut held: BTreeSet<ServiceName> = seeds
+        .iter()
+        .filter(|name| plan.contains(name))
+        .cloned()
+        .collect();
+
+    // The plan is topologically ordered, so one pass in start order reaches
+    // every dependent: a service always follows the ones it depends on.
+    for name in plan {
+        let Some(service) = config.services.get(name) else {
+            continue;
+        };
+        if service
+            .depends_on
+            .iter()
+            .any(|dep| held.contains(&dep.service))
+        {
+            held.insert(name.clone());
+        }
+    }
+
+    held
+}
+
 fn collect_with_dependencies(
     config: &Config,
     name: &ServiceName,
@@ -387,5 +423,76 @@ depends_on = ["tools"]
                 if profile == "prod" && known == "dev, test"),
             "{err}"
         );
+    }
+
+    // ── dependents ─────────────────────────────────────────────────────────
+
+    /// `with_dependents` over the whole stack, as sorted names.
+    fn dependents_of(config: &Config, seeds: &[&str]) -> Vec<String> {
+        let seeds: BTreeSet<ServiceName> = config
+            .services
+            .keys()
+            .filter(|name| seeds.contains(&name.as_str()))
+            .cloned()
+            .collect();
+        with_dependents(config, &config.start_order, &seeds)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    const CHAIN: &str = r#"
+version = 1
+[project]
+name = "demo"
+[services.db]
+command = ["true"]
+[services.api]
+command = ["true"]
+depends_on = ["db"]
+[services.web]
+command = ["true"]
+depends_on = ["api"]
+[services.cache]
+command = ["true"]
+"#;
+
+    #[test]
+    fn dependents_are_collected_through_the_chain() {
+        let (_dir, config) = config_with(CHAIN);
+        assert_eq!(dependents_of(&config, &["db"]), ["api", "db", "web"]);
+    }
+
+    #[test]
+    fn a_service_nothing_depends_on_brings_nobody() {
+        let (_dir, config) = config_with(CHAIN);
+        assert_eq!(dependents_of(&config, &["cache"]), ["cache"]);
+    }
+
+    #[test]
+    fn the_far_end_of_the_chain_pulls_nothing_back() {
+        // Dependencies are not dependents: holding `web` back leaves the
+        // services it relies on running.
+        let (_dir, config) = config_with(CHAIN);
+        assert_eq!(dependents_of(&config, &["web"]), ["web"]);
+    }
+
+    #[test]
+    fn a_seed_outside_the_plan_is_ignored_along_with_its_dependents() {
+        let (_dir, config) = config_with(CHAIN);
+        let plan: Vec<ServiceName> = config
+            .start_order
+            .iter()
+            .filter(|name| name.as_str() != "db")
+            .cloned()
+            .collect();
+        let seeds: BTreeSet<ServiceName> = config
+            .services
+            .keys()
+            .filter(|name| name.as_str() == "db")
+            .cloned()
+            .collect();
+
+        assert!(with_dependents(&config, &plan, &seeds).is_empty());
     }
 }

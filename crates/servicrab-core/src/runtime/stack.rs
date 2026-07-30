@@ -12,7 +12,7 @@
 //! promise that the service is *usable*, so a dependent may still need to retry
 //! its own connection attempts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -216,6 +216,7 @@ pub struct StackSupervisor<'a> {
     options: StackOptions,
     events: EventSender,
     control: Option<ControlRx>,
+    stopped: BTreeSet<ServiceName>,
 }
 
 impl<'a> StackSupervisor<'a> {
@@ -235,12 +236,27 @@ impl<'a> StackSupervisor<'a> {
             options,
             events,
             control: None,
+            stopped: BTreeSet::new(),
         }
     }
 
     /// Accept per-service commands while the stack runs.
     pub fn with_control(mut self, control: ControlRx) -> Self {
         self.control = Some(control);
+        self
+    }
+
+    /// Leave these planned services stopped instead of starting them with the
+    /// rest of the stack.
+    ///
+    /// They keep their place in the plan, so a later `Control::Start` brings
+    /// one up, and they report themselves stopped straight away: dependents get
+    /// the same signal they would get from a service stopped by hand, and the
+    /// daemon's status shows why nothing is running.  Who ends up in this set is
+    /// a decision for the caller — see
+    /// [`crate::runtime::with_dependents`].
+    pub fn with_stopped(mut self, stopped: BTreeSet<ServiceName>) -> Self {
+        self.stopped = stopped;
         self
     }
 
@@ -273,13 +289,18 @@ impl<'a> StackSupervisor<'a> {
             state.insert_slot(&name, Arc::new(service));
         }
         state.rewire_dependencies();
+        let mut running = 0;
         for name in state.plan.clone() {
+            if self.stopped.contains(&name) {
+                state.publish_stopped(&name, &self.events);
+                continue;
+            }
             if let Some(slot) = state.slots.get_mut(&name) {
                 slot.spawn(self.events.clone(), run_options, report_tx.clone());
+                running += 1;
             }
         }
 
-        let mut running = state.slots.len();
         let mut reports: Vec<ServiceReport> = Vec::with_capacity(running);
         let mut shutdown_reason: Option<ShutdownReason> = None;
 
@@ -572,6 +593,29 @@ impl RunState {
                 pending: None,
             },
         );
+    }
+
+    /// Report a service as stopped without ever starting it.
+    ///
+    /// The event is what the daemon's status registry and the event stream go
+    /// by; the readiness update is what a dependent goes by, and it says the
+    /// same thing a service stopped by hand would.
+    fn publish_stopped(&self, name: &ServiceName, events: &EventSender) {
+        let Some(slot) = self.slots.get(name) else {
+            return;
+        };
+        // `send_modify` rather than `send`: the value has to be there for a
+        // dependent that subscribes later, even when nobody is watching yet.
+        slot.readiness.send_modify(|status| {
+            *status = DependencyStatus {
+                state: ServiceState::Stopped,
+                ..DependencyStatus::new()
+            };
+        });
+        let _ = events.send(ServiceEvent::new(
+            name.clone(),
+            EventKind::State(ServiceState::Stopped),
+        ));
     }
 
     /// Point every slot at the status of the dependencies it currently has.
@@ -1141,6 +1185,38 @@ command = ["sleep", "60"]
             .map(|edge| edge.name.clone())
             .collect();
         assert_eq!(deps, vec![name("worker")]);
+    }
+
+    #[test]
+    fn a_held_back_service_reports_itself_stopped_without_running() {
+        let state = state_for(config(BASE));
+        let (events, mut stream) = event_channel();
+
+        state.publish_stopped(&name("api"), &events);
+
+        // Dependents must get a verdict rather than wait for a service nobody
+        // is going to start.
+        let status = *state.slots[&name("api")].readiness.borrow();
+        for condition in [
+            DependencyCondition::ServiceStarted,
+            DependencyCondition::ServiceHealthy,
+            DependencyCondition::ServiceCompletedSuccessfully,
+        ] {
+            assert_eq!(
+                status.readiness(condition),
+                Readiness::Gone,
+                "{condition:?}"
+            );
+        }
+
+        let event = stream.try_recv().expect("one event");
+        assert_eq!(event.service, name("api"));
+        assert!(
+            matches!(event.kind, EventKind::State(ServiceState::Stopped)),
+            "{:?}",
+            event.kind
+        );
+        assert!(state.slots[&name("api")].handle.is_none());
     }
 
     #[test]

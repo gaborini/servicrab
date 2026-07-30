@@ -68,6 +68,14 @@ pub enum RestartPolicy {
     OnFailure,
     /// Always restart, regardless of exit status.
     Always,
+    /// Always restart, except that a service stopped by hand stays stopped —
+    /// including across daemon restarts, which is the only way this differs
+    /// from [`RestartPolicy::Always`].
+    ///
+    /// A hand-stopped service is never restarted under any policy; what this
+    /// one adds is that the daemon remembers it, so `servicrab down` followed
+    /// by `servicrab start` does not quietly bring it back.
+    UnlessStopped,
 }
 
 impl std::fmt::Display for RestartPolicy {
@@ -76,6 +84,7 @@ impl std::fmt::Display for RestartPolicy {
             RestartPolicy::Never => write!(f, "never"),
             RestartPolicy::OnFailure => write!(f, "on-failure"),
             RestartPolicy::Always => write!(f, "always"),
+            RestartPolicy::UnlessStopped => write!(f, "unless-stopped"),
         }
     }
 }
