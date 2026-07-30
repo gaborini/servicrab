@@ -23,6 +23,7 @@ use crate::config::RestartPolicy;
 use crate::lifecycle::{ExitReason, ShutdownReason};
 
 pub mod event;
+pub mod filewatch;
 #[cfg(unix)]
 pub mod health;
 pub mod logs;
@@ -48,6 +49,7 @@ pub use stub::{ForegroundRunner, ServiceRunner, SignalWatcher};
 pub use event::{
     event_channel, EventKind, EventReceiver, EventSender, EventSink, ServiceEvent, Stream,
 };
+pub use filewatch::{scan, spawn_watchers, watch_service, watched_services, FileStamp, Scan};
 #[cfg(unix)]
 pub use health::{HealthMonitor, HealthSignal};
 pub use logs::{LogRouter, LogWriter};

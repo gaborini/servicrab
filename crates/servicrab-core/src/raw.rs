@@ -162,6 +162,32 @@ pub struct RawService {
     /// Optional per-service logging settings (`[services.<name>.logs]`).
     #[serde(default)]
     pub logs: Option<RawServiceLogs>,
+
+    /// Optional file-watching settings (`[services.<name>.watch]`).
+    #[serde(default)]
+    pub watch: Option<RawWatch>,
+}
+
+/// Raw file-watching settings (`[services.<name>.watch]`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawWatch {
+    /// Files and directories to watch.  Relative paths resolve against the
+    /// service's working directory.
+    pub paths: Vec<String>,
+
+    /// Names, path prefixes or `*.ext` patterns to ignore.
+    #[serde(default)]
+    pub ignore: Vec<String>,
+
+    /// How often the watched paths are scanned.  Defaults to `"1s"`.
+    #[serde(default)]
+    pub interval: Option<String>,
+
+    /// How long the tree must stay unchanged before the restart fires.
+    /// Defaults to `"300ms"`.
+    #[serde(default)]
+    pub debounce: Option<String>,
 }
 
 /// Raw health-check configuration (`[services.<name>.health]`).

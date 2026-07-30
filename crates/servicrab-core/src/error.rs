@@ -177,6 +177,15 @@ pub enum ConfigError {
         /// Human-readable reason.
         reason: String,
     },
+
+    /// A `[watch]` block is unusable.
+    #[error("service {service:?}: [watch] {reason}")]
+    InvalidWatch {
+        /// Affected service.
+        service: String,
+        /// Human-readable reason.
+        reason: String,
+    },
 }
 
 /// A non-fatal configuration warning.

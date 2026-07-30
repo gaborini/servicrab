@@ -1,5 +1,8 @@
 //! `servicrab up [SERVICE...]` — run a whole stack in the foreground.
 //!
+//! `servicrab watch` is the same supervisor with a stricter entry check: it
+//! refuses to start when nothing in the plan declares a `[watch]` block.
+//!
 //! This module only renders events; starting, restarting, and stopping the
 //! services is entirely [`servicrab_core::runtime::stack`]'s job.
 
@@ -7,10 +10,12 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 
-use servicrab_core::runtime::stack::{ServiceResult, StackOptions, StackSupervisor};
+use servicrab_core::runtime::stack::{
+    control_channel, ServiceResult, StackOptions, StackSupervisor,
+};
 use servicrab_core::{
-    event_channel, load, plan_stack, resolve_config_path, Config, EventKind, EventReceiver,
-    LogRouter, ServiceName, ShutdownReason, SignalWatcher, Stream,
+    event_channel, load, plan_stack, resolve_config_path, spawn_watchers, watched_services, Config,
+    EventKind, EventReceiver, LogRouter, ServiceName, ShutdownReason, SignalWatcher, Stream,
 };
 
 use crate::style::{self, BOLD, DIM, RESET, SERVICE_COLORS};
@@ -31,6 +36,9 @@ pub struct UpOptions {
     pub timestamps: bool,
     /// Stop the whole stack as soon as one service fails.
     pub abort_on_failure: bool,
+    /// Fail when no service in the plan declares a `[watch]` block.  Set by
+    /// `servicrab watch`.
+    pub require_watch: bool,
 }
 
 /// Run the `up` subcommand, returning the process exit code to use.
@@ -59,8 +67,22 @@ pub fn run(services: &[String], config: Option<&Path>, options: UpOptions) -> Re
         );
     }
 
+    let watched = watched_services(&cfg, &plan);
+    if options.require_watch && watched.is_empty() {
+        let names: Vec<&str> = plan.iter().map(|n| n.as_str()).collect();
+        return Err(format!(
+            "nothing to watch: none of {} declares a [watch] block.\n\
+             Add one, for example:\n\n\
+             \x20 [services.{}.watch]\n\
+             \x20 paths = [\"src\"]",
+            names.join(", "),
+            names.first().copied().unwrap_or("api"),
+        ));
+    }
+
     let printer = Printer::new(&plan, options);
     printer.banner(&cfg, &plan);
+    printer.watching(&watched);
 
     let logs = crate::commands::logs::router_for(&cfg);
 
@@ -82,8 +104,17 @@ pub fn run(services: &[String], config: Option<&Path>, options: UpOptions) -> Re
         let (events_tx, events_rx) = event_channel();
         let renderer = tokio::spawn(render(events_rx, printer, logs));
 
-        let supervisor = StackSupervisor::new(&cfg, plan, stack_options, events_tx);
+        let (control_tx, control_rx) = control_channel();
+        let watchers = spawn_watchers(&cfg, &plan, &control_tx, &events_tx);
+        drop(control_tx);
+
+        let supervisor =
+            StackSupervisor::new(&cfg, plan, stack_options, events_tx).with_control(control_rx);
         let outcome = supervisor.run(&mut shutdown).await;
+
+        for watcher in watchers {
+            watcher.abort();
+        }
 
         // The supervisor owned the last sender, so the renderer stops as soon
         // as it has drained the queue.
@@ -151,11 +182,31 @@ impl Printer {
 
     fn banner(&self, config: &Config, plan: &[ServiceName]) {
         let names: Vec<&str> = plan.iter().map(|n| n.as_str()).collect();
+        let command = if self.options.require_watch {
+            "servicrab watch"
+        } else {
+            "servicrab up"
+        };
         eprintln!(
             "{} {} → {}",
-            style::paint(self.color, BOLD, "servicrab up"),
+            style::paint(self.color, BOLD, command),
             config.project.name,
             names.join(", ")
+        );
+    }
+
+    fn watching(&self, watched: &[ServiceName]) {
+        if watched.is_empty() {
+            return;
+        }
+        let names: Vec<&str> = watched.iter().map(|n| n.as_str()).collect();
+        eprintln!(
+            "{}",
+            style::paint(
+                self.color,
+                DIM,
+                &format!("watching for changes: {}", names.join(", "))
+            )
         );
     }
 
@@ -215,6 +266,26 @@ impl Printer {
             EventKind::Unhealthy { message } => {
                 self.status(service, "✗", &format!("unhealthy: {message}"))
             }
+            EventKind::WatchTriggered { path, changed } => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                let detail = if *changed == 1 {
+                    format!("{name} changed")
+                } else {
+                    format!("{name} and {} more changed", changed - 1)
+                };
+                self.status(service, "↻", &format!("{detail}; restarting"))
+            }
+            EventKind::WatchFailed { message } => {
+                self.status(service, "!", &format!("watch: {message}"))
+            }
+            EventKind::WatchTruncated { limit } => self.status(
+                service,
+                "!",
+                &format!("watch: more than {limit} files; narrow `paths` or add `ignore` entries"),
+            ),
             // State transitions and the final summary are already conveyed by
             // the events above; showing them too would only add noise.
             EventKind::State(_) | EventKind::Finished { .. } => {}

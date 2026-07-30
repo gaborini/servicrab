@@ -95,10 +95,15 @@ pub fn serve(cfg: &Config, paths: &DaemonPaths, options: DaemonOptions) -> Resul
             listener,
             Arc::clone(&registry),
             stop_tx.clone(),
-            control_tx,
+            control_tx.clone(),
             names.clone(),
             project.clone(),
         ));
+
+        // Watch-triggered restarts travel the same control channel as the
+        // socket's `restart_service`, so the supervisor cannot tell them apart.
+        let watchers = servicrab_core::spawn_watchers(cfg, &plan, &control_tx, &events_tx);
+        drop(control_tx);
 
         write_pid(&paths.pid)?;
         tracing::info!(project = %project, socket = %paths.socket.display(), "daemon ready");
@@ -107,6 +112,9 @@ pub fn serve(cfg: &Config, paths: &DaemonPaths, options: DaemonOptions) -> Resul
             StackSupervisor::new(cfg, plan, stack_options, events_tx).with_control(control_rx);
         let outcome = supervisor.run(&mut stop_rx).await;
 
+        for watcher in watchers {
+            watcher.abort();
+        }
         server.abort();
         signal_task.abort();
         let _ = collector.await;
