@@ -71,6 +71,38 @@ fn a_launchd_plist_is_written_to_stdout() {
 }
 
 #[test]
+fn a_unit_carries_the_profiles_it_was_generated_with() {
+    // Otherwise the init system would start a different stack than the operator
+    // tried out with `servicrab start --profile`.
+    let dir = TempDir::new().unwrap();
+    let cfg = project(dir.path());
+
+    let (code, stdout, stderr) = cli(
+        &[
+            "generate",
+            "systemd",
+            "--profile",
+            "dev",
+            "--profile",
+            "obs",
+        ],
+        &cfg,
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stdout.contains("daemon --config") && stdout.contains("--profile dev --profile obs"),
+        "{stdout}"
+    );
+
+    let (code, stdout, stderr) = cli(&["generate", "launchd", "--profile", "dev"], &cfg);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stdout.contains("<string>--profile</string>") && stdout.contains("<string>dev</string>"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn the_unit_can_be_written_to_a_file() {
     let dir = TempDir::new().unwrap();
     let cfg = project(dir.path());

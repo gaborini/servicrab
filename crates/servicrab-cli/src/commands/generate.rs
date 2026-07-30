@@ -44,6 +44,8 @@ pub struct GenerateOptions {
     pub output: Option<PathBuf>,
     /// Account the daemon should run as (system scope only).
     pub user: Option<String>,
+    /// Profiles the generated unit should start with.
+    pub profiles: Vec<String>,
 }
 
 /// Everything a unit template needs that does not come from the config.
@@ -59,6 +61,19 @@ struct Context {
     user: Option<String>,
     /// How long the init system should wait for a clean stop.
     stop_timeout: Duration,
+    /// Profiles to put on the daemon's command line.
+    profiles: Vec<String>,
+}
+
+impl Context {
+    /// The `--profile` arguments the unit has to pass on, as one string ready
+    /// to append to a command line.
+    fn profile_flags(&self) -> String {
+        self.profiles
+            .iter()
+            .map(|profile| format!(" --profile {profile}"))
+            .collect()
+    }
 }
 
 /// Extra time on top of the slowest service's shutdown timeout, so the init
@@ -95,6 +110,7 @@ pub fn run(target: Target, config: Option<&Path>, options: GenerateOptions) -> R
         scope: options.scope,
         user: options.user.clone(),
         stop_timeout: stop_timeout(&cfg),
+        profiles: options.profiles.clone(),
     };
 
     let unit = match target {
@@ -181,7 +197,10 @@ fn systemd_unit(cfg: &Config, context: &Context) -> String {
         "WorkingDirectory={}\n",
         quote_systemd(&context.working_dir)
     ));
-    unit.push_str(&format!("ExecStart={program} daemon --config {config}\n"));
+    unit.push_str(&format!(
+        "ExecStart={program} daemon --config {config}{}\n",
+        context.profile_flags()
+    ));
     // `systemctl reload` picks up config changes without stopping services
     // that did not change.
     unit.push_str(&format!("ExecReload={program} reload --config {config}\n"));
@@ -234,12 +253,20 @@ fn launchd_plist(cfg: &Config, context: &Context) -> String {
         escape_xml(&label)
     ));
     plist.push_str("\t<key>ProgramArguments</key>\n\t<array>\n");
-    for argument in [
+    let arguments = [
         context.program.display().to_string(),
         "daemon".to_string(),
         "--config".to_string(),
         context.config.display().to_string(),
-    ] {
+    ]
+    .into_iter()
+    .chain(
+        context
+            .profiles
+            .iter()
+            .flat_map(|profile| ["--profile".to_string(), profile.clone()]),
+    );
+    for argument in arguments {
         plist.push_str(&format!("\t\t<string>{}</string>\n", escape_xml(&argument)));
     }
     plist.push_str("\t</array>\n");
@@ -371,6 +398,7 @@ command = ["/usr/bin/api"]
             working_dir: PathBuf::from("/srv/demo"),
             scope: Scope::System,
             user: None,
+            profiles: Vec::new(),
             stop_timeout: Duration::from_secs(30),
         }
     }

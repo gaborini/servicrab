@@ -112,6 +112,11 @@ enum Commands {
         #[arg(long, short = 'c')]
         config: Option<std::path::PathBuf>,
 
+        /// Also start the services in this profile.  Repeatable.  Cannot be
+        /// combined with naming services.
+        #[arg(long = "profile", value_name = "NAME", conflicts_with = "services")]
+        profiles: Vec<String>,
+
         /// Never restart services, whatever their configured policy says.
         #[arg(long, default_value_t = false)]
         no_restart: bool,
@@ -146,6 +151,11 @@ enum Commands {
         /// servicrab.toml by walking up from the current directory.
         #[arg(long, short = 'c')]
         config: Option<std::path::PathBuf>,
+
+        /// Also start the services in this profile.  Repeatable.  Cannot be
+        /// combined with naming services.
+        #[arg(long = "profile", value_name = "NAME", conflicts_with = "services")]
+        profiles: Vec<String>,
 
         /// Never restart services, whatever their configured policy says.
         #[arg(long, default_value_t = false)]
@@ -206,6 +216,12 @@ enum Commands {
         /// servicrab.toml by walking up from the current directory.
         #[arg(long, short = 'c')]
         config: Option<std::path::PathBuf>,
+
+        /// Also supervise the services in this profile.  Repeatable.  The
+        /// daemon keeps the set, so `reload` plans the same stack.  Cannot be
+        /// combined with naming services.
+        #[arg(long = "profile", value_name = "NAME", conflicts_with = "services")]
+        profiles: Vec<String>,
 
         /// Never restart services, whatever their configured policy says.
         #[arg(long, default_value_t = false)]
@@ -328,6 +344,11 @@ enum Commands {
         /// Account the daemon should run as (system scope only).
         #[arg(long)]
         user: Option<String>,
+
+        /// Put `--profile NAME` on the daemon's command line in the generated
+        /// unit.  Repeatable.
+        #[arg(long = "profile", value_name = "NAME")]
+        profiles: Vec<String>,
     },
 
     /// Print a shell completion script to stdout.
@@ -352,6 +373,10 @@ enum Commands {
         /// servicrab.toml by walking up from the current directory.
         #[arg(long, short = 'c')]
         config: Option<std::path::PathBuf>,
+
+        /// Also supervise the services in this profile.  Repeatable.
+        #[arg(long = "profile", value_name = "NAME")]
+        profiles: Vec<String>,
 
         /// Never restart services, whatever their configured policy says.
         #[arg(long, default_value_t = false)]
@@ -398,13 +423,17 @@ fn main() {
         Commands::Up {
             services,
             config,
+            profiles,
             no_restart,
             no_prefix,
             timestamps,
             abort_on_failure,
             json,
         } => commands::up::run(
-            &services,
+            servicrab_core::Selection {
+                services: &services,
+                profiles: &profiles,
+            },
             config.as_deref(),
             commands::up::UpOptions {
                 no_restart,
@@ -418,13 +447,17 @@ fn main() {
         Commands::Watch {
             services,
             config,
+            profiles,
             no_restart,
             no_prefix,
             timestamps,
             abort_on_failure,
             json,
         } => commands::up::run(
-            &services,
+            servicrab_core::Selection {
+                services: &services,
+                profiles: &profiles,
+            },
             config.as_deref(),
             commands::up::UpOptions {
                 no_restart,
@@ -438,12 +471,16 @@ fn main() {
         Commands::Start {
             services,
             config,
+            profiles,
             no_restart,
             wait,
             timeout,
         } => commands::daemon::start(
             config.as_deref(),
-            &services,
+            servicrab_core::Selection {
+                services: &services,
+                profiles: &profiles,
+            },
             commands::daemon::StartOptions {
                 no_restart,
                 wait,
@@ -474,15 +511,18 @@ fn main() {
         ),
         Commands::Status { config, json } => commands::daemon::status(config.as_deref(), json),
         Commands::Down { config } => commands::daemon::down(config.as_deref()),
-        Commands::Daemon { config, no_restart } => {
-            commands::daemon::daemon(config.as_deref(), no_restart)
-        }
+        Commands::Daemon {
+            config,
+            profiles,
+            no_restart,
+        } => commands::daemon::daemon(config.as_deref(), no_restart, &profiles),
         Commands::Generate {
             target,
             config,
             scope,
             output,
             user,
+            profiles,
         } => commands::generate::run(
             target,
             config.as_deref(),
@@ -490,6 +530,7 @@ fn main() {
                 scope,
                 output,
                 user,
+                profiles,
             },
         ),
         Commands::Completions { shell } => commands::completions::run::<Cli>(shell).map(|()| 0),

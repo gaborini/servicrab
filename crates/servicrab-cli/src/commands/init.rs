@@ -66,6 +66,9 @@ name = "my-project"
 #                 with a condition: { db = { condition = "service_healthy" } }
 #                 Conditions: service_started | service_healthy |
 #                 service_completed_successfully (the last one is for migrations)
+#   profiles      Groups this service belongs to, e.g. ["dev"].  A service with
+#                 profiles only starts when a command enables one of them
+#                 (`servicrab up --profile dev`); without any, it always starts
 #   autostart     Whether to start automatically (default: true)
 #   restart       never | on-failure | always  (default: never)
 #   restart_delay         Minimum backoff before first restart (default: 1s)

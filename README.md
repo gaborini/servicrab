@@ -10,6 +10,7 @@ Think of it as a minimal, zero-dependency alternative to [overmind](https://gith
 
 - Declare your entire local stack in one `servicrab.toml`, or split it across
   files with `include`
+- Profiles: group the optional services and ask for them with `--profile`
 - `${VAR}` substitution in every config value, strict about unset variables
 - `servicrab init` — scaffold a config in seconds
 - `servicrab check` — validate your config before running anything
@@ -318,10 +319,12 @@ set, or when `TERM=dumb`.
 
 ### Which services are started
 
-- with no arguments: every service with `autostart = true`;
+- with no arguments: every service with `autostart = true` that no profile
+  holds back (see [Profiles](#profiles));
 - with explicit names: those services only;
-- in both cases every transitive `depends_on` entry is pulled in, even when it
-  has `autostart = false`.
+- with `--profile NAME`: the above, plus the services in that profile;
+- in every case each transitive `depends_on` entry is pulled in, even when it
+  has `autostart = false` or sits in a profile of its own.
 
 ### Start and stop ordering
 
@@ -591,6 +594,58 @@ receives. (Values in `servicrab.toml` are — see
 unterminated quote or a line without `=` is a configuration error, reported by
 `servicrab check` with the file name and line number — the stack never starts
 with a half-loaded environment.
+
+---
+
+## Profiles
+
+Most repositories have more than one "everything": the services you always
+want, and the extras you only sometimes do. `profiles` puts a service in a
+group that has to be asked for by name:
+
+```toml
+[services.api]
+command = ["node", "server.js"]        # no profiles: always part of the stack
+
+[services.mailhog]
+command = ["mailhog"]
+profiles = ["dev"]
+
+[services.seeder]
+command = ["./seed.sh"]
+profiles = ["dev", "test"]             # any one of them is enough
+```
+
+```sh
+servicrab up                           # api
+servicrab up --profile dev             # api, mailhog, seeder
+servicrab up --profile test            # api, seeder
+servicrab up --profile dev --profile test
+servicrab start --profile dev          # same, in the background
+servicrab list                         # shows each service's profiles
+```
+
+A service that declares no profiles is always started; one that declares any
+waits to be asked. Naming a service starts it whatever its profiles say, so
+`servicrab up mailhog` needs no flag — and because that is a second way of
+saying which services to start, naming services and passing `--profile` in one
+command is refused rather than silently resolved.
+
+Two things follow from profiles selecting what to start *on its own*:
+
+- **Dependencies come along regardless.** If an always-on service depends on a
+  profiled one, the profiled one is started too — a service can never run
+  without what it declares in `depends_on`. Put the dependent in the profile as
+  well if it should stay out.
+- **The daemon remembers.** `servicrab start --profile dev` records the set for
+  the lifetime of the daemon, so `servicrab reload` re-plans that stack rather
+  than the smaller one a bare `start` would have produced.
+  `servicrab generate systemd --profile dev` writes the flag into the unit for
+  the same reason.
+
+A `--profile` no service declares is an error listing the ones that exist,
+because a typo that silently started less than you asked for is the kind of
+thing you notice an hour later.
 
 ---
 

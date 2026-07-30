@@ -91,6 +91,26 @@ pub enum ConfigError {
     #[error("invalid service name {name:?}: {reason}")]
     InvalidServiceName { name: String, reason: String },
 
+    /// A profile name violates naming rules.
+    #[error("service {service:?}: invalid profile name {profile:?}: {reason}")]
+    InvalidProfileName {
+        /// The service that lists the profile.
+        service: String,
+        /// The offending name.
+        profile: String,
+        /// Why it is not usable.
+        reason: String,
+    },
+
+    /// A service lists the same profile more than once.
+    #[error("service {service:?}: duplicate profile {profile:?}")]
+    DuplicateProfile {
+        /// The service that lists it twice.
+        service: String,
+        /// The repeated name.
+        profile: String,
+    },
+
     /// `[services]` is present but contains no entries.
     #[error("no services defined; at least one [services.*] entry is required")]
     NoServices,
@@ -330,6 +350,22 @@ pub enum RuntimeError {
         service: String,
         /// Comma-separated list of configured service names.
         known: String,
+    },
+
+    /// No service belongs to a requested profile.
+    #[error("no service is in profile {profile:?}; profiles in use: {known}")]
+    UnknownProfile {
+        /// The profile that was asked for.
+        profile: String,
+        /// Comma-separated list of the profiles the config declares.
+        known: String,
+    },
+
+    /// The plan came out empty, so there is nothing to supervise.
+    #[error("no services to start: {reason}")]
+    NothingToStart {
+        /// Which of the ways to end up with an empty plan this was.
+        reason: String,
     },
 
     /// The configured executable could not be spawned.

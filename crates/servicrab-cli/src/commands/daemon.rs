@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use servicrab_core::{load, resolve_config_path, Config};
+use servicrab_core::{load, resolve_config_path, Config, Selection};
 
 use crate::daemon::DaemonPaths;
 
@@ -67,22 +67,30 @@ mod imp {
     use crate::style::{self, BOLD, DIM, GREEN, RED, RESET, YELLOW};
 
     /// Run the daemon in the foreground (this is the process `start` spawns).
-    pub fn daemon(config: Option<&Path>, no_restart: bool) -> Result<i32, String> {
+    pub fn daemon(
+        config: Option<&Path>,
+        no_restart: bool,
+        profiles: &[String],
+    ) -> Result<i32, String> {
         let (cfg, config_path, paths) = setup(config)?;
         server::serve(
             &cfg,
             &config_path,
             &paths,
-            server::DaemonOptions { no_restart },
+            server::DaemonOptions {
+                no_restart,
+                profiles: profiles.to_vec(),
+            },
         )
     }
 
     /// Start the daemon, or individual services inside a running one.
     pub fn start(
         config: Option<&Path>,
-        services: &[String],
+        selection: Selection<'_>,
         options: StartOptions,
     ) -> Result<i32, String> {
+        let services = selection.services;
         if !services.is_empty() {
             let code = control(config, services, |name| Request::StartService { name })?;
             if code != 0 || !options.wait {
@@ -123,6 +131,11 @@ mod imp {
             .stderr(errors);
         if options.no_restart {
             command.arg("--no-restart");
+        }
+        // The daemon process is where the profiles have to live: `reload`
+        // re-plans the stack, and it has to plan the one that was started.
+        for profile in selection.profiles {
+            command.arg("--profile").arg(profile);
         }
         // A new session detaches the daemon from this terminal, so Ctrl+C here
         // no longer reaches it and it survives the shell that started it.
@@ -538,13 +551,17 @@ mod imp {
 
     const UNSUPPORTED: &str = "the background daemon is only supported on Linux and macOS";
 
-    pub fn daemon(_config: Option<&Path>, _no_restart: bool) -> Result<i32, String> {
+    pub fn daemon(
+        _config: Option<&Path>,
+        _no_restart: bool,
+        _profiles: &[String],
+    ) -> Result<i32, String> {
         Err(UNSUPPORTED.to_string())
     }
 
     pub fn start(
         _config: Option<&Path>,
-        _services: &[String],
+        _selection: Selection<'_>,
         _options: StartOptions,
     ) -> Result<i32, String> {
         Err(UNSUPPORTED.to_string())

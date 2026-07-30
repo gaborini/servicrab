@@ -675,6 +675,86 @@ fn an_unknown_service_is_rejected_by_the_daemon() {
     assert!(stderr.contains("api"), "{stderr}");
 }
 
+// ── profiles ───────────────────────────────────────────────────────────────
+
+#[test]
+fn a_daemon_keeps_its_profiles_across_a_reload() {
+    // The profiles live in the daemon process, so a reload has to plan the
+    // stack that was started rather than the one a bare `start` would give.
+    let dir = TempDir::new().unwrap();
+    let api = resident(dir.path(), "api.sh");
+    let seeder = resident(dir.path(), "seeder.sh");
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}"]
+restart = "always"
+[services.seeder]
+command = ["{}"]
+restart = "always"
+profiles = ["dev"]
+"#,
+            api.display(),
+            seeder.display()
+        ),
+    );
+
+    let daemon = Daemon::start_with(&cfg, &["--profile", "dev"]);
+    daemon.wait_for_status("both services to run", |s| {
+        s.contains("api") && s.contains("seeder")
+    });
+
+    let (code, stdout, stderr) = cli(&["reload"], &cfg);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.contains("no changes"), "{stdout}");
+
+    let status = daemon.status();
+    assert!(
+        status.contains("seeder"),
+        "the reload should not have dropped the profiled service:\n{status}"
+    );
+}
+
+#[test]
+fn a_daemon_without_the_profile_leaves_the_service_out() {
+    let dir = TempDir::new().unwrap();
+    let api = resident(dir.path(), "api.sh");
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}"]
+restart = "always"
+[services.seeder]
+command = ["true"]
+profiles = ["dev"]
+"#,
+            api.display()
+        ),
+    );
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("api to run", |s| s.contains("running"));
+
+    let status = daemon.status();
+    assert!(!status.contains("seeder"), "{status}");
+
+    // And it is not a service the daemon will take commands about, because it
+    // is not part of this stack.
+    let (code, _, stderr) = cli(&["restart", "seeder"], &cfg);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("unknown service"), "{stderr}");
+}
+
 /// The pid the daemon reports for `api`, or 0 when it is not running.
 fn pid_of(daemon: &Daemon) -> i64 {
     let (_, stdout, _) = cli(&["status", "--json"], &daemon.config);

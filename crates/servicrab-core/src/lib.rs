@@ -43,6 +43,6 @@ pub use runtime::filewatch::{spawn_watchers, watched_services};
 pub use runtime::{
     control_channel, event_channel, plan_stack, Control, ControlTx, EventKind, EventReceiver,
     EventSender, EventSink, ForegroundRunner, Health, LogRouter, LogWriter, OutputMode, RunOptions,
-    RunOutcome, ServiceEvent, ServiceRunner, ServiceStatus, SignalWatcher, StackOptions,
+    RunOutcome, Selection, ServiceEvent, ServiceRunner, ServiceStatus, SignalWatcher, StackOptions,
     StackOutcome, StackSupervisor, StatusRegistry, Stream,
 };

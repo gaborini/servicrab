@@ -1,8 +1,9 @@
 //! `servicrab check [--config PATH]` — load and validate a `servicrab.toml`.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
-use servicrab_core::{load, resolve_config_path};
+use servicrab_core::{load, resolve_config_path, Config};
 
 /// Run the `check` subcommand.
 pub fn run(config: Option<&Path>) -> Result<(), String> {
@@ -20,6 +21,12 @@ pub fn run(config: Option<&Path>) -> Result<(), String> {
 
             let order: Vec<&str> = cfg.start_order.iter().map(|n| n.as_str()).collect();
             println!("  start order: {}", order.join(" → "));
+
+            // The order above lists every service, profiled ones included, so
+            // say which of them wait to be asked for.
+            for line in profile_lines(&cfg) {
+                println!("  {line}");
+            }
 
             if !warnings.is_empty() {
                 println!("  {} warning(s):", warnings.len());
@@ -40,4 +47,24 @@ pub fn run(config: Option<&Path>) -> Result<(), String> {
             ))
         }
     }
+}
+
+/// One line per profile, naming the services it holds. Empty when the config
+/// uses no profiles.
+fn profile_lines(cfg: &Config) -> Vec<String> {
+    let mut members: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for name in &cfg.start_order {
+        let service = &cfg.services[name];
+        for profile in &service.profiles {
+            members
+                .entry(profile.as_str())
+                .or_default()
+                .push(name.as_str());
+        }
+    }
+
+    members
+        .into_iter()
+        .map(|(profile, services)| format!("profile {profile}: {}", services.join(", ")))
+        .collect()
 }
