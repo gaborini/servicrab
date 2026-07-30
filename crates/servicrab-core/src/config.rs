@@ -275,7 +275,11 @@ impl WatchSettings {
 }
 
 /// Validated configuration for a single managed service.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `PartialEq` is what config hot-reload uses to decide whether a service has
+/// to be restarted, so every field that affects the running process must take
+/// part in the comparison.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Service {
     /// Validated service name.
     pub name: ServiceName,

@@ -18,6 +18,7 @@ Think of it as a minimal, zero-dependency alternative to [overmind](https://gith
 - `servicrab watch` — restart a service as soon as its sources change, with ignore rules and debouncing
 - Log files: opt-in per-service capture with size-based rotation, plus `servicrab logs [-f]` to read and follow them
 - Background daemon: `servicrab start` / `status` / `stop` / `restart` / `down`, with a documented JSON-over-Unix-socket protocol (Linux/macOS)
+- `servicrab reload` — apply config changes to a running stack without stopping the services you did not touch
 - Restart policies: `never`, `on-failure`, `always`, with exponential backoff
 - Environment: per-service variables, working directories, and dotenv-style `env_file` layering
 - Shell completions for bash, zsh, fish, PowerShell and elvish
@@ -131,6 +132,7 @@ if you want shell semantics.
 | `servicrab status [--config PATH] [--json]` | Show what the background daemon is doing |
 | `servicrab stop <SERVICE...> [--config PATH]` | Stop individual services in the running daemon |
 | `servicrab restart <SERVICE...> [--config PATH]` | Restart individual services |
+| `servicrab reload [--config PATH]` | Re-read the config and apply the difference to the running daemon |
 | `servicrab down [--config PATH]` | Stop the daemon and every service it supervises |
 | `servicrab daemon [--config PATH] [--no-restart]` | Run the daemon in the foreground (for systemd/launchd/containers) |
 | `servicrab completions <SHELL>` | Print a completion script for bash, zsh, fish, PowerShell or elvish |
@@ -570,10 +572,48 @@ echo '{"type":"status"}' | nc -U .servicrab/daemon.sock
 | `{"type":"start_service","name":"api"}` | `{"type":"ok","message":"api started"}` |
 | `{"type":"stop_service","name":"api"}` | `{"type":"ok","message":"api stopped"}` |
 | `{"type":"restart_service","name":"api"}` | `{"type":"ok","message":"api restarted"}` |
+| `{"type":"reload"}` | `{"type":"ok","message":"reloaded demo: 1 added, 1 changed, 0 removed"}` |
 
 `stop_service` and `restart_service` only answer once the service has actually
 stopped (and, for a restart, been replaced), so scripts can rely on the reply
 instead of polling.
+
+### Config hot-reload
+
+`servicrab reload` makes the running daemon re-read its `servicrab.toml` and
+apply only what changed:
+
+```console
+$ servicrab reload
+✓ reloaded demo: 1 added, 1 changed, 1 removed
+  from /srv/demo/servicrab.toml
+```
+
+| Difference | What the daemon does |
+| --- | --- |
+| A service was added | It is started (and becomes visible to `status`, `stop`, `restart`, …) |
+| A service definition changed | It is restarted with the new definition |
+| A service was removed | It is stopped and disappears from the stack |
+| Nothing changed | Nothing at all — uptime and restart counters are preserved |
+
+A service you stopped by hand stays stopped; it picks up its new definition the
+next time you start it. Comparison is exact: any field that affects the process
+(command, environment, env files, restart policy, health check, watch rules, …)
+counts as a change.
+
+If the new config is invalid the reload is refused and the stack keeps running
+untouched, so a typo can never take a stack down:
+
+```console
+$ servicrab reload
+✗ servicrab.toml has 1 error(s); the stack was left untouched:
+  • service "api": depends on unknown service "ghost"
+```
+
+Project-level settings — `[project.logs]`, the log directory and rotation
+rules — are bound to the daemon process and need a `servicrab down` +
+`servicrab start` to change. File watchers (`[services.x.watch]`) *are*
+re-created on every reload.
 
 The wire types live in the `servicrab-protocol` crate, which depends on
 neither the runtime nor Tokio.
@@ -643,20 +683,20 @@ cargo test -p servicrab-core config::tests
 - [x] `servicrab logs [SERVICE...] [-f] [-n N]`
 - [x] Per-service opt-out via `[services.<name>.logs] enabled = false`
 
-### Phase 2 (current) — Background daemon ✅
+### Phase 2 — Background daemon ✅
 - [x] Detached daemon per project with a Unix-socket JSON API
 - [x] `servicrab start` / `status` / `down` / `daemon`
 - [x] Status snapshot: state, pid, uptime, restarts, health
 - [x] Per-service `start` / `stop` / `restart` through the daemon
 - [ ] Live event streaming over the socket
 
-### Phase 3 (current) — Stack management
+### Phase 3 — Stack management ✅
 - [x] `.env` file support per project and per service
 - [x] Shell completions (`servicrab completions <SHELL>`)
 - [x] `servicrab watch` — restart on file changes, with ignore rules and debouncing
-- [ ] Config hot-reload
+- [x] Config hot-reload (`servicrab reload`)
 
-### Phase 4 — Platform integration (optional)
+### Phase 4 (current) — Platform integration
 - [ ] systemd unit generation
 - [ ] launchd plist generation
 - [ ] Windows Service wrapper

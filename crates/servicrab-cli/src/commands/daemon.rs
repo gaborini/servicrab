@@ -49,8 +49,13 @@ mod imp {
 
     /// Run the daemon in the foreground (this is the process `start` spawns).
     pub fn daemon(config: Option<&Path>, no_restart: bool) -> Result<i32, String> {
-        let (cfg, _, paths) = setup(config)?;
-        server::serve(&cfg, &paths, server::DaemonOptions { no_restart })
+        let (cfg, config_path, paths) = setup(config)?;
+        server::serve(
+            &cfg,
+            &config_path,
+            &paths,
+            server::DaemonOptions { no_restart },
+        )
     }
 
     /// Start the daemon, or individual services inside a running one.
@@ -149,6 +154,39 @@ mod imp {
     /// Restart individual services.
     pub fn restart(config: Option<&Path>, services: &[String]) -> Result<i32, String> {
         control(config, services, |name| Request::RestartService { name })
+    }
+
+    /// Ask the daemon to re-read the configuration file.
+    pub fn reload(config: Option<&Path>) -> Result<i32, String> {
+        let (cfg, config_path, paths) = setup(config)?;
+        if !client::is_running(&paths.socket) {
+            return Err(format!(
+                "no daemon is running for {} — start one with `servicrab start`",
+                cfg.project.name
+            ));
+        }
+
+        let color = style::color_enabled();
+        match client::send(&paths.socket, &Request::Reload) {
+            Ok(Response::Ok { message }) => {
+                println!(
+                    "{} {}",
+                    style::paint(color, GREEN, "✓"),
+                    message.unwrap_or_else(|| "reloaded".to_string())
+                );
+                println!(
+                    "{}",
+                    style::paint(color, DIM, &format!("  from {}", config_path.display()))
+                );
+                Ok(0)
+            }
+            Ok(Response::Error { message }) => {
+                eprintln!("{} {message}", style::paint(color, RED, "✗"));
+                Ok(1)
+            }
+            Ok(other) => Err(format!("unexpected response from the daemon: {other:?}")),
+            Err(err) => Err(err.to_string()),
+        }
     }
 
     /// Send one per-service command per name, reporting each outcome.
@@ -364,6 +402,10 @@ mod imp {
         Err(UNSUPPORTED.to_string())
     }
 
+    pub fn reload(_config: Option<&Path>) -> Result<i32, String> {
+        Err(UNSUPPORTED.to_string())
+    }
+
     pub fn status(_config: Option<&Path>, _json: bool) -> Result<i32, String> {
         Err(UNSUPPORTED.to_string())
     }
@@ -373,4 +415,4 @@ mod imp {
     }
 }
 
-pub use imp::{daemon, down, restart, start, status, stop};
+pub use imp::{daemon, down, reload, restart, start, status, stop};

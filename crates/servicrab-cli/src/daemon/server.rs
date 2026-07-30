@@ -5,20 +5,24 @@
 //! through the same channel the signal handler uses — so a slow or hostile
 //! client cannot interfere with process supervision.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use servicrab_core::runtime::stack::{Control, ControlTx, StackOptions, StackSupervisor};
 use servicrab_core::runtime::{control_channel, shutdown_channel, wait_for_shutdown};
 use servicrab_core::{
-    event_channel, plan_stack, Config, EventKind, EventReceiver, LogRouter, ServiceName,
-    ServiceState, ShutdownReason, SignalWatcher, StatusRegistry,
+    event_channel, load, plan_stack, Config, EventKind, EventReceiver, EventSender, LogRouter,
+    ServiceName, ServiceState, ShutdownReason, SignalWatcher, StatusRegistry,
 };
 use servicrab_protocol::{decode, encode, Request, Response};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::task::JoinHandle;
 
 use super::paths::DaemonPaths;
+
+/// How long the daemon waits for the log collector to drain on shutdown.
+const COLLECTOR_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Options for the daemon body.
 #[derive(Debug, Clone, Copy, Default)]
@@ -27,9 +31,81 @@ pub struct DaemonOptions {
     pub no_restart: bool,
 }
 
+/// Everything the socket side of the daemon may touch.
+///
+/// The supervisor is never reached directly: commands travel the control
+/// channel, shutdown travels the same channel the signal handler uses, and
+/// status is read from a snapshot the collector task keeps current.
+struct Session {
+    registry: Arc<Mutex<StatusRegistry>>,
+    stop: servicrab_core::runtime::ShutdownTx,
+    control: ControlTx,
+    /// The services the running configuration knows about; a reload replaces
+    /// this list.
+    names: Mutex<Vec<ServiceName>>,
+    project: String,
+    /// Where the configuration was loaded from, so it can be re-read.
+    config_path: PathBuf,
+    /// Kept so reloads can rebuild the watchers.  It is dropped when the
+    /// daemon stops, which is what lets the collector task finish: it ends
+    /// when the last event sender is gone.
+    events: Mutex<Option<EventSender>>,
+    /// File watchers, replaced wholesale on reload.
+    watchers: Mutex<Vec<JoinHandle<()>>>,
+    /// Serializes reloads: two clients must not diff against each other.
+    reloading: tokio::sync::Mutex<()>,
+}
+
+impl Session {
+    fn known_names(&self) -> Vec<ServiceName> {
+        self.names
+            .lock()
+            .map(|names| names.clone())
+            .unwrap_or_default()
+    }
+
+    /// Replace the file watchers with ones built from `cfg`.
+    fn respawn_watchers(&self, cfg: &Config, plan: &[ServiceName]) {
+        let Some(events) = self
+            .events
+            .lock()
+            .ok()
+            .and_then(|events| events.as_ref().cloned())
+        else {
+            // The daemon is shutting down; no point in starting watchers.
+            return;
+        };
+        let fresh = servicrab_core::spawn_watchers(cfg, plan, &self.control, &events);
+        let Ok(mut watchers) = self.watchers.lock() else {
+            return;
+        };
+        for watcher in watchers.drain(..) {
+            watcher.abort();
+        }
+        *watchers = fresh;
+    }
+
+    /// Stop the watchers and let go of the event sender.
+    fn shutdown(&self) {
+        if let Ok(mut watchers) = self.watchers.lock() {
+            for watcher in watchers.drain(..) {
+                watcher.abort();
+            }
+        }
+        if let Ok(mut events) = self.events.lock() {
+            *events = None;
+        }
+    }
+}
+
 /// Run the daemon in this process until the stack stops or shutdown is
 /// requested. Returns the exit code to use.
-pub fn serve(cfg: &Config, paths: &DaemonPaths, options: DaemonOptions) -> Result<i32, String> {
+pub fn serve(
+    cfg: &Config,
+    config_path: &Path,
+    paths: &DaemonPaths,
+    options: DaemonOptions,
+) -> Result<i32, String> {
     let plan = plan_stack(cfg, &[]).map_err(|e| e.to_string())?;
     if plan.is_empty() {
         return Err(
@@ -57,7 +133,6 @@ pub fn serve(cfg: &Config, paths: &DaemonPaths, options: DaemonOptions) -> Resul
         (name.clone(), has_health)
     }))));
 
-    let names: Vec<ServiceName> = plan.clone();
     let logs = crate::commands::logs::router_for(cfg);
     let project = cfg.project.name.to_string();
     let stack_options = StackOptions {
@@ -91,19 +166,24 @@ pub fn serve(cfg: &Config, paths: &DaemonPaths, options: DaemonOptions) -> Resul
         let (events_tx, events_rx) = event_channel();
         let (control_tx, control_rx) = control_channel();
         let collector = tokio::spawn(collect(events_rx, Arc::clone(&registry), logs));
-        let server = tokio::spawn(accept_loop(
-            listener,
-            Arc::clone(&registry),
-            stop_tx.clone(),
-            control_tx.clone(),
-            names.clone(),
-            project.clone(),
-        ));
+
+        let session = Arc::new(Session {
+            registry: Arc::clone(&registry),
+            stop: stop_tx.clone(),
+            control: control_tx.clone(),
+            names: Mutex::new(plan.clone()),
+            project: project.clone(),
+            config_path: config_path.to_path_buf(),
+            events: Mutex::new(Some(events_tx.clone())),
+            watchers: Mutex::new(Vec::new()),
+            reloading: tokio::sync::Mutex::new(()),
+        });
+        drop(control_tx);
 
         // Watch-triggered restarts travel the same control channel as the
         // socket's `restart_service`, so the supervisor cannot tell them apart.
-        let watchers = servicrab_core::spawn_watchers(cfg, &plan, &control_tx, &events_tx);
-        drop(control_tx);
+        session.respawn_watchers(cfg, &plan);
+        let server = tokio::spawn(accept_loop(listener, Arc::clone(&session)));
 
         write_pid(&paths.pid)?;
         tracing::info!(project = %project, socket = %paths.socket.display(), "daemon ready");
@@ -112,12 +192,14 @@ pub fn serve(cfg: &Config, paths: &DaemonPaths, options: DaemonOptions) -> Resul
             StackSupervisor::new(cfg, plan, stack_options, events_tx).with_control(control_rx);
         let outcome = supervisor.run(&mut stop_rx).await;
 
-        for watcher in watchers {
-            watcher.abort();
-        }
+        // Dropping the last event senders is what ends the collector, so the
+        // socket side has to let go of its clone first.
+        session.shutdown();
         server.abort();
         signal_task.abort();
-        let _ = collector.await;
+        // The collector only has queued events left; the timeout is a
+        // backstop so a lost sender can never keep the daemon alive.
+        let _ = tokio::time::timeout(COLLECTOR_GRACE, collector).await;
 
         Ok::<_, String>(outcome)
     });
@@ -153,40 +235,21 @@ async fn collect(
 }
 
 /// Serve clients until the task is cancelled.
-#[allow(clippy::too_many_arguments)]
-async fn accept_loop(
-    listener: UnixListener,
-    registry: Arc<Mutex<StatusRegistry>>,
-    stop: servicrab_core::runtime::ShutdownTx,
-    control: ControlTx,
-    names: Vec<ServiceName>,
-    project: String,
-) {
+async fn accept_loop(listener: UnixListener, session: Arc<Session>) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             continue;
         };
-        let registry = Arc::clone(&registry);
-        let stop = stop.clone();
-        let control = control.clone();
-        let names = names.clone();
-        let project = project.clone();
+        let session = Arc::clone(&session);
         // One task per client keeps a stuck reader from blocking everybody
         // else.
         tokio::spawn(async move {
-            handle_client(stream, registry, stop, control, names, project).await;
+            handle_client(stream, session).await;
         });
     }
 }
 
-async fn handle_client(
-    stream: UnixStream,
-    registry: Arc<Mutex<StatusRegistry>>,
-    stop: servicrab_core::runtime::ShutdownTx,
-    control: ControlTx,
-    names: Vec<ServiceName>,
-    project: String,
-) {
+async fn handle_client(stream: UnixStream, session: Arc<Session>) {
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
 
@@ -195,7 +258,7 @@ async fn handle_client(
             continue;
         }
         let response = match decode::<Request>(&line) {
-            Ok(request) => respond(request, &registry, &stop, &control, &names, &project).await,
+            Ok(request) => respond(request, &session).await,
             Err(err) => Response::Error {
                 message: err.to_string(),
             },
@@ -211,21 +274,14 @@ async fn handle_client(
     }
 }
 
-async fn respond(
-    request: Request,
-    registry: &Arc<Mutex<StatusRegistry>>,
-    stop: &servicrab_core::runtime::ShutdownTx,
-    control: &ControlTx,
-    names: &[ServiceName],
-    project: &str,
-) -> Response {
+async fn respond(request: Request, session: &Session) -> Response {
     match request {
         Request::Ping => Response::Pong {
-            project: project.to_string(),
+            project: session.project.clone(),
             pid: std::process::id(),
         },
         Request::Status => {
-            let Ok(registry) = registry.lock() else {
+            let Ok(registry) = session.registry.lock() else {
                 return Response::Error {
                     message: "the status registry is poisoned".to_string(),
                 };
@@ -235,32 +291,33 @@ async fn respond(
             }
         }
         Request::Shutdown => {
-            let _ = stop.send(Some(ShutdownReason::Terminated));
+            let _ = session.stop.send(Some(ShutdownReason::Terminated));
             Response::Ok {
                 message: Some("stopping the stack".to_string()),
             }
         }
         Request::StartService { name } => {
-            command(control, names, &name, |service, ack| Control::Start {
+            command(session, &name, |service, ack| Control::Start {
                 service,
                 ack,
             })
             .await
         }
         Request::StopService { name } => {
-            command(control, names, &name, |service, ack| Control::Stop {
+            command(session, &name, |service, ack| Control::Stop {
                 service,
                 ack,
             })
             .await
         }
         Request::RestartService { name } => {
-            command(control, names, &name, |service, ack| Control::Restart {
+            command(session, &name, |service, ack| Control::Restart {
                 service,
                 ack,
             })
             .await
         }
+        Request::Reload => reload(session).await,
         // `Request` is `#[non_exhaustive]`, so an older daemon can still be
         // asked something it does not know about.
         _ => Response::Error {
@@ -269,13 +326,113 @@ async fn respond(
     }
 }
 
+/// Re-read the configuration and apply the difference to the running stack.
+///
+/// Only services change: project-level settings such as `[project.logs]` are
+/// bound to the process and need a daemon restart.
+async fn reload(session: &Session) -> Response {
+    // Two clients reloading at once would each diff against a stack the other
+    // one is still changing.
+    let _guard = session.reloading.lock().await;
+
+    let (cfg, warnings) = match load(&session.config_path) {
+        Ok(loaded) => loaded,
+        Err(errors) => {
+            let details: Vec<String> = errors.iter().map(|e| format!("  • {e}")).collect();
+            return Response::Error {
+                message: format!(
+                    "{} has {} error(s); the stack was left untouched:\n{}",
+                    session.config_path.display(),
+                    errors.len(),
+                    details.join("\n")
+                ),
+            };
+        }
+    };
+    for warning in &warnings {
+        tracing::warn!("{warning}");
+    }
+
+    let plan = match plan_stack(&cfg, &[]) {
+        Ok(plan) => plan,
+        Err(err) => {
+            return Response::Error {
+                message: format!("{err}; the stack was left untouched"),
+            }
+        }
+    };
+    if plan.is_empty() {
+        return Response::Error {
+            message: "no services would be left running: none have autostart = true".to_string(),
+        };
+    }
+
+    // The registry is updated first so that events from services the reload
+    // adds are not dropped for lack of an entry.
+    let previous = session.known_names();
+    sync_registry(session, &cfg, &plan);
+
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    let command = Control::Reload {
+        config: Box::new(cfg.clone()),
+        plan: plan.clone(),
+        ack: ack_tx,
+    };
+    if session.control.send(command).is_err() {
+        restore_registry(session, &cfg, &previous);
+        return Response::Error {
+            message: "the supervisor is no longer accepting commands".to_string(),
+        };
+    }
+
+    match ack_rx.await {
+        Ok(Ok(message)) => {
+            session.respawn_watchers(&cfg, &plan);
+            Response::Ok {
+                message: Some(format!("reloaded {}: {message}", session.project)),
+            }
+        }
+        Ok(Err(message)) => {
+            restore_registry(session, &cfg, &previous);
+            Response::Error { message }
+        }
+        Err(_) => {
+            restore_registry(session, &cfg, &previous);
+            Response::Error {
+                message: "the stack stopped before the reload completed".to_string(),
+            }
+        }
+    }
+}
+
+/// Point the registry and the known-name list at a new plan.
+fn sync_registry(session: &Session, cfg: &Config, plan: &[ServiceName]) {
+    if let Ok(mut registry) = session.registry.lock() {
+        registry.sync(plan.iter().map(|name| {
+            let has_health = cfg
+                .services
+                .get(name)
+                .is_some_and(|svc| svc.health.is_some());
+            (name.clone(), has_health)
+        }));
+    }
+    if let Ok(mut names) = session.names.lock() {
+        *names = plan.to_vec();
+    }
+}
+
+/// Undo [`sync_registry`] after a reload the supervisor refused.
+fn restore_registry(session: &Session, cfg: &Config, previous: &[ServiceName]) {
+    sync_registry(session, cfg, previous);
+}
+
 /// Send one per-service command to the supervisor and wait for its verdict.
 async fn command(
-    control: &ControlTx,
-    names: &[ServiceName],
+    session: &Session,
     name: &str,
     build: impl FnOnce(ServiceName, servicrab_core::runtime::stack::Ack) -> Control,
 ) -> Response {
+    let names = session.known_names();
     let Some(service) = names.iter().find(|known| known.as_str() == name) else {
         return Response::Error {
             message: format!(
@@ -290,7 +447,11 @@ async fn command(
     };
 
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-    if control.send(build(service.clone(), ack_tx)).is_err() {
+    if session
+        .control
+        .send(build(service.clone(), ack_tx))
+        .is_err()
+    {
         return Response::Error {
             message: "the supervisor is no longer accepting commands".to_string(),
         };
