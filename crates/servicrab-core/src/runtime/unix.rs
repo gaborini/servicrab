@@ -139,7 +139,8 @@ impl ProcessHandle {
     /// A group that has already gone away is not an error.
     fn signal_group(&self, service: &str, sig: Signal) -> Result<(), RuntimeError> {
         match killpg(self.pgid, sig) {
-            Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+            Ok(()) => Ok(()),
+            Err(errno) if group_is_gone(errno) => Ok(()),
             Err(errno) => Err(RuntimeError::SignalDeliveryFailed {
                 service: service.to_string(),
                 signal: sig.as_str().to_string(),
@@ -153,7 +154,16 @@ impl ProcessHandle {
     /// group.  Used to make sure no descendant outlives the supervisor.
     fn kill_group(&self, service: &str, timeout: Duration) -> Result<(), RuntimeError> {
         match killpg(self.pgid, Signal::SIGKILL) {
-            Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+            Ok(()) => Ok(()),
+            Err(errno) if group_is_gone(errno) => {
+                tracing::debug!(
+                    service = %service,
+                    pgid = self.pgid.as_raw(),
+                    %errno,
+                    "the process group was already gone"
+                );
+                Ok(())
+            }
             Err(errno) => Err(RuntimeError::ForceKillFailed {
                 service: service.to_string(),
                 pgid: self.pgid.as_raw(),
@@ -650,9 +660,30 @@ impl<'a> ForegroundRunner<'a> {
     }
 }
 
+/// Whether a `killpg(2)` error means "there is nothing of ours left to
+/// signal".
+///
+/// `ESRCH` is the documented answer for an empty group.  macOS also answers
+/// `EPERM` once the group holds nothing we own — for example when the leader
+/// has been reaped and only unrelated processes could still claim the id.
+/// Either way there is no process of ours left to kill, and failing the run
+/// over it would turn a successful shutdown into a spurious error.
+fn group_is_gone(errno: nix::errno::Errno) -> bool {
+    matches!(errno, nix::errno::Errno::ESRCH | nix::errno::Errno::EPERM)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_vanished_group_is_not_an_error() {
+        assert!(group_is_gone(nix::errno::Errno::ESRCH));
+        // macOS reports a group we can no longer signal this way.
+        assert!(group_is_gone(nix::errno::Errno::EPERM));
+        // Anything else is a real failure worth reporting.
+        assert!(!group_is_gone(nix::errno::Errno::EINVAL));
+    }
 
     #[test]
     fn shutdown_signals_map_to_os_signals() {
