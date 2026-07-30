@@ -29,8 +29,9 @@ pub mod validation;
 
 // Convenience re-exports.
 pub use config::{
-    Config, HealthCheck, HealthProbe, LogSettings, Project, ProjectName, RestartPolicy, Service,
-    ServiceName, ShutdownSignal, UnhealthyAction, WatchSettings,
+    Config, Dependency, DependencyCondition, HealthCheck, HealthProbe, LogSettings, Project,
+    ProjectName, RestartPolicy, Service, ServiceName, ShutdownSignal, UnhealthyAction,
+    WatchSettings,
 };
 pub use envfile::EnvFileError;
 pub use error::{ConfigError, ConfigWarning, RuntimeError};

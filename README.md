@@ -324,13 +324,19 @@ set, or when `TERM=dumb`.
 ### Start and stop ordering
 
 Services start in the configuration's deterministic topological order, and a
-service is only spawned once every service it depends on is **available**:
+service is only spawned once every service it depends on is **available**. What
+"available" means is per dependency, and by default depends on the dependency
+itself:
 
-- a service without a health check is available as soon as its process is up;
-- a service **with** a health check is available only after its first
+- a dependency without a health check is available as soon as its process is up;
+- a dependency **with** a health check is available only after its first
   successful probe;
-- a one-shot dependency (a migration, a build step) that exited cleanly counts
-  as available too.
+- a one-shot dependency (a migration, a build step) that has exited counts as
+  available too — otherwise a stack containing one could never come up.
+
+Spell the condition out to override that (see
+[Dependency conditions](#dependency-conditions)), which is also the only way to
+have the exit status of a one-shot checked.
 
 Shutdown happens in reverse: dependents are stopped (and fully reaped) before
 the services they depend on, each with its own `shutdown_signal` and
@@ -403,6 +409,53 @@ command = ["./scripts/queue-ok.sh"]      # healthy when it exits with code 0
 
 Failures during `start_period` never count, which gives slow starters time to
 come up without burning their retry budget.
+
+---
+
+## Dependency conditions
+
+`depends_on = ["db"]` says *what* to wait for but not *when* the wait is over.
+The table form says both:
+
+```toml
+[services.api]
+command = ["./api"]
+
+[services.api.depends_on]
+db = { condition = "service_healthy" }
+migrate = { condition = "service_completed_successfully" }
+cache = { condition = "service_started" }
+```
+
+| Condition | Available once |
+|---|---|
+| `service_started` | the process is up; the exit status is never consulted |
+| `service_healthy` | a health probe has passed |
+| `service_completed_successfully` | the service has exited with status `0` |
+
+Both forms may be mixed across services, but not within one service: a service
+either lists names or uses the table.
+
+**Leaving the condition out is not the same as `service_started`.** An entry
+without a condition waits for a probe when the dependency has a `[health]`
+block, and for the process otherwise — so adding a health check to a service
+automatically starts gating everything that depends on it.
+
+`service_completed_successfully` is the one that exists for **migrations and
+seed steps**: it is the only condition that looks at the exit status, so it is
+the only one that stops a dependent from starting against a half-migrated
+database. Under the other two conditions a one-shot that has exited counts as
+available whatever its exit status, because a condition a finished process can
+never meet again would deadlock the stack.
+
+Conditions that can never be met are rejected at load time rather than at
+2 a.m.: `service_healthy` on a service with no `[health]` block, and
+`service_completed_successfully` on a service with `restart = "always"`, which
+never stays exited.
+
+A dependency that can no longer meet its condition — including a one-shot that
+exited non-zero where success was required — leaves its dependents **skipped**,
+exactly as an unavailable dependency does.
 
 ---
 
@@ -613,9 +666,12 @@ servicrab start api --wait             # wait for one service inside a running d
 A service counts as ready when it is running and — if it declares a health
 check — that check has passed. A one-shot service that has already exited counts
 as ready too: a migration that finished is not something to keep waiting for.
-This is the same definition the supervisor uses to decide when a dependent may
-start, so `--wait` returns exactly when the last dependent would have been
-released.
+That is the default a dependent waits for as well, so with the default
+conditions `--wait` returns exactly when the last dependent would have been
+released. A `depends_on` entry that spells out
+[a condition](#dependency-conditions) is not reflected here: `--wait` asks
+whether each service is ready, not whether it satisfies a particular dependent,
+so it does not check the exit status of a one-shot.
 
 The exit code is the point:
 

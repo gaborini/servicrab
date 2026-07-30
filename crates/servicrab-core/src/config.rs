@@ -106,6 +106,64 @@ impl std::fmt::Display for ShutdownSignal {
     }
 }
 
+/// What a dependent waits for before it starts.
+///
+/// The names are the ones Docker Compose uses, because that is where anyone
+/// writing this field has met the idea before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyCondition {
+    /// The dependency's process is up.  Its exit status is not consulted: a
+    /// one-shot that has already run counts as started.
+    ServiceStarted,
+    /// A health probe of the dependency has passed.
+    ServiceHealthy,
+    /// The dependency has exited with status 0.
+    ServiceCompletedSuccessfully,
+}
+
+impl std::fmt::Display for DependencyCondition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DependencyCondition::ServiceStarted => write!(f, "service_started"),
+            DependencyCondition::ServiceHealthy => write!(f, "service_healthy"),
+            DependencyCondition::ServiceCompletedSuccessfully => {
+                write!(f, "service_completed_successfully")
+            }
+        }
+    }
+}
+
+/// One validated `depends_on` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Dependency {
+    /// The service to wait for.
+    pub service: ServiceName,
+    /// What to wait for, when the config spelled it out.
+    ///
+    /// Left as declared rather than resolved to a concrete condition, because
+    /// `PartialEq` on [`Service`] is the hot-reload restart trigger: resolving
+    /// it here would restart a dependent whenever its *dependency* gained a
+    /// health check, which changes nothing about the dependent's own process.
+    /// Use [`Dependency::condition_for`] to get the effective condition.
+    pub condition: Option<DependencyCondition>,
+}
+
+impl Dependency {
+    /// The condition to actually wait for, given the dependency it points at.
+    ///
+    /// An unspecified condition means "healthy if it promised a health check,
+    /// up otherwise" — the rule servicrab used before conditions existed, kept
+    /// so that adding a health check to a service still gates its dependents.
+    pub fn condition_for(&self, dependency: &Service) -> DependencyCondition {
+        self.condition.unwrap_or(if dependency.health.is_some() {
+            DependencyCondition::ServiceHealthy
+        } else {
+            DependencyCondition::ServiceStarted
+        })
+    }
+}
+
 // ── Project ────────────────────────────────────────────────────────────────
 
 /// Validated file-logging settings.
@@ -295,8 +353,8 @@ pub struct Service {
     /// Absolute paths of the service-level `env_file` entries, in declaration
     /// order.
     pub env_files: Vec<PathBuf>,
-    /// Validated list of service names that must start before this one.
-    pub depends_on: Vec<ServiceName>,
+    /// Validated dependencies that must be ready before this one starts.
+    pub depends_on: Vec<Dependency>,
     /// Whether the supervisor should start this service automatically.
     pub autostart: bool,
     /// Restart policy.

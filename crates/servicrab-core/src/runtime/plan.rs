@@ -84,7 +84,7 @@ fn collect_with_dependencies(
     // dependencies, so this recursion always terminates.
     if let Some(service) = config.services.get(name) {
         for dep in &service.depends_on {
-            collect_with_dependencies(config, dep, selected);
+            collect_with_dependencies(config, &dep.service, selected);
         }
     }
 }

@@ -8,12 +8,15 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::{
-    Config, HealthCheck, HealthProbe, LogSettings, Project, ProjectName, RestartPolicy, Service,
-    ServiceName, ShutdownSignal, UnhealthyAction, WatchSettings,
+    Config, Dependency, DependencyCondition, HealthCheck, HealthProbe, LogSettings, Project,
+    ProjectName, RestartPolicy, Service, ServiceName, ShutdownSignal, UnhealthyAction,
+    WatchSettings,
 };
 use crate::error::{ConfigError, ConfigWarning};
 use crate::graph::topological_sort;
-use crate::raw::{RawConfig, RawEnvFile, RawHealthCheck, RawRestartPolicy, RawWatch};
+use crate::raw::{
+    RawConfig, RawDependsOn, RawEnvFile, RawHealthCheck, RawRestartPolicy, RawService, RawWatch,
+};
 
 /// The only supported schema version.
 const SUPPORTED_VERSION: u32 = 1;
@@ -238,11 +241,17 @@ pub fn validate_raw(
         merged_env.extend(svc_file_env);
         merged_env.extend(svc_env);
 
-        // Collect depends_on as ServiceNames (cross-service validation deferred)
-        let depends_on: Vec<ServiceName> = raw_svc
-            .depends_on
-            .iter()
-            .map(|d| ServiceName(d.clone()))
+        // Collect depends_on (cross-service validation deferred to step 7).
+        // An unparseable condition is dropped rather than reported here: step 7
+        // walks the raw services, so it also sees the ones this loop skipped
+        // over an invalid command, and it is the single place that reports
+        // dependency problems.
+        let depends_on: Vec<Dependency> = dependency_entries(raw_svc)
+            .into_iter()
+            .map(|(dep, condition)| Dependency {
+                service: ServiceName(dep.to_string()),
+                condition: condition.and_then(parse_dependency_condition),
+            })
             .collect();
 
         let args = raw_svc.command[1..].to_vec();
@@ -275,21 +284,53 @@ pub fn validate_raw(
     // ── 7. Cross-service dependency validation ────────────────────────────
     for (raw_name, raw_svc) in &raw.services {
         let mut seen: BTreeSet<&str> = BTreeSet::new();
-        for dep in &raw_svc.depends_on {
-            if dep == raw_name {
+        for (dep, condition) in dependency_entries(raw_svc) {
+            if dep == raw_name.as_str() {
                 errors.push(ConfigError::SelfDependency {
                     service: raw_name.clone(),
                 });
-            } else if !raw.services.contains_key(dep.as_str()) {
+                continue;
+            }
+            let Some(target) = raw.services.get(dep) else {
                 errors.push(ConfigError::UnknownDependency {
                     service: raw_name.clone(),
-                    dep: dep.clone(),
+                    dep: dep.to_string(),
                 });
-            } else if !seen.insert(dep.as_str()) {
+                continue;
+            };
+            if !seen.insert(dep) {
                 errors.push(ConfigError::DuplicateDependency {
                     service: raw_name.clone(),
-                    dep: dep.clone(),
+                    dep: dep.to_string(),
                 });
+                continue;
+            }
+
+            // A condition the dependency can never satisfy is a deadlock
+            // waiting to happen — the dependent would sit there until someone
+            // interrupts the stack — so it is rejected at load time.
+            let Some(condition) = condition else { continue };
+            match parse_dependency_condition(condition) {
+                None => errors.push(ConfigError::InvalidDependencyCondition {
+                    service: raw_name.clone(),
+                    dep: dep.to_string(),
+                    value: condition.to_string(),
+                }),
+                Some(DependencyCondition::ServiceHealthy) if target.health.is_none() => {
+                    errors.push(ConfigError::DependencyNotHealthChecked {
+                        service: raw_name.clone(),
+                        dep: dep.to_string(),
+                    });
+                }
+                Some(DependencyCondition::ServiceCompletedSuccessfully)
+                    if target.restart == RawRestartPolicy::Always =>
+                {
+                    errors.push(ConfigError::DependencyNeverCompletes {
+                        service: raw_name.clone(),
+                        dep: dep.to_string(),
+                    });
+                }
+                Some(_) => {}
             }
         }
     }
@@ -302,7 +343,10 @@ pub fn validate_raw(
     // ── 9. Topological sort (may also emit DependencyCycle) ───────────────
     let dep_graph: BTreeMap<ServiceName, Vec<ServiceName>> = services
         .iter()
-        .map(|(name, svc)| (name.clone(), svc.depends_on.clone()))
+        .map(|(name, svc)| {
+            let deps = svc.depends_on.iter().map(|d| d.service.clone()).collect();
+            (name.clone(), deps)
+        })
         .collect();
 
     let start_order = match topological_sort(&dep_graph) {
@@ -324,6 +368,27 @@ pub fn validate_raw(
     };
 
     Ok((config, warnings))
+}
+
+// ── Dependencies ───────────────────────────────────────────────────────────
+
+/// The `depends_on` entries of one raw service, whichever form it used.
+fn dependency_entries(service: &RawService) -> Vec<(&str, Option<&str>)> {
+    service
+        .depends_on
+        .as_ref()
+        .map(RawDependsOn::entries)
+        .unwrap_or_default()
+}
+
+/// Parse a `depends_on` condition token, or `None` if it is not one.
+fn parse_dependency_condition(value: &str) -> Option<DependencyCondition> {
+    match value {
+        "service_started" => Some(DependencyCondition::ServiceStarted),
+        "service_healthy" => Some(DependencyCondition::ServiceHealthy),
+        "service_completed_successfully" => Some(DependencyCondition::ServiceCompletedSuccessfully),
+        _ => None,
+    }
 }
 
 // ── Name validation ────────────────────────────────────────────────────────
@@ -1659,7 +1724,7 @@ command = ["echo"]
                         cwd: None,
                         env: Default::default(),
                         env_file: None,
-                        depends_on: vec![],
+                        depends_on: None,
                         autostart: true,
                         restart: Default::default(),
                         restart_delay: None,
@@ -2088,6 +2153,138 @@ shutdown_timeout = "30s"
         load_from_str(toml).expect("valid dependency should pass");
     }
 
+    // ── Dependency conditions ──────────────────────────────────────────────
+
+    /// Two services where `b` depends on `a` under `condition`, and `a` carries
+    /// whatever `a_extra` adds.
+    fn with_condition(condition: &str, a_extra: &str) -> String {
+        format!(
+            r#"
+version = 1
+[project]
+name = "p"
+[services.a]
+command = ["echo"]
+{a_extra}
+[services.b]
+command = ["echo"]
+depends_on = {{ a = {{ condition = "{condition}" }} }}
+"#
+        )
+    }
+
+    #[test]
+    fn a_declared_condition_survives_validation() {
+        let (cfg, _) =
+            load_from_str(&with_condition("service_completed_successfully", "")).unwrap();
+        let b = &cfg.services[&ServiceName("b".to_string())];
+
+        assert_eq!(b.depends_on.len(), 1);
+        assert_eq!(b.depends_on[0].service.as_str(), "a");
+        assert_eq!(
+            b.depends_on[0].condition,
+            Some(DependencyCondition::ServiceCompletedSuccessfully)
+        );
+    }
+
+    #[test]
+    fn the_short_form_leaves_the_condition_to_the_dependency() {
+        let toml = r#"
+version = 1
+[project]
+name = "p"
+[services.a]
+command = ["echo"]
+[services.plain]
+command = ["echo"]
+depends_on = ["a"]
+[services.checked]
+command = ["echo"]
+depends_on = ["a"]
+[services.checked.health]
+tcp = "127.0.0.1:1"
+"#;
+        let (cfg, _) = load_from_str(toml).unwrap();
+        let plain = &cfg.services[&ServiceName("plain".to_string())];
+        let checked = &cfg.services[&ServiceName("checked".to_string())];
+
+        // Nothing is resolved at load time, so that adding a health check to a
+        // dependency does not count as a change to its dependents.
+        assert_eq!(plain.depends_on[0].condition, None);
+        assert_eq!(
+            plain.depends_on[0].condition_for(&cfg.services[&ServiceName("a".to_string())]),
+            DependencyCondition::ServiceStarted
+        );
+        assert_eq!(
+            plain.depends_on[0].condition_for(checked),
+            DependencyCondition::ServiceHealthy
+        );
+    }
+
+    #[test]
+    fn an_unknown_condition_errors() {
+        let err = expect_one_error(&with_condition("service_started_maybe", ""));
+        assert!(
+            matches!(&err, ConfigError::InvalidDependencyCondition { dep, value, .. }
+                if dep == "a" && value == "service_started_maybe"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn service_healthy_needs_the_dependency_to_have_a_health_check() {
+        let err = expect_one_error(&with_condition("service_healthy", ""));
+        assert!(
+            matches!(&err, ConfigError::DependencyNotHealthChecked { service, dep }
+                if service == "b" && dep == "a"),
+            "{err:?}"
+        );
+
+        load_from_str(&with_condition(
+            "service_healthy",
+            "[services.a.health]\ntcp = \"127.0.0.1:1\"",
+        ))
+        .expect("a health-checked dependency should pass");
+    }
+
+    #[test]
+    fn service_completed_successfully_rejects_a_dependency_that_always_restarts() {
+        let err = expect_one_error(&with_condition(
+            "service_completed_successfully",
+            r#"restart = "always""#,
+        ));
+        assert!(
+            matches!(&err, ConfigError::DependencyNeverCompletes { service, dep }
+                if service == "b" && dep == "a"),
+            "{err:?}"
+        );
+
+        // `on-failure` is fine: it retries until the run succeeds, which is
+        // exactly what waiting for a successful completion wants.
+        load_from_str(&with_condition(
+            "service_completed_successfully",
+            r#"restart = "on-failure""#,
+        ))
+        .expect("a retried dependency should pass");
+    }
+
+    #[test]
+    fn the_table_form_is_checked_like_the_list_form() {
+        let toml = "version=1\n[project]\nname=\"p\"\n[services.s]\ncommand=[\"echo\"]\ndepends_on={ ghost = {} }\n";
+        let err = expect_one_error(toml);
+        assert!(
+            matches!(&err, ConfigError::UnknownDependency { dep, .. } if dep == "ghost"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_typo_inside_the_table_form_names_the_field() {
+        let toml = "version=1\n[project]\nname=\"p\"\n[services.a]\ncommand=[\"echo\"]\n[services.b]\ncommand=[\"echo\"]\ndepends_on={ a = { conditon = \"service_started\" } }\n";
+        let err = toml::from_str::<RawConfig>(toml).expect_err("unknown field must be rejected");
+        assert!(err.to_string().contains("conditon"), "{err}");
+    }
+
     // ── Topological order ──────────────────────────────────────────────────
 
     #[test]
@@ -2172,7 +2369,7 @@ restart_delay = "2s"
                 cwd: None,
                 env: env.into_iter().collect(),
                 env_file: None,
-                depends_on: vec![],
+                depends_on: None,
                 autostart: true,
                 restart: Default::default(),
                 restart_delay: None,

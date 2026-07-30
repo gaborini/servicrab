@@ -35,11 +35,22 @@ struct ServiceJson<'a> {
     name: &'a str,
     command: Vec<&'a str>,
     cwd: String,
-    depends_on: Vec<&'a str>,
+    depends_on: Vec<DependencyJson<'a>>,
     autostart: bool,
     restart: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     health: Option<String>,
+}
+
+/// One dependency, with the condition resolved.
+///
+/// Resolved rather than as written, because a consumer of `--json` wants to
+/// know what will be waited for without having to reimplement the rule for an
+/// omitted condition.
+#[derive(Serialize)]
+struct DependencyJson<'a> {
+    service: &'a str,
+    condition: String,
 }
 
 fn print_json(services: &std::collections::BTreeMap<ServiceName, Service>) {
@@ -52,7 +63,7 @@ fn print_json(services: &std::collections::BTreeMap<ServiceName, Service>) {
                 name: svc.name.as_str(),
                 command: cmd,
                 cwd: svc.cwd.display().to_string(),
-                depends_on: svc.depends_on.iter().map(|n| n.as_str()).collect(),
+                depends_on: dependencies(svc, services),
                 autostart: svc.autostart,
                 restart: match svc.restart {
                     servicrab_core::RestartPolicy::Never => "never",
@@ -68,6 +79,26 @@ fn print_json(services: &std::collections::BTreeMap<ServiceName, Service>) {
         "{}",
         serde_json::to_string_pretty(&list).expect("JSON serialization")
     );
+}
+
+/// The dependencies of one service, each with its effective condition.
+fn dependencies<'a>(
+    service: &'a Service,
+    services: &'a std::collections::BTreeMap<ServiceName, Service>,
+) -> Vec<DependencyJson<'a>> {
+    service
+        .depends_on
+        .iter()
+        .map(|dep| DependencyJson {
+            service: dep.service.as_str(),
+            condition: match services.get(&dep.service) {
+                Some(target) => dep.condition_for(target).to_string(),
+                // Unreachable for a loaded config: validation rejects a
+                // dependency on a service that does not exist.
+                None => "unknown".to_string(),
+            },
+        })
+        .collect()
 }
 
 // ── Human-readable table ───────────────────────────────────────────────────
@@ -101,7 +132,10 @@ fn print_table(services: &std::collections::BTreeMap<ServiceName, Service>, proj
             cmd_preview
         );
         if !svc.depends_on.is_empty() {
-            let deps: Vec<&str> = svc.depends_on.iter().map(|n| n.as_str()).collect();
+            let deps: Vec<String> = dependencies(svc, services)
+                .into_iter()
+                .map(|dep| format!("{} ({})", dep.service, dep.condition))
+                .collect();
             println!("  depends on: {}", deps.join(", "));
         }
         if let Some(health) = &svc.health {

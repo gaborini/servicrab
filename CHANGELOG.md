@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Docker-Compose-style conditions on `depends_on`, spelled with the table form:
+
+  ```toml
+  [services.api.depends_on]
+  db = { condition = "service_healthy" }
+  migrate = { condition = "service_completed_successfully" }
+  ```
+
+  `service_completed_successfully` is the one that was missing: it is the only
+  condition that looks at the exit status, so a dependent is no longer started
+  against a half-migrated database when the migration exits non-zero. The other
+  two conditions keep treating a one-shot that has exited as available whatever
+  its status, because a condition a finished process can never meet again would
+  deadlock the stack.
+
+  The list form and its behaviour are unchanged, and leaving the condition out
+  is deliberately *not* the same as `service_started`: it still means "healthy
+  if the dependency declares a health check, up otherwise", so adding a health
+  check keeps gating everything that depends on that service. Spelling out
+  `service_started` is now the way to opt out of that for one edge.
+
+  Conditions that can never be met are rejected at load time: `service_healthy`
+  on a service with no `[health]` block, and `service_completed_successfully` on
+  a service with `restart = "always"`, which never stays exited.
 - `servicrab start --wait` returns only once every service is ready — running,
   and health-checked if it declares a health check — with `--timeout` to bound
   the wait (60s by default). A one-shot service that has already exited counts
@@ -39,6 +63,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `servicrab list --json` reports each dependency as an object rather than a
+  bare name, so the condition being waited for is machine-readable:
+  `"depends_on": [{"service": "db", "condition": "service_healthy"}]`. The
+  condition is the effective one, resolved for entries that omit it. The human
+  output names it too.
 - The daemon socket is now created with mode `0600`. It was left to the process
   umask, which is `022` on most systems but `002` on distributions that give
   each user a private group — and connecting to the socket is enough to start

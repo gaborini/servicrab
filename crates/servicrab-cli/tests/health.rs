@@ -183,6 +183,58 @@ retries = 2
     );
 }
 
+/// The other half of the test above: `service_started` is the way to opt out of
+/// health gating for one edge — a log shipper needs the database process to
+/// exist, not to be serving queries — so the same never-healthy dependency does
+/// not hold this dependent back.
+#[test]
+fn service_started_ignores_the_dependencys_health_check() {
+    let dir = TempDir::new().unwrap();
+    let started = dir.path().join("api.started");
+
+    script(dir.path(), "db.sh", "sleep 30");
+    script(dir.path(), "probe.sh", "exit 1");
+    script(
+        dir.path(),
+        "api.sh",
+        &format!("echo started > {}", started.display()),
+    );
+
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+
+[project]
+name = "demo"
+
+[services.api]
+command = ["{api}"]
+depends_on = {{ db = {{ condition = "service_started" }} }}
+
+[services.db]
+command = ["{db}"]
+restart = "never"
+
+[services.db.health]
+command = ["{probe}"]
+interval = "100ms"
+retries = 2
+"#,
+            api = dir.path().join("api.sh").display(),
+            db = dir.path().join("db.sh").display(),
+            probe = dir.path().join("probe.sh").display(),
+        ),
+    );
+
+    let (_code, _stdout, stderr) = up(&cfg, &[]);
+    assert!(
+        started.exists(),
+        "the dependent should not wait for a health check it opted out of: {stderr}"
+    );
+}
+
 #[test]
 fn an_unhealthy_service_is_restarted() {
     let dir = TempDir::new().unwrap();

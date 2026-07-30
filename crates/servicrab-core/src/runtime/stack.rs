@@ -5,9 +5,12 @@
 //! down in reverse dependency order so that dependents stop before the services
 //! they rely on.
 //!
-//! A service is considered "available" for its dependents as soon as its
-//! process is running.  Real readiness probes are a later milestone; until then
-//! a dependent may still need to retry its own connection attempts.
+//! What makes a service "available" for its dependents is per edge: each
+//! `depends_on` entry carries a [`DependencyCondition`], and an entry that does
+//! not spell one out waits for a health probe when the dependency has a health
+//! check and for the process to be up otherwise.  Either way, "up" is not a
+//! promise that the service is *usable*, so a dependent may still need to retry
+//! its own connection attempts.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -16,7 +19,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-use crate::config::{Config, Service, ServiceName};
+use crate::config::{Config, DependencyCondition, Service, ServiceName};
 use crate::error::RuntimeError;
 use crate::lifecycle::{ExitReason, ServiceState, ShutdownReason};
 use crate::runtime::event::{event_channel, EventKind, EventSender, EventSink, ServiceEvent};
@@ -155,8 +158,8 @@ pub fn control_channel() -> (ControlTx, ControlRx) {
 /// Everything the supervisor needs to run — and re-run — one service.
 struct Slot {
     service: Arc<Service>,
-    deps: Vec<(ServiceName, watch::Receiver<Readiness>)>,
-    readiness: Arc<watch::Sender<Readiness>>,
+    deps: Vec<DependencyEdge>,
+    readiness: Arc<watch::Sender<DependencyStatus>>,
     /// Present exactly while a supervision task is alive.
     stop: Option<crate::runtime::ShutdownTx>,
     handle: Option<JoinHandle<()>>,
@@ -177,9 +180,9 @@ impl Slot {
         options: RunOptions,
         reports: mpsc::UnboundedSender<ServiceReport>,
     ) {
-        // A previous run may have left the signal at `Gone`; dependents that
-        // are still waiting must not act on that stale verdict.
-        let _ = self.readiness.send(Readiness::Pending);
+        // A previous run may have left the status at something a dependent
+        // would read as a verdict; it must not act on that stale news.
+        let _ = self.readiness.send(DependencyStatus::new());
 
         let (stop_tx, stop_rx) = shutdown_channel();
         self.stop = Some(stop_tx);
@@ -554,7 +557,7 @@ impl RunState {
     /// Dependencies are wired up separately, once every slot exists: a
     /// service must be able to subscribe to slots added after it.
     fn insert_slot(&mut self, name: &ServiceName, service: Arc<Service>) {
-        let (state_tx, state_rx) = watch::channel(Readiness::Pending);
+        let (state_tx, state_rx) = watch::channel(DependencyStatus::new());
         drop(state_rx);
         self.slots.insert(
             name.clone(),
@@ -571,9 +574,9 @@ impl RunState {
         );
     }
 
-    /// Point every slot at the readiness of the dependencies it currently has.
+    /// Point every slot at the status of the dependencies it currently has.
     fn rewire_dependencies(&mut self) {
-        let readiness: BTreeMap<ServiceName, Arc<watch::Sender<Readiness>>> = self
+        let readiness: BTreeMap<ServiceName, Arc<watch::Sender<DependencyStatus>>> = self
             .slots
             .iter()
             .map(|(name, slot)| (name.clone(), slot.readiness.clone()))
@@ -587,9 +590,17 @@ impl RunState {
                 .depends_on
                 .iter()
                 .filter_map(|dep| {
-                    readiness
-                        .get(dep)
-                        .map(|sender| (dep.clone(), sender.subscribe()))
+                    // An unspecified condition resolves against the dependency
+                    // as it is configured *now*, so a health check added by a
+                    // reload starts gating this edge without the dependent
+                    // itself having changed.
+                    let target = self.config.services.get(&dep.service)?;
+                    let sender = readiness.get(&dep.service)?;
+                    Some(DependencyEdge {
+                        name: dep.service.clone(),
+                        condition: dep.condition_for(target),
+                        status: sender.subscribe(),
+                    })
                 })
                 .collect();
         }
@@ -723,12 +734,87 @@ pub enum Readiness {
     Gone,
 }
 
+/// What a service's own event stream says about it so far.
+///
+/// This is broadcast rather than a [`Readiness`] verdict because one service
+/// can be depended on under different conditions at the same time — a web app
+/// may want the database *healthy* while a log shipper only needs it *up* — so
+/// the verdict has to be computed per dependent, from a shared set of facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DependencyStatus {
+    /// The last lifecycle state observed.
+    state: ServiceState,
+    /// Whether a probe has passed for the process that is running now.
+    healthy: bool,
+    /// Whether the current run is known to be unhealthy.
+    unhealthy: bool,
+    /// Whether the last run that ended exited with status 0.
+    exited_ok: bool,
+    /// Set when the service will not run at all: it was itself skipped over an
+    /// unavailable dependency, or the stack shut down before its turn.  No
+    /// lifecycle state describes that, and no condition can be met after it.
+    gone: bool,
+}
+
+impl DependencyStatus {
+    /// The status of a service that has not been started yet.
+    fn new() -> Self {
+        Self {
+            state: ServiceState::Pending,
+            healthy: false,
+            unhealthy: false,
+            exited_ok: false,
+            gone: false,
+        }
+    }
+
+    /// Whether a dependent waiting for `condition` may start.
+    fn readiness(&self, condition: DependencyCondition) -> Readiness {
+        if self.gone {
+            return Readiness::Gone;
+        }
+        match self.state {
+            ServiceState::Exited => match condition {
+                // The only condition that consults the exit status.  The other
+                // two treat a one-shot that has done its job — a migration, a
+                // build step — as available, which is what keeps a stack whose
+                // dependency legitimately exits from deadlocking.
+                DependencyCondition::ServiceCompletedSuccessfully if self.exited_ok => {
+                    Readiness::Ready
+                }
+                DependencyCondition::ServiceCompletedSuccessfully => Readiness::Gone,
+                // Unless it was stopped precisely because it was unhealthy.
+                _ if !self.unhealthy => Readiness::Ready,
+                _ => Readiness::Gone,
+            },
+            ServiceState::Failed | ServiceState::Stopped => Readiness::Gone,
+            ServiceState::Running => match condition {
+                DependencyCondition::ServiceStarted => Readiness::Ready,
+                DependencyCondition::ServiceHealthy if self.healthy => Readiness::Ready,
+                // An unhealthy service may yet be restarted into shape, and a
+                // one-shot that has not exited yet may yet exit cleanly, so
+                // both are a wait rather than a verdict.
+                _ => Readiness::Pending,
+            },
+            _ => Readiness::Pending,
+        }
+    }
+}
+
+/// One dependency edge: who to wait for, for what, and where to watch it.
+#[derive(Clone)]
+struct DependencyEdge {
+    name: ServiceName,
+    condition: DependencyCondition,
+    status: watch::Receiver<DependencyStatus>,
+}
+
 /// Supervise one service: wait for its dependencies, then run it.
 #[allow(clippy::too_many_arguments)]
 async fn supervise_service(
     service: Arc<Service>,
-    deps: Vec<(ServiceName, watch::Receiver<Readiness>)>,
-    readiness: Arc<watch::Sender<Readiness>>,
+    deps: Vec<DependencyEdge>,
+    readiness: Arc<watch::Sender<DependencyStatus>>,
     mut stop: ShutdownRx,
     events: EventSender,
     options: RunOptions,
@@ -745,7 +831,7 @@ async fn supervise_service(
                     dependency: dependency.clone(),
                 },
             ));
-            let _ = readiness.send(Readiness::Gone);
+            readiness.send_modify(|status| status.gone = true);
             let _ = reports.send(ServiceReport {
                 service: name,
                 result: ServiceResult::Skipped { dependency },
@@ -753,7 +839,7 @@ async fn supervise_service(
             return;
         }
         DependencyWait::Shutdown(reason) => {
-            let _ = readiness.send(Readiness::Gone);
+            readiness.send_modify(|status| status.gone = true);
             let _ = reports.send(ServiceReport {
                 service: name,
                 result: ServiceResult::Finished(RunOutcome::Stopped { reason }),
@@ -767,9 +853,7 @@ async fn supervise_service(
     let (tx, mut rx) = event_channel();
     let relay = {
         let global = events.clone();
-        // A service with a health check is only ready once a probe passes;
-        // without one, "the process is up" is the best signal available.
-        let mut tracker = ReadinessTracker::new(service.health.is_some());
+        let mut tracker = ReadinessTracker::new();
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 if let Some(next) = tracker.observe(&event.kind) {
@@ -808,86 +892,66 @@ async fn supervise_service(
     });
 }
 
-/// Derives the readiness signal dependents wait on from a service's events.
+/// Folds a service's events into the status its dependents watch.
 struct ReadinessTracker {
-    /// Whether the service promised a health check, in which case being up is
-    /// not enough to be ready.
-    gate_on_health: bool,
-    /// Whether the current process run is known to be unhealthy.
-    unhealthy: bool,
+    status: DependencyStatus,
 }
 
 impl ReadinessTracker {
-    fn new(gate_on_health: bool) -> Self {
+    fn new() -> Self {
         Self {
-            gate_on_health,
-            unhealthy: false,
+            status: DependencyStatus::new(),
         }
     }
 
-    /// Map one runtime event to the readiness it implies, if any.
-    fn observe(&mut self, kind: &EventKind) -> Option<Readiness> {
+    /// Fold one runtime event in, returning the new status when it changed.
+    fn observe(&mut self, kind: &EventKind) -> Option<DependencyStatus> {
+        let before = self.status;
         match kind {
-            // A passing health probe always means ready.
             EventKind::Healthy => {
-                self.unhealthy = false;
-                Some(Readiness::Ready)
+                self.status.healthy = true;
+                self.status.unhealthy = false;
             }
-            // A failing one takes readiness away again, so a dependent that
-            // has not started yet keeps waiting for the service to recover.
             EventKind::Unhealthy { .. } => {
-                self.unhealthy = true;
-                Some(Readiness::Pending)
+                self.status.healthy = false;
+                self.status.unhealthy = true;
             }
-            EventKind::Exited {
-                reason: ExitReason::Unhealthy,
-                ..
-            } => {
-                self.unhealthy = true;
-                None
+            EventKind::Exited { reason, .. } => {
+                self.status.exited_ok = reason.is_success();
+                if matches!(reason, ExitReason::Unhealthy) {
+                    self.status.unhealthy = true;
+                }
             }
-            EventKind::State(state) => match state {
+            EventKind::State(state) => {
+                self.status.state = *state;
                 // A restart gets a clean slate: the new process has to prove
                 // itself healthy again.
-                ServiceState::Starting => {
-                    self.unhealthy = false;
-                    None
+                if matches!(state, ServiceState::Starting) {
+                    self.status.healthy = false;
+                    self.status.unhealthy = false;
                 }
-                // The process is up: enough on its own, unless the service
-                // promised a health check that has not passed yet.
-                ServiceState::Running if !self.gate_on_health => Some(Readiness::Ready),
-                // A one-shot dependency (a migration, a build step) that
-                // already did its job counts as available — unless it was
-                // stopped precisely because it was unhealthy.
-                ServiceState::Exited if !self.unhealthy => Some(Readiness::Ready),
-                ServiceState::Exited | ServiceState::Failed | ServiceState::Stopped => {
-                    Some(Readiness::Gone)
-                }
-                _ => None,
-            },
-            _ => None,
+            }
+            _ => {}
         }
+        (self.status != before).then_some(self.status)
     }
 }
 
 /// Wait until every dependency is available (or will never be).
-async fn wait_for_dependencies(
-    deps: &[(ServiceName, watch::Receiver<Readiness>)],
-    stop: &mut ShutdownRx,
-) -> DependencyWait {
-    for (name, receiver) in deps {
-        let mut receiver = receiver.clone();
+async fn wait_for_dependencies(deps: &[DependencyEdge], stop: &mut ShutdownRx) -> DependencyWait {
+    for edge in deps {
+        let mut status = edge.status.clone();
         loop {
-            match *receiver.borrow_and_update() {
+            match status.borrow_and_update().readiness(edge.condition) {
                 Readiness::Ready => break,
-                Readiness::Gone => return DependencyWait::Blocked(name.clone()),
+                Readiness::Gone => return DependencyWait::Blocked(edge.name.clone()),
                 Readiness::Pending => {}
             }
 
             tokio::select! {
-                changed = receiver.changed() => {
+                changed = status.changed() => {
                     if changed.is_err() {
-                        return DependencyWait::Blocked(name.clone());
+                        return DependencyWait::Blocked(edge.name.clone());
                     }
                 }
                 reason = wait_for_shutdown(stop) => return DependencyWait::Shutdown(reason),
@@ -1072,7 +1136,7 @@ command = ["sleep", "60"]
         let deps: Vec<ServiceName> = state.slots[&name("api")]
             .deps
             .iter()
-            .map(|(dep, _)| dep.clone())
+            .map(|edge| edge.name.clone())
             .collect();
         assert_eq!(deps, vec![name("worker")]);
     }
@@ -1116,14 +1180,53 @@ command = ["sleep", "60"]
         assert_eq!(bad.failures().count(), 1);
     }
 
+    /// What a dependent waiting for `condition` sees after the dependency has
+    /// emitted `events`.
+    fn verdict(events: &[EventKind], condition: DependencyCondition) -> Readiness {
+        let mut tracker = ReadinessTracker::new();
+        for event in events {
+            tracker.observe(event);
+        }
+        tracker.status.readiness(condition)
+    }
+
+    /// The events a service emits as it comes up.
+    fn started() -> Vec<EventKind> {
+        vec![
+            EventKind::State(ServiceState::Starting),
+            EventKind::State(ServiceState::Running),
+        ]
+    }
+
+    /// The events a service emits as it exits with `code` and is not restarted.
+    fn exited(code: i32) -> Vec<EventKind> {
+        let mut events = started();
+        events.push(EventKind::Exited {
+            reason: ExitReason::Code(code),
+            uptime: Duration::from_secs(1),
+        });
+        events.push(EventKind::State(ServiceState::Exited));
+        events
+    }
+
+    fn edge(
+        condition: DependencyCondition,
+        status: watch::Receiver<DependencyStatus>,
+    ) -> Vec<DependencyEdge> {
+        vec![DependencyEdge {
+            name: name("db"),
+            condition,
+            status,
+        }]
+    }
+
     #[tokio::test]
     async fn dependencies_are_awaited_until_ready() {
-        let (tx, rx) = watch::channel(Readiness::Pending);
+        let (tx, rx) = watch::channel(DependencyStatus::new());
         let (_stop_tx, mut stop_rx) = shutdown_channel();
-        let deps = vec![(name("db"), rx)];
+        let deps = edge(DependencyCondition::ServiceStarted, rx);
 
         let waiter = tokio::spawn(async move {
-            let (_stop_tx2, _) = shutdown_channel();
             matches!(
                 wait_for_dependencies(&deps, &mut stop_rx).await,
                 DependencyWait::Ready
@@ -1131,18 +1234,32 @@ command = ["sleep", "60"]
         });
 
         tokio::task::yield_now().await;
-        tx.send(Readiness::Ready).expect("receiver alive");
+        tx.send_modify(|status| status.state = ServiceState::Running);
 
         assert!(waiter.await.expect("task"));
     }
 
     #[tokio::test]
     async fn a_failed_dependency_blocks_the_dependent() {
-        let (tx, rx) = watch::channel(Readiness::Pending);
+        let (tx, rx) = watch::channel(DependencyStatus::new());
         let (_stop_tx, mut stop_rx) = shutdown_channel();
-        let deps = vec![(name("db"), rx)];
+        let deps = edge(DependencyCondition::ServiceStarted, rx);
 
-        tx.send(Readiness::Gone).expect("receiver alive");
+        tx.send_modify(|status| status.state = ServiceState::Failed);
+
+        assert!(matches!(
+            wait_for_dependencies(&deps, &mut stop_rx).await,
+            DependencyWait::Blocked(blocked) if blocked.as_str() == "db"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_skipped_dependency_blocks_the_dependent() {
+        let (tx, rx) = watch::channel(DependencyStatus::new());
+        let (_stop_tx, mut stop_rx) = shutdown_channel();
+        let deps = edge(DependencyCondition::ServiceStarted, rx);
+
+        tx.send_modify(|status| status.gone = true);
 
         assert!(matches!(
             wait_for_dependencies(&deps, &mut stop_rx).await,
@@ -1151,89 +1268,120 @@ command = ["sleep", "60"]
     }
 
     #[test]
-    fn readiness_follows_the_process_when_there_is_no_health_check() {
-        let mut tracker = ReadinessTracker::new(false);
+    fn service_started_only_needs_the_process_to_be_up() {
+        use DependencyCondition::ServiceStarted;
+
+        assert_eq!(verdict(&started(), ServiceStarted), Readiness::Ready);
         assert_eq!(
-            tracker.observe(&EventKind::State(ServiceState::Running)),
-            Some(Readiness::Ready)
+            verdict(&[EventKind::State(ServiceState::Starting)], ServiceStarted),
+            Readiness::Pending
         );
+        // The exit status is deliberately not consulted: it started.
+        assert_eq!(verdict(&exited(1), ServiceStarted), Readiness::Ready);
         assert_eq!(
-            tracker.observe(&EventKind::State(ServiceState::Backoff)),
-            None
-        );
-        assert_eq!(
-            tracker.observe(&EventKind::State(ServiceState::Failed)),
-            Some(Readiness::Gone)
+            verdict(&[EventKind::State(ServiceState::Failed)], ServiceStarted),
+            Readiness::Gone
         );
     }
 
     #[test]
-    fn a_health_checked_service_is_only_ready_once_a_probe_passes() {
-        let mut tracker = ReadinessTracker::new(true);
-        assert_eq!(
-            tracker.observe(&EventKind::State(ServiceState::Running)),
-            None
-        );
-        assert_eq!(tracker.observe(&EventKind::Healthy), Some(Readiness::Ready));
-        assert_eq!(
-            tracker.observe(&EventKind::Unhealthy {
-                message: "boom".to_string()
-            }),
-            Some(Readiness::Pending)
-        );
+    fn service_healthy_waits_for_a_passing_probe() {
+        use DependencyCondition::ServiceHealthy;
+
+        assert_eq!(verdict(&started(), ServiceHealthy), Readiness::Pending);
+
+        let mut healthy = started();
+        healthy.push(EventKind::Healthy);
+        assert_eq!(verdict(&healthy, ServiceHealthy), Readiness::Ready);
+
+        // A failing probe takes readiness away again rather than settling the
+        // question: a restart may yet put the service right.
+        let mut unhealthy = healthy.clone();
+        unhealthy.push(EventKind::Unhealthy {
+            message: "boom".to_string(),
+        });
+        assert_eq!(verdict(&unhealthy, ServiceHealthy), Readiness::Pending);
     }
 
     #[test]
-    fn a_one_shot_dependency_counts_as_ready_once_it_exits() {
-        for gate in [false, true] {
-            let mut tracker = ReadinessTracker::new(gate);
-            assert_eq!(
-                tracker.observe(&EventKind::State(ServiceState::Exited)),
-                Some(Readiness::Ready)
-            );
+    fn a_one_shot_dependency_counts_as_started_and_as_healthy_once_it_exits() {
+        // Neither condition can ever be met again by a process that is gone, so
+        // insisting on them would deadlock every stack with a migration step in
+        // it.  `service_completed_successfully` is the condition for callers who
+        // want the exit status checked.
+        for condition in [
+            DependencyCondition::ServiceStarted,
+            DependencyCondition::ServiceHealthy,
+        ] {
+            assert_eq!(verdict(&exited(0), condition), Readiness::Ready);
         }
     }
 
     #[test]
-    fn a_service_stopped_for_being_unhealthy_never_becomes_available() {
-        let mut tracker = ReadinessTracker::new(true);
+    fn service_completed_successfully_waits_for_a_clean_exit() {
+        use DependencyCondition::ServiceCompletedSuccessfully;
+
         assert_eq!(
-            tracker.observe(&EventKind::Unhealthy {
-                message: "boom".to_string()
-            }),
-            Some(Readiness::Pending)
+            verdict(&started(), ServiceCompletedSuccessfully),
+            Readiness::Pending
         );
         assert_eq!(
-            tracker.observe(&EventKind::Exited {
-                reason: ExitReason::Unhealthy,
-                uptime: Duration::from_secs(1),
-            }),
-            None
+            verdict(&exited(0), ServiceCompletedSuccessfully),
+            Readiness::Ready
         );
         assert_eq!(
-            tracker.observe(&EventKind::State(ServiceState::Exited)),
-            Some(Readiness::Gone)
+            verdict(&exited(1), ServiceCompletedSuccessfully),
+            Readiness::Gone
         );
     }
 
     #[test]
+    fn a_service_stopped_for_being_unhealthy_never_becomes_available() {
+        let events = vec![
+            EventKind::State(ServiceState::Running),
+            EventKind::Unhealthy {
+                message: "boom".to_string(),
+            },
+            EventKind::Exited {
+                reason: ExitReason::Unhealthy,
+                uptime: Duration::from_secs(1),
+            },
+            EventKind::State(ServiceState::Exited),
+        ];
+
+        for condition in [
+            DependencyCondition::ServiceStarted,
+            DependencyCondition::ServiceHealthy,
+        ] {
+            assert_eq!(verdict(&events, condition), Readiness::Gone);
+        }
+    }
+
+    #[test]
     fn a_restart_resets_the_unhealthy_verdict() {
-        let mut tracker = ReadinessTracker::new(true);
-        tracker.observe(&EventKind::Unhealthy {
+        let mut events = started();
+        events.push(EventKind::Unhealthy {
             message: "boom".to_string(),
         });
+        events.push(EventKind::State(ServiceState::Starting));
+        events.push(EventKind::State(ServiceState::Running));
         assert_eq!(
-            tracker.observe(&EventKind::State(ServiceState::Starting)),
-            None
+            verdict(&events, DependencyCondition::ServiceHealthy),
+            Readiness::Pending
         );
-        assert_eq!(tracker.observe(&EventKind::Healthy), Some(Readiness::Ready));
+
+        events.push(EventKind::Healthy);
+        assert_eq!(
+            verdict(&events, DependencyCondition::ServiceHealthy),
+            Readiness::Ready
+        );
     }
 
     #[tokio::test]
     async fn shutdown_interrupts_the_dependency_wait() {
-        let (_tx, rx) = watch::channel(Readiness::Pending);
+        let (_tx, rx) = watch::channel(DependencyStatus::new());
         let (stop_tx, mut stop_rx) = shutdown_channel();
-        let deps = vec![(name("db"), rx)];
+        let deps = edge(DependencyCondition::ServiceStarted, rx);
 
         stop_tx
             .send(Some(ShutdownReason::UserInterrupt))

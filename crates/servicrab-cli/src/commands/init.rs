@@ -47,7 +47,10 @@ name = "my-project"
 #   cwd           Working directory (default: config file's directory)
 #   env           Per-service environment variables
 #   env_file      Dotenv file(s) loaded before `env`, e.g. ".env" or a list
-#   depends_on    Services that must start before this one, e.g. ["db"]
+#   depends_on    Services that must be ready before this one, e.g. ["db"], or
+#                 with a condition: { db = { condition = "service_healthy" } }
+#                 Conditions: service_started | service_healthy |
+#                 service_completed_successfully (the last one is for migrations)
 #   autostart     Whether to start automatically (default: true)
 #   restart       never | on-failure | always  (default: never)
 #   restart_delay         Minimum backoff before first restart (default: 1s)
@@ -79,7 +82,8 @@ name = "my-project"
 #   on_unhealthy  restart | ignore (default: restart)
 #
 # Services that depend on a health-checked service wait for its first
-# successful probe instead of just for its process to be up.
+# successful probe instead of just for its process to be up, unless their
+# depends_on entry says otherwise.
 
 [services.api]
 command = ["echo", "Replace me with your API server command"]
