@@ -4,9 +4,12 @@ A **lightweight, cross-platform process supervisor** for local development stack
 
 Think of it as a minimal, zero-dependency alternative to [overmind](https://github.com/DarthSim/overmind) or [Honcho](https://github.com/nicksylett/honcho), with a roadmap toward daemon-based management and a local API.
 
+[![crates.io](https://img.shields.io/crates/v/servicrab.svg)](https://crates.io/crates/servicrab)
+[![MSRV](https://img.shields.io/badge/rustc-1.85%2B-blue.svg)](https://github.com/gaborini/servicrab#from-source)
+
 ---
 
-## Features (v0.1)
+## Features (v0.2)
 
 - Declare your entire local stack in one `servicrab.toml`, or split it across
   files with `include`
@@ -1157,12 +1160,12 @@ green pipeline.
 - [x] Live event streaming over the socket (`servicrab events`, `subscribe`)
 - [x] `--json` event stream for `up` and `watch`
 
-### Phase 5 (current) — Release engineering
+### Phase 5 — Release engineering ✅
 - [x] Publishable crate metadata and a `CHANGELOG.md`
 - [x] Tagged releases with prebuilt Linux and macOS binaries (x86_64 + aarch64)
 - [x] Man pages (`servicrab man`), shipped in the release tarballs
 - [x] Dependency audit (`cargo-deny`) and automated dependency updates
-- [ ] Published to crates.io
+- [x] Published to crates.io
 
 ---
 
