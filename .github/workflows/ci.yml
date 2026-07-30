@@ -12,6 +12,14 @@ env:
 permissions:
   contents: read
 
+# A second push to the same branch makes the first run's answer worthless, so
+# it is cancelled rather than left to report on code nobody has any more.  Runs
+# on `main` are left alone: those are the ones a release is cut from, and their
+# results are what the branch's history is judged by.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   check:
     name: fmt + clippy + test (${{ matrix.os }})
