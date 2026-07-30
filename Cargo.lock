@@ -584,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "servicrab"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -608,7 +608,7 @@ dependencies = [
 
 [[package]]
 name = "servicrab-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "humantime",
  "nix",
@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "servicrab-protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
