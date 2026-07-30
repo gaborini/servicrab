@@ -141,6 +141,9 @@ pub struct Project {
     pub name: ProjectName,
     /// Project-level environment variables (as declared in `[project.env]`).
     pub env: BTreeMap<String, String>,
+    /// Absolute paths of the project-level `env_file` entries, in declaration
+    /// order.
+    pub env_files: Vec<PathBuf>,
     /// File-logging settings, when `[project.logs]` was declared.
     pub logs: Option<LogSettings>,
 }
@@ -245,9 +248,12 @@ pub struct Service {
     pub args: Vec<String>,
     /// Absolute, canonicalized working directory.
     pub cwd: PathBuf,
-    /// Effective environment: process env + project env + service env (later
-    /// entries override earlier ones).
+    /// Effective environment: process env + project env files + project env +
+    /// service env files + service env (later entries override earlier ones).
     pub env: BTreeMap<String, String>,
+    /// Absolute paths of the service-level `env_file` entries, in declaration
+    /// order.
+    pub env_files: Vec<PathBuf>,
     /// Validated list of service names that must start before this one.
     pub depends_on: Vec<ServiceName>,
     /// Whether the supervisor should start this service automatically.

@@ -22,6 +22,7 @@
 //!   across multiple files.
 
 pub mod config;
+pub mod envfile;
 pub mod error;
 pub mod graph;
 pub mod lifecycle;
@@ -35,6 +36,7 @@ pub use config::{
     Config, HealthCheck, HealthProbe, LogSettings, Project, ProjectName, RestartPolicy, Service,
     ServiceName, ShutdownSignal, UnhealthyAction,
 };
+pub use envfile::EnvFileError;
 pub use error::{ConfigError, ConfigWarning, RuntimeError};
 pub use lifecycle::{
     ExitReason, InvalidTransition, ProcessOutcome, RestartDecision, RestartTracker, ServiceState,

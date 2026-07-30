@@ -18,7 +18,8 @@ Think of it as a minimal, zero-dependency alternative to [overmind](https://gith
 - Log files: opt-in per-service capture with size-based rotation, plus `servicrab logs [-f]` to read and follow them
 - Background daemon: `servicrab start` / `status` / `stop` / `restart` / `down`, with a documented JSON-over-Unix-socket protocol (Linux/macOS)
 - Restart policies: `never`, `on-failure`, `always`, with exponential backoff
-- Per-service environment variables and working directories
+- Environment: per-service variables, working directories, and dotenv-style `env_file` layering
+- Shell completions for bash, zsh, fish, PowerShell and elvish
 - Dependency declarations and a deterministic start order
 
 ---
@@ -130,6 +131,7 @@ if you want shell semantics.
 | `servicrab restart <SERVICE...> [--config PATH]` | Restart individual services |
 | `servicrab down [--config PATH]` | Stop the daemon and every service it supervises |
 | `servicrab daemon [--config PATH] [--no-restart]` | Run the daemon in the foreground (for systemd/launchd/containers) |
+| `servicrab completions <SHELL>` | Print a completion script for bash, zsh, fish, PowerShell or elvish |
 
 If `--config` is omitted, Servicrab discovers `servicrab.toml` by walking up
 from the current directory.
@@ -400,6 +402,67 @@ all of them are powers of 1024.
 
 ---
 
+## Environment files
+
+Anything you would otherwise repeat in `[project.env]` or
+`[services.<name>.env]` can live in a dotenv-style file instead:
+
+```toml
+[project]
+name = "my-project"
+env_file = ".env"                    # or a list: [".env", ".env.local"]
+
+[services.api]
+command = ["node", "server.js"]
+env_file = [".env.api", ".env.api.local"]
+
+[services.api.env]
+PORT = "3000"                        # wins over anything in the files
+```
+
+Paths are relative to `servicrab.toml`. Files are read once, when the config is
+loaded, and layered lowest to highest:
+
+```
+inherited shell environment
+  → project env_file (in declaration order)
+    → [project.env]
+      → service env_file (in declaration order)
+        → [services.<name>.env]
+```
+
+The file format is deliberately small:
+
+```sh
+# a comment
+KEY=value
+export KEY=value          # `export` is accepted and ignored
+QUOTED="hello world"      # double quotes support \n \r \t \\ \" escapes
+LITERAL='no $expansion'   # single quotes are literal
+EMPTY=
+PORT=3000                 # trailing comments are stripped
+```
+
+There is no variable expansion: what is written is what the service receives.
+A missing file, an unterminated quote or a line without `=` is a configuration
+error, reported by `servicrab check` with the file name and line number — the
+stack never starts with a half-loaded environment.
+
+---
+
+## Shell completions
+
+```bash
+servicrab completions bash > /etc/bash_completion.d/servicrab
+servicrab completions zsh  > ~/.zfunc/_servicrab
+servicrab completions fish > ~/.config/fish/completions/servicrab.fish
+```
+
+`powershell` and `elvish` are supported too. The script is written to stdout,
+so nothing is installed behind your back.
+
+---
+
 ## Running in the background
 
 `up` is the interactive mode; `start` is the same stack without a terminal
@@ -542,9 +605,10 @@ cargo test -p servicrab-core config::tests
 - [x] Per-service `start` / `stop` / `restart` through the daemon
 - [ ] Live event streaming over the socket
 
-### Phase 3 — Stack management
+### Phase 3 (current) — Stack management
+- [x] `.env` file support per project and per service
+- [x] Shell completions (`servicrab completions <SHELL>`)
 - [ ] `servicrab watch` — restart on file changes (à la `watchexec`)
-- [ ] `.env` file support per service
 - [ ] Config hot-reload
 
 ### Phase 4 — Platform integration (optional)

@@ -11,6 +11,7 @@
 //!   (Linux/macOS)
 //!
 //! - `servicrab logs [SERVICE...]` — read the captured log files
+//! - `servicrab completions <SHELL>` — print a shell completion script
 //! - `servicrab start` / `status` / `stop` / `restart` / `down` — background
 //!   daemon control (Linux/macOS)
 //!
@@ -209,6 +210,12 @@ enum Commands {
         config: Option<std::path::PathBuf>,
     },
 
+    /// Print a shell completion script to stdout.
+    Completions {
+        /// Shell to generate completions for.
+        shell: clap_complete::Shell,
+    },
+
     /// Supervise the stack in the foreground while serving the daemon socket.
     /// This is what `start` runs in the background; use it directly under
     /// systemd, launchd or a container.  Linux and macOS only.
@@ -291,6 +298,7 @@ fn main() {
         Commands::Daemon { config, no_restart } => {
             commands::daemon::daemon(config.as_deref(), no_restart)
         }
+        Commands::Completions { shell } => commands::completions::run::<Cli>(shell).map(|()| 0),
         Commands::Logs {
             services,
             config,

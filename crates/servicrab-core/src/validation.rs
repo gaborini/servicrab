@@ -13,7 +13,7 @@ use crate::config::{
 };
 use crate::error::{ConfigError, ConfigWarning};
 use crate::graph::topological_sort;
-use crate::raw::{RawConfig, RawHealthCheck, RawRestartPolicy};
+use crate::raw::{RawConfig, RawEnvFile, RawHealthCheck, RawRestartPolicy};
 
 /// The only supported schema version.
 const SUPPORTED_VERSION: u32 = 1;
@@ -58,6 +58,14 @@ pub fn validate_raw(
 
     // ── 4. Project env ─────────────────────────────────────────────────────
     let project_env = validate_project_env(&raw.project.env, &mut errors);
+
+    // ── 4a. Project env files ──────────────────────────────────────────────
+    let (project_env_files, project_file_env) = load_env_files(
+        raw.project.env_file.as_ref(),
+        &source_dir,
+        "project",
+        &mut errors,
+    );
 
     // ── 4b. Project log settings ───────────────────────────────────────────
     let logs = raw
@@ -119,6 +127,14 @@ pub fn validate_raw(
 
         // Service env
         let svc_env = validate_service_env(&raw_svc.env, raw_name, &mut errors);
+
+        // Service env files
+        let (svc_env_files, svc_file_env) = load_env_files(
+            raw_svc.env_file.as_ref(),
+            &source_dir,
+            &format!("service {raw_name:?}"),
+            &mut errors,
+        );
 
         // Restart policy
         let restart = match raw_svc.restart {
@@ -209,9 +225,12 @@ pub fn validate_raw(
         // Warning: executable not in PATH
         check_executable_in_path(executable, raw_name, &mut warnings);
 
-        // Merge environment: process → project → service  (later overrides earlier)
+        // Merge environment, later layers override earlier ones:
+        //   process → project env_file → project env → service env_file → service env
         let mut merged_env: BTreeMap<String, String> = std::env::vars().collect();
+        merged_env.extend(project_file_env.clone());
         merged_env.extend(project_env.clone());
+        merged_env.extend(svc_file_env);
         merged_env.extend(svc_env);
 
         // Collect depends_on as ServiceNames (cross-service validation deferred)
@@ -231,6 +250,7 @@ pub fn validate_raw(
                 args,
                 cwd,
                 env: merged_env,
+                env_files: svc_env_files,
                 depends_on,
                 autostart: raw_svc.autostart,
                 restart,
@@ -290,6 +310,7 @@ pub fn validate_raw(
         project: Project {
             name: project_name.expect("project_name is Some when no errors"),
             env: project_env,
+            env_files: project_env_files,
             logs,
         },
         services,
@@ -400,6 +421,60 @@ fn validate_service_env(
 
 fn is_valid_env_key(key: &str) -> bool {
     !key.is_empty() && !key.contains('=') && !key.contains('\0')
+}
+
+/// Resolve and read the declared `env_file` entries.
+///
+/// Returns the resolved absolute paths (in declaration order) and the merged
+/// key/value pairs, where a later file overrides an earlier one.  Every failure
+/// is pushed onto `errors`; the caller keeps validating so that a run reports
+/// all problems at once.
+fn load_env_files(
+    declared: Option<&RawEnvFile>,
+    source_dir: &Path,
+    scope: &str,
+    errors: &mut Vec<ConfigError>,
+) -> (Vec<PathBuf>, BTreeMap<String, String>) {
+    let mut paths = Vec::new();
+    let mut merged = BTreeMap::new();
+
+    let Some(declared) = declared else {
+        return (paths, merged);
+    };
+
+    for candidate in declared.paths() {
+        let raw = Path::new(candidate);
+        let path = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            source_dir.join(raw)
+        };
+
+        match crate::envfile::load(&path) {
+            Ok(vars) => {
+                for (key, value) in vars {
+                    if !is_valid_env_key(&key) || value.contains('\0') {
+                        errors.push(ConfigError::InvalidEnvFile {
+                            scope: scope.to_string(),
+                            path: path.clone(),
+                            reason: format!("invalid entry for key {key:?}"),
+                        });
+                        continue;
+                    }
+                    merged.insert(key, value);
+                }
+            }
+            Err(e) => errors.push(ConfigError::InvalidEnvFile {
+                scope: scope.to_string(),
+                path: path.clone(),
+                reason: e.to_string(),
+            }),
+        }
+
+        paths.push(path);
+    }
+
+    (paths, merged)
 }
 
 // ── cwd resolution ─────────────────────────────────────────────────────────
@@ -1476,6 +1551,7 @@ command = ["echo"]
                 logs: None,
                 name: "p".into(),
                 env: Default::default(),
+                env_file: None,
             },
             services: {
                 let mut m = std::collections::BTreeMap::new();
@@ -1485,6 +1561,7 @@ command = ["echo"]
                         command: vec!["exe\0cutable".to_string()],
                         cwd: None,
                         env: Default::default(),
+                        env_file: None,
                         depends_on: vec![],
                         autostart: true,
                         restart: Default::default(),
@@ -1609,6 +1686,102 @@ _SVCRAB_TEST_KEY = "service"
             Some("service")
         );
         std::env::remove_var("_SVCRAB_TEST_KEY");
+    }
+
+    // ── env_file ───────────────────────────────────────────────────────────
+
+    /// Result of validating a config written into a temp dir.
+    type Validated = Result<(Config, Vec<ConfigWarning>), Vec<ConfigError>>;
+
+    /// Write `servicrab.toml` plus a set of sibling files, then validate.
+    /// The `TempDir` is returned so the caller keeps the tree alive.
+    fn load_with_files(toml: &str, files: &[(&str, &str)]) -> (TempDir, Validated) {
+        let dir = TempDir::new().unwrap();
+        for (name, body) in files {
+            std::fs::write(dir.path().join(name), body).unwrap();
+        }
+        let path = dir.path().join("servicrab.toml");
+        std::fs::write(&path, toml).unwrap();
+        let raw: RawConfig = toml::from_str(toml).expect("raw parse failed in test");
+        let result = validate_raw(raw, &path);
+        (dir, result)
+    }
+
+    #[test]
+    fn a_service_env_file_is_loaded() {
+        let toml = "version=1\n[project]\nname=\"p\"\n[services.s]\ncommand=[\"echo\"]\nenv_file=\".env\"\n";
+        let (_dir, result) = load_with_files(toml, &[(".env", "FROM_FILE=yes\n")]);
+        let (cfg, _) = result.unwrap();
+        let svc = &cfg.services[&ServiceName("s".into())];
+        assert_eq!(svc.env.get("FROM_FILE").map(String::as_str), Some("yes"));
+        assert_eq!(svc.env_files.len(), 1);
+    }
+
+    #[test]
+    fn a_project_env_file_reaches_every_service() {
+        let toml = "version=1\n[project]\nname=\"p\"\nenv_file=[\".env\"]\n[services.s]\ncommand=[\"echo\"]\n[services.t]\ncommand=[\"echo\"]\n";
+        let (_dir, result) = load_with_files(toml, &[(".env", "SHARED=1\n")]);
+        let (cfg, _) = result.unwrap();
+        for name in ["s", "t"] {
+            let svc = &cfg.services[&ServiceName(name.into())];
+            assert_eq!(svc.env.get("SHARED").map(String::as_str), Some("1"));
+        }
+        assert_eq!(cfg.project.env_files.len(), 1);
+    }
+
+    #[test]
+    fn env_files_are_layered_in_declaration_order() {
+        let toml = "version=1\n[project]\nname=\"p\"\n[services.s]\ncommand=[\"echo\"]\nenv_file=[\".env\", \".env.local\"]\n";
+        let (_dir, result) =
+            load_with_files(toml, &[(".env", "K=base\n"), (".env.local", "K=local\n")]);
+        let (cfg, _) = result.unwrap();
+        let svc = &cfg.services[&ServiceName("s".into())];
+        assert_eq!(svc.env.get("K").map(String::as_str), Some("local"));
+    }
+
+    #[test]
+    fn an_explicit_env_entry_beats_the_env_file() {
+        let toml = "version=1\n[project]\nname=\"p\"\n[services.s]\ncommand=[\"echo\"]\nenv_file=\".env\"\n[services.s.env]\nK=\"inline\"\n";
+        let (_dir, result) = load_with_files(toml, &[(".env", "K=file\n")]);
+        let (cfg, _) = result.unwrap();
+        let svc = &cfg.services[&ServiceName("s".into())];
+        assert_eq!(svc.env.get("K").map(String::as_str), Some("inline"));
+    }
+
+    #[test]
+    fn a_service_env_file_beats_the_project_env_file() {
+        let toml = "version=1\n[project]\nname=\"p\"\nenv_file=\".env\"\n[services.s]\ncommand=[\"echo\"]\nenv_file=\".env.svc\"\n";
+        let (_dir, result) = load_with_files(
+            toml,
+            &[(".env", "K=project\n"), (".env.svc", "K=service\n")],
+        );
+        let (cfg, _) = result.unwrap();
+        let svc = &cfg.services[&ServiceName("s".into())];
+        assert_eq!(svc.env.get("K").map(String::as_str), Some("service"));
+    }
+
+    #[test]
+    fn a_missing_env_file_is_a_config_error() {
+        let toml = "version=1\n[project]\nname=\"p\"\n[services.s]\ncommand=[\"echo\"]\nenv_file=\"nope.env\"\n";
+        let (_dir, result) = load_with_files(toml, &[]);
+        let errs = result.unwrap_err();
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ConfigError::InvalidEnvFile { .. })));
+    }
+
+    #[test]
+    fn a_malformed_env_file_is_a_config_error() {
+        let toml = "version=1\n[project]\nname=\"p\"\n[services.s]\ncommand=[\"echo\"]\nenv_file=\".env\"\n";
+        let (_dir, result) = load_with_files(toml, &[(".env", "not an assignment\n")]);
+        let errs = result.unwrap_err();
+        let message = errs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(message.contains("env_file"), "got: {message}");
+        assert!(message.contains("line 1"), "got: {message}");
     }
 
     // ── Restart policies ───────────────────────────────────────────────────
@@ -1841,6 +2014,7 @@ restart_delay = "2s"
                 command: vec!["echo".to_string()],
                 cwd: None,
                 env: env.into_iter().collect(),
+                env_file: None,
                 depends_on: vec![],
                 autostart: true,
                 restart: Default::default(),
@@ -1860,6 +2034,7 @@ restart_delay = "2s"
                 logs: None,
                 name: "p".into(),
                 env: Default::default(),
+                env_file: None,
             },
             services,
         }

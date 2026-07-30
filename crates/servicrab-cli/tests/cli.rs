@@ -212,3 +212,87 @@ fn list_failure_on_invalid_config() {
         .assert()
         .failure();
 }
+
+// ── completions ────────────────────────────────────────────────────────────
+
+#[test]
+fn completions_are_generated_for_every_supported_shell() {
+    for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+        let output = cmd()
+            .arg("completions")
+            .arg(shell)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let text = String::from_utf8(output).unwrap();
+        assert!(
+            text.contains("servicrab"),
+            "{shell} completions should mention the binary name"
+        );
+        assert!(
+            text.len() > 200,
+            "{shell} completions look suspiciously short"
+        );
+    }
+}
+
+#[test]
+fn completions_mention_the_subcommands() {
+    let output = cmd()
+        .arg("completions")
+        .arg("bash")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+    for sub in ["up", "down", "logs", "status", "restart"] {
+        assert!(text.contains(sub), "bash completions should list {sub}");
+    }
+}
+
+#[test]
+fn completions_reject_an_unknown_shell() {
+    cmd().arg("completions").arg("tcsh").assert().failure();
+}
+
+// ── env_file ───────────────────────────────────────────────────────────────
+
+#[test]
+fn env_file_values_reach_the_service() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join(".env"), "GREETING=from-file\n").unwrap();
+    let path = dir.path().join("servicrab.toml");
+    fs::write(
+        &path,
+        "version = 1\n[project]\nname = \"p\"\n[services.web]\ncommand = [\"sh\", \"-c\", \"echo $GREETING\"]\nenv_file = \".env\"\n",
+    )
+    .unwrap();
+
+    cmd()
+        .arg("run")
+        .arg("web")
+        .arg("--config")
+        .arg(&path)
+        .assert()
+        .success()
+        .stdout(contains("from-file"));
+}
+
+#[test]
+fn a_missing_env_file_fails_the_config() {
+    let (_dir, path) = temp_dir_with_config(
+        "version = 1\n[project]\nname = \"p\"\n[services.web]\ncommand = [\"echo\"]\nenv_file = \"nope.env\"\n",
+    );
+
+    cmd()
+        .arg("check")
+        .arg("--config")
+        .arg(&path)
+        .assert()
+        .failure()
+        .stderr(contains("env_file"));
+}

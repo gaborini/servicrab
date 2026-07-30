@@ -21,6 +21,13 @@ name = "my-project"
 # [project.env]
 # RUST_LOG = "info"
 
+# ── Environment files ─────────────────────────────────────────────────────────
+# Dotenv-style files loaded for every service.  Paths are relative to this file.
+# Layering, later wins:  shell env -> project env_file -> [project.env]
+#                        -> service env_file -> [services.<name>.env]
+# env_file = ".env"
+# env_file = [".env", ".env.local"]
+
 # ── Log files ─────────────────────────────────────────────────────────────────
 # Uncomment to keep a copy of every service's output on disk.  Files are
 # rotated once they cross max_size:  api.log -> api.log.1 -> api.log.2 ...
@@ -39,6 +46,7 @@ name = "my-project"
 # Optional fields:
 #   cwd           Working directory (default: config file's directory)
 #   env           Per-service environment variables
+#   env_file      Dotenv file(s) loaded before `env`, e.g. ".env" or a list
 #   depends_on    Services that must start before this one, e.g. ["db"]
 #   autostart     Whether to start automatically (default: true)
 #   restart       never | on-failure | always  (default: never)
