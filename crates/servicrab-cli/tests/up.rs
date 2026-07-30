@@ -716,15 +716,26 @@ command = ["{}"]
     assert!(events.iter().all(|e| e["service"] == "hello"));
 
     // Captured output keeps its stream, and both streams end up on stdout.
-    let logs: Vec<&serde_json::Value> = events
+    // The two readers race, so only membership is guaranteed, not order.
+    let mut logs: Vec<(String, String)> = events
         .iter()
         .filter(|e| e["event"]["kind"] == "log")
+        .map(|e| {
+            (
+                e["event"]["stream"].as_str().unwrap().to_string(),
+                e["event"]["line"].as_str().unwrap().to_string(),
+            )
+        })
         .collect();
-    assert_eq!(logs.len(), 2, "{stdout}");
-    assert_eq!(logs[0]["event"]["line"], "hi");
-    assert_eq!(logs[0]["event"]["stream"], "stdout");
-    assert_eq!(logs[1]["event"]["line"], "oops");
-    assert_eq!(logs[1]["event"]["stream"], "stderr");
+    logs.sort();
+    assert_eq!(
+        logs,
+        vec![
+            ("stderr".to_string(), "oops".to_string()),
+            ("stdout".to_string(), "hi".to_string()),
+        ],
+        "{stdout}"
+    );
 
     // The lifecycle is there too, in order.
     let kinds: Vec<&str> = events
@@ -733,7 +744,7 @@ command = ["{}"]
         .collect();
     assert!(kinds.contains(&"started"), "{kinds:?}");
     assert!(kinds.contains(&"exited"), "{kinds:?}");
-    assert_eq!(kinds.last(), Some(&"finished"), "{kinds:?}");
+    assert!(kinds.contains(&"finished"), "{kinds:?}");
 }
 
 #[test]
