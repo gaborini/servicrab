@@ -19,6 +19,7 @@ Think of it as a minimal, zero-dependency alternative to [overmind](https://gith
 - Log files: opt-in per-service capture with size-based rotation, plus `servicrab logs [-f]` to read and follow them
 - Background daemon: `servicrab start` / `status` / `stop` / `restart` / `down`, with a documented JSON-over-Unix-socket protocol (Linux/macOS)
 - `servicrab reload` — apply config changes to a running stack without stopping the services you did not touch
+- `servicrab events` — follow a running stack live: logs, state changes, restarts and health verdicts, as text or JSON
 - `servicrab generate systemd|launchd` — hand the stack over to the init system, with `systemctl reload` wired to `servicrab reload`
 - Restart policies: `never`, `on-failure`, `always`, with exponential backoff
 - Environment: per-service variables, working directories, and dotenv-style `env_file` layering
@@ -134,6 +135,7 @@ if you want shell semantics.
 | `servicrab stop <SERVICE...> [--config PATH]` | Stop individual services in the running daemon |
 | `servicrab restart <SERVICE...> [--config PATH]` | Restart individual services |
 | `servicrab reload [--config PATH]` | Re-read the config and apply the difference to the running daemon |
+| `servicrab events [SERVICE...] [--config PATH] [--json] [--no-prefix] [--timestamps] [--no-logs]` | Follow the daemon's live event stream |
 | `servicrab down [--config PATH]` | Stop the daemon and every service it supervises |
 | `servicrab daemon [--config PATH] [--no-restart]` | Run the daemon in the foreground (for systemd/launchd/containers) |
 | `servicrab generate <systemd\|launchd> [--config PATH] [--scope system\|user] [-o PATH] [--user NAME]` | Generate an init-system unit that runs the stack |
@@ -575,10 +577,48 @@ echo '{"type":"status"}' | nc -U .servicrab/daemon.sock
 | `{"type":"stop_service","name":"api"}` | `{"type":"ok","message":"api stopped"}` |
 | `{"type":"restart_service","name":"api"}` | `{"type":"ok","message":"api restarted"}` |
 | `{"type":"reload"}` | `{"type":"ok","message":"reloaded demo: 1 added, 1 changed, 0 removed"}` |
+| `{"type":"subscribe"}` | `{"type":"ok"}`, then a `{"type":"event",…}` line per event |
 
 `stop_service` and `restart_service` only answer once the service has actually
 stopped (and, for a restart, been replaced), so scripts can rely on the reply
 instead of polling.
+
+### Live event streaming
+
+`subscribe` is the one request that turns a connection one-way: the daemon
+answers `ok` and then keeps writing events until the client goes away. It takes
+two optional fields — `services` (an allow-list; empty means all of them) and
+`logs` (set it to `false` to leave captured output out).
+
+```bash
+$ echo '{"type":"subscribe","services":["api"]}' | nc -U .servicrab/daemon.sock
+{"type":"ok"}
+{"type":"event","service":"api","event":{"kind":"log","stream":"stdout","line":"listening on :8080"}}
+{"type":"event","service":"api","event":{"kind":"state","state":"stopping"}}
+```
+
+`servicrab events` is the CLI on top of it, rendered like `up`:
+
+```console
+$ servicrab events
+servicrab events demo → all services
+api    | listening on :8080
+worker | picked up job 41
+api    | ▶ started (pgid 5512)
+```
+
+| Flag | Effect |
+| --- | --- |
+| `SERVICE...` | Only follow these services |
+| `--json` | Print the raw protocol lines, one JSON object per line |
+| `--no-logs` | Lifecycle events only — no captured stdout/stderr |
+| `--no-prefix` | Drop the service-name column |
+| `-t`, `--timestamps` | Prefix every line with a UTC timestamp |
+
+The stream is a live feed, not a backlog: a subscriber sees what happens from
+the moment it attaches (use `servicrab logs` for history). A client too slow to
+keep up gets a `{"type":"lagged","skipped":N}` notice instead of silently
+missing events, and the command exits cleanly when the daemon stops.
 
 ### Config hot-reload
 
@@ -725,7 +765,7 @@ cargo test -p servicrab-core config::tests
 - [x] `servicrab start` / `status` / `down` / `daemon`
 - [x] Status snapshot: state, pid, uptime, restarts, health
 - [x] Per-service `start` / `stop` / `restart` through the daemon
-- [ ] Live event streaming over the socket
+- [x] Live event streaming over the socket
 
 ### Phase 3 — Stack management ✅
 - [x] `.env` file support per project and per service
@@ -736,7 +776,7 @@ cargo test -p servicrab-core config::tests
 ### Phase 4 (current) — Platform integration
 - [x] systemd unit generation (`servicrab generate systemd`)
 - [x] launchd plist generation (`servicrab generate launchd`)
-- [ ] Live event streaming over the socket
+- [x] Live event streaming over the socket (`servicrab events`, `subscribe`)
 - [ ] `--json` event stream for `up`
 
 ---

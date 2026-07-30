@@ -93,6 +93,127 @@ pub struct ServiceInfo {
     pub message: Option<String>,
 }
 
+/// Which standard stream a captured log line came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Stream {
+    /// The service's standard output.
+    Stdout,
+    /// The service's standard error.
+    Stderr,
+}
+
+impl std::fmt::Display for Stream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Stream::Stdout => f.write_str("stdout"),
+            Stream::Stderr => f.write_str("stderr"),
+        }
+    }
+}
+
+/// Something that happened to a service, as streamed by the daemon.
+///
+/// This mirrors the runtime's event enum, but the protocol crate stays
+/// independent of the runtime: durations are plain milliseconds and paths are
+/// strings, so any client can read them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Event {
+    /// The service moved to a new lifecycle state.
+    State {
+        /// The state it moved to.
+        state: ServiceState,
+    },
+    /// The service's process was spawned.
+    Started {
+        /// Process-group id (equal to the direct child's pid).
+        pgid: i32,
+    },
+    /// A line was read from the service's captured output.
+    Log {
+        /// Which stream the line came from.
+        stream: Stream,
+        /// The line, without its trailing newline.
+        line: String,
+    },
+    /// The service's process stopped.
+    Exited {
+        /// Human-readable description of why the process stopped.
+        reason: String,
+        /// Exit code, when the process exited on its own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<i32>,
+        /// Signal number, when the process was killed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<i32>,
+        /// How long it stayed alive.
+        uptime_ms: u64,
+    },
+    /// The service is waiting before being restarted.
+    Backoff {
+        /// How long the supervisor will wait.
+        delay_ms: u64,
+        /// 1-based restart attempt number.
+        attempt: u32,
+    },
+    /// The service was never started because a dependency never came up.
+    Skipped {
+        /// The dependency that blocked the start.
+        dependency: String,
+    },
+    /// The supervisor is shutting the service down.
+    Stopping {
+        /// Why the shutdown was requested.
+        reason: String,
+    },
+    /// The service stopped for good, and no restart will happen.
+    Finished {
+        /// A human-readable description of the final outcome.
+        summary: String,
+    },
+    /// The service passed its health check and is considered ready.
+    Healthy,
+    /// A health probe failed.
+    HealthProbeFailed {
+        /// Why the probe failed.
+        message: String,
+        /// How many consecutive failures have been seen so far.
+        consecutive: u32,
+        /// How many consecutive failures are tolerated.
+        retries: u32,
+    },
+    /// The service exhausted its health-check retry budget.
+    Unhealthy {
+        /// Why the last probe failed.
+        message: String,
+    },
+    /// A watched path changed and a restart was requested.
+    WatchTriggered {
+        /// The first changed path, in sort order.
+        path: String,
+        /// How many paths changed in this batch.
+        changed: usize,
+    },
+    /// A watch-triggered restart was refused by the supervisor.
+    WatchFailed {
+        /// Why the restart did not happen.
+        message: String,
+    },
+    /// The watched tree is larger than the scan limit.
+    WatchTruncated {
+        /// How many files the watcher is willing to scan.
+        limit: usize,
+    },
+    /// The service failed fatally.
+    Failed {
+        /// A human-readable description of the failure.
+        message: String,
+    },
+}
+
 /// A response returned by the servicrab daemon to a client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -117,6 +238,20 @@ pub enum Response {
     Status {
         /// One entry per service, in start order.
         services: Vec<ServiceInfo>,
+    },
+
+    /// One streamed runtime event, sent after [`crate::Request::Subscribe`].
+    Event {
+        /// The service the event belongs to.
+        service: String,
+        /// What happened.
+        event: Event,
+    },
+
+    /// Events were dropped because the client could not keep up.
+    Lagged {
+        /// How many events were skipped.
+        skipped: u64,
     },
 
     /// The requested operation failed.

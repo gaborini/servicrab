@@ -58,6 +58,68 @@ mod tests {
     }
 
     #[test]
+    fn subscribe_defaults_to_every_service_and_logs() {
+        let request: Request = decode("{\"type\":\"subscribe\"}\n").unwrap();
+        assert_eq!(
+            request,
+            Request::Subscribe {
+                services: Vec::new(),
+                logs: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_subscribe_request_survives_a_round_trip() {
+        let request = Request::Subscribe {
+            services: vec!["api".to_string()],
+            logs: false,
+        };
+        let line = encode(&request).unwrap();
+        assert!(line.contains("\"services\":[\"api\"]"));
+        assert_eq!(decode::<Request>(&line).unwrap(), request);
+    }
+
+    #[test]
+    fn a_streamed_event_survives_a_round_trip() {
+        let response = Response::Event {
+            service: "api".to_string(),
+            event: crate::Event::Log {
+                stream: crate::Stream::Stderr,
+                line: "boom".to_string(),
+            },
+        };
+        let line = encode(&response).unwrap();
+        assert!(line.contains("\"kind\":\"log\""));
+        assert_eq!(decode::<Response>(&line).unwrap(), response);
+    }
+
+    #[test]
+    fn event_payloads_omit_absent_exit_details() {
+        let response = Response::Event {
+            service: "api".to_string(),
+            event: crate::Event::Exited {
+                reason: "exited with code 0".to_string(),
+                code: Some(0),
+                signal: None,
+                uptime_ms: 1234,
+            },
+        };
+        let line = encode(&response).unwrap();
+        assert!(line.contains("\"code\":0"));
+        assert!(!line.contains("signal"));
+        assert_eq!(decode::<Response>(&line).unwrap(), response);
+    }
+
+    #[test]
+    fn a_lag_notice_survives_a_round_trip() {
+        let response = Response::Lagged { skipped: 7 };
+        let line = encode(&response).unwrap();
+        assert!(line.contains("\"type\":\"lagged\""));
+        assert_eq!(decode::<Response>(&line).unwrap(), response);
+    }
+
+    #[test]
     fn garbage_is_reported_not_panicked_on() {
         assert!(decode::<Request>("not json").is_err());
         assert!(decode::<Request>("{\"type\":\"fly\"}").is_err());

@@ -36,4 +36,24 @@ pub enum Request {
 
     /// Re-read the configuration file and apply the difference.
     Reload,
+
+    /// Follow the daemon's event stream.
+    ///
+    /// The daemon answers `ok` and then keeps writing
+    /// [`crate::Response::Event`] lines until the client disconnects, so this
+    /// is the only request that turns a connection one-way.
+    Subscribe {
+        /// Only report these services; empty means all of them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        services: Vec<String>,
+
+        /// Whether captured stdout/stderr lines are part of the stream.
+        #[serde(default = "yes")]
+        logs: bool,
+    },
+}
+
+/// Serde default for flags that are on unless a client says otherwise.
+fn yes() -> bool {
+    true
 }
