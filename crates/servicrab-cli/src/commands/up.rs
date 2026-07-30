@@ -39,6 +39,9 @@ pub struct UpOptions {
     /// Fail when no service in the plan declares a `[watch]` block.  Set by
     /// `servicrab watch`.
     pub require_watch: bool,
+    /// Print one JSON event per line on stdout instead of rendering for a
+    /// terminal.
+    pub json: bool,
 }
 
 /// Run the `up` subcommand, returning the process exit code to use.
@@ -181,6 +184,9 @@ impl Printer {
     }
 
     fn banner(&self, config: &Config, plan: &[ServiceName]) {
+        if self.options.json {
+            return;
+        }
         let names: Vec<&str> = plan.iter().map(|n| n.as_str()).collect();
         let command = if self.options.require_watch {
             "servicrab watch"
@@ -196,7 +202,7 @@ impl Printer {
     }
 
     fn watching(&self, watched: &[ServiceName]) {
-        if watched.is_empty() {
+        if self.options.json || watched.is_empty() {
             return;
         }
         let names: Vec<&str> = watched.iter().map(|n| n.as_str()).collect();
@@ -229,6 +235,10 @@ impl Printer {
     }
 
     fn event(&self, service: &ServiceName, kind: &EventKind) {
+        if self.options.json {
+            self.json(service, kind);
+            return;
+        }
         match kind {
             EventKind::Log { stream, line } => self.log(service, *stream, line),
             EventKind::Started { pgid } => {
@@ -292,6 +302,21 @@ impl Printer {
         }
     }
 
+    /// Emit one event in the same shape the daemon streams over its socket,
+    /// so `up --json` and `events --json` can feed the same tooling.
+    fn json(&self, service: &ServiceName, kind: &EventKind) {
+        let response = servicrab_protocol::Response::Event {
+            service: service.to_string(),
+            event: crate::wire::to_wire_event(kind),
+        };
+        let Ok(line) = servicrab_protocol::encode(&response) else {
+            return;
+        };
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(line.as_bytes());
+        let _ = out.flush();
+    }
+
     fn log(&self, service: &ServiceName, stream: Stream, line: &str) {
         let text = format!("{}{}{}", self.timestamp(), self.prefix(service), line);
         match stream {
@@ -328,6 +353,9 @@ impl Printer {
     }
 
     fn summary(&self, outcome: &servicrab_core::runtime::stack::StackOutcome) {
+        if self.options.json {
+            return;
+        }
         if outcome.is_success() {
             eprintln!(
                 "{}",

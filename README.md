@@ -127,8 +127,8 @@ if you want shell semantics.
 | `servicrab check [--config PATH]` | Parse and validate the config file |
 | `servicrab list [--config PATH] [--json]` | List all services with their restart policies |
 | `servicrab run <SERVICE> [--config PATH] [--no-restart]` | Supervise one service in the foreground |
-| `servicrab up [SERVICE...] [--config PATH] [--no-restart] [--no-prefix] [--timestamps] [--abort-on-failure]` | Supervise a whole stack in the foreground |
-| `servicrab watch [SERVICE...] [--config PATH] [--no-restart] [--no-prefix] [--timestamps] [--abort-on-failure]` | Like `up`, and restart services when their watched files change |
+| `servicrab up [SERVICE...] [--config PATH] [--no-restart] [--no-prefix] [--timestamps] [--abort-on-failure] [--json]` | Supervise a whole stack in the foreground |
+| `servicrab watch [SERVICE...] [--config PATH] [--no-restart] [--no-prefix] [--timestamps] [--abort-on-failure] [--json]` | Like `up`, and restart services when their watched files change |
 | `servicrab logs [SERVICE...] [--config PATH] [-f] [-n N] [--no-prefix]` | Show (and follow) the captured log files |
 | `servicrab start [--config PATH] [--no-restart]` | Start the stack in the background |
 | `servicrab status [--config PATH] [--json]` | Show what the background daemon is doing |
@@ -597,6 +597,20 @@ $ echo '{"type":"subscribe","services":["api"]}' | nc -U .servicrab/daemon.sock
 {"type":"event","service":"api","event":{"kind":"state","state":"stopping"}}
 ```
 
+`up --json` and `watch --json` print the very same lines without a daemon in
+sight, so a wrapper can consume a foreground stack the same way it consumes a
+background one:
+
+```console
+$ servicrab up --json
+{"type":"event","service":"api","event":{"kind":"state","state":"starting"}}
+{"type":"event","service":"api","event":{"kind":"log","stream":"stdout","line":"listening on :8080"}}
+```
+
+In `--json` mode stdout carries nothing but event lines — the banner, warnings
+and the closing summary stay on stderr — so `servicrab up --json | jq` works
+unchanged.
+
 `servicrab events` is the CLI on top of it, rendered like `up`:
 
 ```console
@@ -777,7 +791,7 @@ cargo test -p servicrab-core config::tests
 - [x] systemd unit generation (`servicrab generate systemd`)
 - [x] launchd plist generation (`servicrab generate launchd`)
 - [x] Live event streaming over the socket (`servicrab events`, `subscribe`)
-- [ ] `--json` event stream for `up`
+- [x] `--json` event stream for `up` and `watch`
 
 ---
 
