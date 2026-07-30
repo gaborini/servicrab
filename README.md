@@ -19,6 +19,7 @@ Think of it as a minimal, zero-dependency alternative to [overmind](https://gith
 - Log files: opt-in per-service capture with size-based rotation, plus `servicrab logs [-f]` to read and follow them
 - Background daemon: `servicrab start` / `status` / `stop` / `restart` / `down`, with a documented JSON-over-Unix-socket protocol (Linux/macOS)
 - `servicrab reload` — apply config changes to a running stack without stopping the services you did not touch
+- `servicrab generate systemd|launchd` — hand the stack over to the init system, with `systemctl reload` wired to `servicrab reload`
 - Restart policies: `never`, `on-failure`, `always`, with exponential backoff
 - Environment: per-service variables, working directories, and dotenv-style `env_file` layering
 - Shell completions for bash, zsh, fish, PowerShell and elvish
@@ -135,6 +136,7 @@ if you want shell semantics.
 | `servicrab reload [--config PATH]` | Re-read the config and apply the difference to the running daemon |
 | `servicrab down [--config PATH]` | Stop the daemon and every service it supervises |
 | `servicrab daemon [--config PATH] [--no-restart]` | Run the daemon in the foreground (for systemd/launchd/containers) |
+| `servicrab generate <systemd\|launchd> [--config PATH] [--scope system\|user] [-o PATH] [--user NAME]` | Generate an init-system unit that runs the stack |
 | `servicrab completions <SHELL>` | Print a completion script for bash, zsh, fish, PowerShell or elvish |
 
 If `--config` is omitted, Servicrab discovers `servicrab.toml` by walking up
@@ -620,6 +622,41 @@ neither the runtime nor Tokio.
 
 ---
 
+## Running under systemd or launchd
+
+`servicrab generate` writes a unit that starts `servicrab daemon` — the
+foreground supervisor — so the init system supervises one process and
+servicrab supervises the stack:
+
+```console
+$ servicrab generate systemd
+[Unit]
+Description=servicrab stack "demo"
+…
+$ servicrab generate systemd -o .            # writes servicrab-demo.service
+$ servicrab generate launchd --scope user -o ~/Library/LaunchAgents/
+```
+
+Install instructions are printed to stderr, so `servicrab generate systemd >
+demo.service` keeps the file clean.
+
+| Flag | What it does |
+| --- | --- |
+| `--scope system` (default) | `/etc/systemd/system` or `/Library/LaunchDaemons`, started at boot |
+| `--scope user` | `systemctl --user` or `~/Library/LaunchAgents`, started at login |
+| `--user NAME` | Run the daemon as another account (system scope only) |
+| `-o PATH` | Write to a file, or into a directory using the conventional name |
+
+The generated unit contains no service definitions — it points at your
+`servicrab.toml`. Adding a service means editing the config and reloading, not
+regenerating the unit. On systemd, `ExecReload` is wired to `servicrab reload`,
+so `systemctl reload servicrab-demo.service` applies config changes without
+touching the services that did not change. `TimeoutStopSec` (and launchd's
+`ExitTimeOut`) follow the slowest `shutdown_timeout` in your config, so the init
+system never kills the daemon while it is still stopping the stack.
+
+---
+
 ## Workspace layout
 
 ```
@@ -697,9 +734,10 @@ cargo test -p servicrab-core config::tests
 - [x] Config hot-reload (`servicrab reload`)
 
 ### Phase 4 (current) — Platform integration
-- [ ] systemd unit generation
-- [ ] launchd plist generation
-- [ ] Windows Service wrapper
+- [x] systemd unit generation (`servicrab generate systemd`)
+- [x] launchd plist generation (`servicrab generate launchd`)
+- [ ] Live event streaming over the socket
+- [ ] `--json` event stream for `up`
 
 ---
 

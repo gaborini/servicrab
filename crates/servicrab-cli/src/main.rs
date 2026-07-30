@@ -251,6 +251,31 @@ enum Commands {
         config: Option<std::path::PathBuf>,
     },
 
+    /// Generate an init-system unit that runs the stack through
+    /// `servicrab daemon`.
+    Generate {
+        /// Which init system to generate for.
+        target: commands::generate::Target,
+
+        /// Path to the configuration file.  If omitted, discovers
+        /// servicrab.toml by walking up from the current directory.
+        #[arg(long, short = 'c')]
+        config: Option<std::path::PathBuf>,
+
+        /// Whether the unit is system-wide or per-user.
+        #[arg(long, value_enum, default_value_t = commands::generate::Scope::System)]
+        scope: commands::generate::Scope,
+
+        /// Write the unit to this file (or into this directory) instead of
+        /// stdout.
+        #[arg(long, short = 'o')]
+        output: Option<std::path::PathBuf>,
+
+        /// Account the daemon should run as (system scope only).
+        #[arg(long)]
+        user: Option<String>,
+    },
+
     /// Print a shell completion script to stdout.
     Completions {
         /// Shell to generate completions for.
@@ -359,6 +384,21 @@ fn main() {
         Commands::Daemon { config, no_restart } => {
             commands::daemon::daemon(config.as_deref(), no_restart)
         }
+        Commands::Generate {
+            target,
+            config,
+            scope,
+            output,
+            user,
+        } => commands::generate::run(
+            target,
+            config.as_deref(),
+            commands::generate::GenerateOptions {
+                scope,
+                output,
+                user,
+            },
+        ),
         Commands::Completions { shell } => commands::completions::run::<Cli>(shell).map(|()| 0),
         Commands::Logs {
             services,
