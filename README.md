@@ -25,7 +25,8 @@ Think of it as a minimal, zero-dependency alternative to [overmind](https://gith
 - `servicrab reload` — apply config changes to a running stack without stopping the services you did not touch
 - `servicrab events` — follow a running stack live: logs, state changes, restarts and health verdicts, as text or JSON
 - `servicrab generate systemd|launchd` — hand the stack over to the init system, with `systemctl reload` wired to `servicrab reload`
-- Restart policies: `never`, `on-failure`, `always`, with exponential backoff
+- Restart policies: `never`, `on-failure`, `always`, `unless-stopped`, with
+  exponential backoff
 - Environment: per-service variables, working directories, and dotenv-style `env_file` layering
 - Shell completions for bash, zsh, fish, PowerShell and elvish, and man pages via `servicrab man`
 - Dependency declarations and a deterministic start order
@@ -232,6 +233,13 @@ finished. Nothing is written to disk and no background process is left behind.
 | `never` (default) | stop | stop | stop |
 | `on-failure` | stop | restart | restart |
 | `always` | restart | restart | restart |
+| `unless-stopped` | restart | restart | restart |
+
+`unless-stopped` restarts exactly like `always`; the two differ only in what a
+daemon does with a service you stopped by hand — see
+[Services you stopped by hand](#services-you-stopped-by-hand). In this
+single-service foreground mode there is nothing to remember, so the two are the
+same thing.
 
 Between attempts the runner waits:
 
@@ -810,6 +818,47 @@ worker   backoff          -         -         3  -
   worker: stopped (exit code 1), last status: exit code 1
 ```
 
+### Services you stopped by hand
+
+A hand-stopped service stays stopped for as long as that daemon lives, whatever
+its restart policy says. What the policy decides is whether the *next* daemon
+remembers:
+
+```toml
+[services.api]
+command = ["node", "server.js"]
+restart = "unless-stopped"
+```
+
+```bash
+servicrab stop api      # you are running api in a debugger instead
+servicrab down          # end of the day
+servicrab start         # api is still yours; the rest of the stack comes back
+servicrab start api     # hand it back to servicrab
+```
+
+With `restart = "always"` that last daemon would have started `api` again,
+because `always` means always. `unless-stopped` is the same policy plus a
+memory, and only for the initial start: once running, the two behave
+identically.
+
+The memory is a list of service names in `.servicrab/stopped`, written by the
+daemon whenever you stop or start a service. It is plain text on purpose —
+deleting it, or a line from it, is a perfectly good way to forget a stop. Two
+consequences worth knowing:
+
+- **It only affects `unless-stopped` services.** The file records every stop,
+  but every other policy starts as it always has, so adopting this changes
+  nothing about an existing stack.
+- **Dependents are held back too.** A service cannot run without what it
+  declares in `depends_on`, so if a held-back service is a dependency, whatever
+  depends on it starts out stopped as well rather than waiting for something
+  nobody is going to start. `servicrab start` on the dependency brings it up;
+  its dependents need starting too.
+
+`servicrab up` ignores all of this: a foreground run has nothing to remember,
+and there is no `stop` command while it is the thing holding your terminal.
+
 ### Waiting for the stack to be ready
 
 `start` returns as soon as the daemon is up, which is not the same as the stack
@@ -829,7 +878,9 @@ conditions `--wait` returns exactly when the last dependent would have been
 released. A `depends_on` entry that spells out
 [a condition](#dependency-conditions) is not reflected here: `--wait` asks
 whether each service is ready, not whether it satisfies a particular dependent,
-so it does not check the exit status of a one-shot.
+so it does not check the exit status of a one-shot. A service the daemon
+deliberately left stopped is not waited for either — see
+[Services you stopped by hand](#services-you-stopped-by-hand).
 
 The exit code is the point:
 
@@ -849,9 +900,10 @@ servicrab down
 ```
 
 The daemon keeps its runtime state next to the config file, in
-`.servicrab/`: `daemon.sock` (the control socket), `daemon.pid`, and
-`daemon.log` (its own diagnostics — service output goes to the log files
-described above). Add `.servicrab/` to your `.gitignore`.
+`.servicrab/`: `daemon.sock` (the control socket), `daemon.pid`, `daemon.log`
+(its own diagnostics — service output goes to the log files described above),
+and `stopped` (the services you stopped by hand). Add `.servicrab/` to your
+`.gitignore`.
 
 Each project gets its own daemon, so several stacks can run side by side.
 `start` refuses to launch a second daemon for the same config, and both the

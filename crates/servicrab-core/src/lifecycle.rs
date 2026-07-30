@@ -377,7 +377,11 @@ impl RestartTracker {
     fn should_restart(&self, reason: ExitReason) -> bool {
         match self.policy {
             RestartPolicy::Never => false,
-            RestartPolicy::Always => match reason {
+            // `unless-stopped` differs from `always` only in what survives a
+            // daemon restart, which is not something this tracker can observe:
+            // a hand-stopped service never reaches the policy at all, because
+            // the shutdown reason short-circuits above.
+            RestartPolicy::Always | RestartPolicy::UnlessStopped => match reason {
                 ExitReason::SpawnFailure { retryable } => retryable,
                 _ => true,
             },
@@ -554,6 +558,36 @@ mod tests {
                 delay: SEC,
                 attempt: 1
             }
+        );
+    }
+
+    #[test]
+    fn unless_stopped_restarts_whatever_the_exit_status_was() {
+        for reason in [
+            ExitReason::Code(0),
+            ExitReason::Code(7),
+            ExitReason::Signal(9),
+        ] {
+            let mut t = tracker(RestartPolicy::UnlessStopped);
+            assert!(
+                matches!(
+                    t.decide(outcome(reason), None),
+                    RestartDecision::Restart { .. }
+                ),
+                "{reason:?}"
+            );
+        }
+
+        // What the policy is *named* for is the one case it shares with every
+        // other policy; the difference only shows up across daemon restarts,
+        // which this tracker cannot see.
+        let mut t = tracker(RestartPolicy::UnlessStopped);
+        assert_eq!(
+            t.decide(
+                outcome(ExitReason::Code(1)),
+                Some(ShutdownReason::Requested)
+            ),
+            RestartDecision::Stop
         );
     }
 

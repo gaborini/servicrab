@@ -5,6 +5,7 @@
 //! message instead of pretending to work.
 
 pub mod paths;
+pub mod stopped;
 
 #[cfg(unix)]
 pub mod client;

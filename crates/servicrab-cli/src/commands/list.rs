@@ -72,6 +72,7 @@ fn print_json(services: &std::collections::BTreeMap<ServiceName, Service>) {
                     servicrab_core::RestartPolicy::Never => "never",
                     servicrab_core::RestartPolicy::OnFailure => "on-failure",
                     servicrab_core::RestartPolicy::Always => "always",
+                    servicrab_core::RestartPolicy::UnlessStopped => "unless-stopped",
                 },
                 health: svc.health.as_ref().map(|h| h.probe.to_string()),
             }

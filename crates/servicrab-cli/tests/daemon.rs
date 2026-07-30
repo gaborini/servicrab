@@ -755,6 +755,151 @@ profiles = ["dev"]
     assert!(stderr.contains("unknown service"), "{stderr}");
 }
 
+// ── restart = "unless-stopped" ──────────────────────────────────────────────
+
+/// A stack of one `unless-stopped` service and one that always restarts, so
+/// every test here can compare the two policies side by side.
+fn two_policies(dir: &Path) -> PathBuf {
+    let api = resident(dir, "api.sh");
+    let cache = resident(dir, "cache.sh");
+    config(
+        dir,
+        &format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}"]
+restart = "unless-stopped"
+[services.cache]
+command = ["{}"]
+restart = "always"
+"#,
+            api.display(),
+            cache.display()
+        ),
+    )
+}
+
+/// The STATE column for one service in a `status` table.
+fn state_of(status: &str, service: &str) -> String {
+    status
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some(service))
+        .unwrap_or_else(|| panic!("{service} is missing from the status:\n{status}"))
+        .split_whitespace()
+        .nth(1)
+        .expect("a state column")
+        .to_string()
+}
+
+#[test]
+fn a_hand_stopped_service_stays_stopped_across_a_daemon_restart() {
+    let dir = TempDir::new().unwrap();
+    let cfg = two_policies(dir.path());
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("both services to run", |s| {
+        state_of(s, "api") == "running" && state_of(s, "cache") == "running"
+    });
+
+    assert_eq!(cli(&["stop", "api"], &cfg).0, 0);
+    assert_eq!(cli(&["stop", "cache"], &cfg).0, 0);
+    drop(daemon);
+
+    let daemon = Daemon::start(&cfg);
+    // `cache` restarts unconditionally, so the stop was only for as long as
+    // that daemon lived; `api` asked to be remembered.
+    let status =
+        daemon.wait_for_status("cache to run again", |s| state_of(s, "cache") == "running");
+    assert_eq!(state_of(&status, "api"), "stopped", "{status}");
+}
+
+#[test]
+fn starting_a_remembered_service_takes_the_stop_back() {
+    let dir = TempDir::new().unwrap();
+    let cfg = two_policies(dir.path());
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("api to run", |s| state_of(s, "api") == "running");
+    assert_eq!(cli(&["stop", "api"], &cfg).0, 0);
+    assert_eq!(cli(&["start", "api"], &cfg).0, 0);
+    drop(daemon);
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("api to run again", |s| state_of(s, "api") == "running");
+}
+
+#[test]
+fn the_remembered_stop_is_a_plain_list_of_names() {
+    // The file is state a human may have to look at — or edit — when a stack
+    // ends up in a shape nobody wanted.
+    let dir = TempDir::new().unwrap();
+    let cfg = two_policies(dir.path());
+    let remembered = dir.path().join(".servicrab/stopped");
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("api to run", |s| state_of(s, "api") == "running");
+    assert!(!remembered.exists(), "nothing was stopped yet");
+
+    assert_eq!(cli(&["stop", "api"], &cfg).0, 0);
+    assert_eq!(fs::read_to_string(&remembered).unwrap(), "api\n");
+
+    assert_eq!(cli(&["restart", "api"], &cfg).0, 0);
+    assert_eq!(fs::read_to_string(&remembered).unwrap(), "");
+}
+
+#[test]
+fn a_service_held_back_keeps_its_dependents_stopped() {
+    let dir = TempDir::new().unwrap();
+    let db = resident(dir.path(), "db.sh");
+    let api = resident(dir.path(), "api.sh");
+    let cache = resident(dir.path(), "cache.sh");
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.db]
+command = ["{}"]
+restart = "unless-stopped"
+[services.api]
+command = ["{}"]
+depends_on = ["db"]
+restart = "always"
+[services.cache]
+command = ["{}"]
+restart = "always"
+"#,
+            db.display(),
+            api.display(),
+            cache.display()
+        ),
+    );
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("the stack to run", |s| {
+        state_of(s, "db") == "running" && state_of(s, "api") == "running"
+    });
+    assert_eq!(cli(&["stop", "db"], &cfg).0, 0);
+    drop(daemon);
+
+    // `--wait` returns 0 rather than waiting out its timeout on a service the
+    // daemon deliberately left alone.
+    let daemon = Daemon::start_with(&cfg, &["--wait", "--timeout", "10s"]);
+    let status = daemon.status();
+    assert_eq!(state_of(&status, "db"), "stopped", "{status}");
+    assert_eq!(
+        state_of(&status, "api"),
+        "stopped",
+        "a service cannot run without its dependency:\n{status}"
+    );
+    assert_eq!(state_of(&status, "cache"), "running", "{status}");
+}
+
 /// The pid the daemon reports for `api`, or 0 when it is not running.
 fn pid_of(daemon: &Daemon) -> i64 {
     let (_, stdout, _) = cli(&["status", "--json"], &daemon.config);

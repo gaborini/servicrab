@@ -3,12 +3,13 @@
 //! `daemon` is the body that supervises the stack; `start` launches it
 //! detached; `status` and `down` are thin socket clients.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use servicrab_core::{load, resolve_config_path, Config, Selection};
+use servicrab_core::{load, plan_stack, resolve_config_path, Config, Selection, ServiceName};
 
-use crate::daemon::DaemonPaths;
+use crate::daemon::{stopped, DaemonPaths};
 
 /// How long to wait for a freshly spawned daemon to answer.
 const START_TIMEOUT: Duration = Duration::from_secs(15);
@@ -97,7 +98,9 @@ mod imp {
                 return Ok(code);
             }
             let (_, _, paths) = setup(config)?;
-            return wait_for_ready(&paths.socket, services, options.timeout);
+            // Naming a service is a request to start it, so nothing it may
+            // have been remembered for holds any more.
+            return wait_for_ready(&paths.socket, services, &BTreeSet::new(), options.timeout);
         }
 
         let (cfg, config_path, paths) = setup(config)?;
@@ -182,7 +185,12 @@ mod imp {
         );
 
         if options.wait {
-            return wait_for_ready(&paths.socket, &[], options.timeout);
+            // The daemon leaves hand-stopped services stopped, so waiting for
+            // them to become ready would only ever time out.
+            let held_back = plan_stack(&cfg, selection)
+                .map(|plan| stopped::held_back(&cfg, &plan, &stopped::read(&paths.stopped)))
+                .unwrap_or_default();
+            return wait_for_ready(&paths.socket, &[], &held_back, options.timeout);
         }
         Ok(0)
     }
@@ -238,13 +246,15 @@ mod imp {
         }
     }
 
-    /// Poll the daemon until every service in `only` (or all of them) is ready.
+    /// Poll the daemon until every service in `only` (or all of them) is ready,
+    /// leaving out the ones in `skip`.
     ///
     /// The daemon is left running either way: a stack that came up wrong is
     /// easier to diagnose alive, with `status`, `logs` and `events`.
     fn wait_for_ready(
         socket: &Path,
         only: &[String],
+        skip: &BTreeSet<ServiceName>,
         timeout: Option<Duration>,
     ) -> Result<i32, String> {
         let timeout = timeout.unwrap_or(WAIT_TIMEOUT);
@@ -265,6 +275,7 @@ mod imp {
             let watched: Vec<&ServiceInfo> = services
                 .iter()
                 .filter(|service| only.is_empty() || only.contains(&service.name))
+                .filter(|service| !skip.iter().any(|name| name.as_str() == service.name))
                 .collect();
 
             let mut waiting: Vec<&str> = Vec::new();

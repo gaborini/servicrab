@@ -21,6 +21,8 @@ pub struct DaemonPaths {
     pub pid: PathBuf,
     /// Where a detached daemon's own output is appended.
     pub log: PathBuf,
+    /// The services an operator stopped by hand, one name per line.
+    pub stopped: PathBuf,
 }
 
 impl DaemonPaths {
@@ -45,6 +47,7 @@ impl DaemonPaths {
             socket,
             pid: dir.join("daemon.pid"),
             log: dir.join("daemon.log"),
+            stopped: dir.join("stopped"),
             dir,
         }
     }
