@@ -18,4 +18,4 @@ pub mod response;
 
 pub use frame::{decode, encode, FrameError};
 pub use request::Request;
-pub use response::{Health, Response, ServiceInfo, ServiceState};
+pub use response::{Event, Health, Response, ServiceInfo, ServiceState, Stream};

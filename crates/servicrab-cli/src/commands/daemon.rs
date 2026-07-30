@@ -16,7 +16,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(15);
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Load the config the daemon commands all need.
-fn setup(config: Option<&Path>) -> Result<(Config, PathBuf, DaemonPaths), String> {
+pub(crate) fn setup(config: Option<&Path>) -> Result<(Config, PathBuf, DaemonPaths), String> {
     let path = resolve_config_path(config).map_err(|e| format!("could not find config: {e}"))?;
 
     let (cfg, warnings) = load(&path).map_err(|errors| {

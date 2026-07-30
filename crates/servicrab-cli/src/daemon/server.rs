@@ -14,12 +14,16 @@ use servicrab_core::{
     event_channel, load, plan_stack, Config, EventKind, EventReceiver, EventSender, LogRouter,
     ServiceName, ServiceState, ShutdownReason, SignalWatcher, StatusRegistry,
 };
-use servicrab_protocol::{decode, encode, Request, Response};
+use servicrab_protocol::{decode, encode, Event, Request, Response};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 
 use super::paths::DaemonPaths;
+
+/// How many events a slow subscriber may fall behind before it is told that
+/// it missed some.  Log lines dominate the stream, so this is generous.
+const STREAM_BACKLOG: usize = 4096;
 
 /// How long the daemon waits for the log collector to drain on shutdown.
 const COLLECTOR_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -50,6 +54,8 @@ struct Session {
     /// daemon stops, which is what lets the collector task finish: it ends
     /// when the last event sender is gone.
     events: Mutex<Option<EventSender>>,
+    /// Fan-out of the runtime event stream to subscribed clients.
+    stream: tokio::sync::broadcast::Sender<servicrab_core::ServiceEvent>,
     /// File watchers, replaced wholesale on reload.
     watchers: Mutex<Vec<JoinHandle<()>>>,
     /// Serializes reloads: two clients must not diff against each other.
@@ -165,7 +171,13 @@ pub fn serve(
 
         let (events_tx, events_rx) = event_channel();
         let (control_tx, control_rx) = control_channel();
-        let collector = tokio::spawn(collect(events_rx, Arc::clone(&registry), logs));
+        let (stream_tx, _) = tokio::sync::broadcast::channel(STREAM_BACKLOG);
+        let collector = tokio::spawn(collect(
+            events_rx,
+            Arc::clone(&registry),
+            logs,
+            stream_tx.clone(),
+        ));
 
         let session = Arc::new(Session {
             registry: Arc::clone(&registry),
@@ -175,6 +187,7 @@ pub fn serve(
             project: project.clone(),
             config_path: config_path.to_path_buf(),
             events: Mutex::new(Some(events_tx.clone())),
+            stream: stream_tx,
             watchers: Mutex::new(Vec::new()),
             reloading: tokio::sync::Mutex::new(()),
         });
@@ -216,11 +229,13 @@ pub fn serve(
     Ok(0)
 }
 
-/// Keep the status registry current and copy output to the log files.
+/// Keep the status registry current, copy output to the log files, and hand
+/// every event to whoever is subscribed.
 async fn collect(
     mut events: EventReceiver,
     registry: Arc<Mutex<StatusRegistry>>,
     mut logs: Option<LogRouter>,
+    stream: tokio::sync::broadcast::Sender<servicrab_core::ServiceEvent>,
 ) {
     while let Some(event) = events.recv().await {
         if let (Some(router), EventKind::Log { line, .. }) = (logs.as_mut(), &event.kind) {
@@ -231,6 +246,8 @@ async fn collect(
         if let Ok(mut registry) = registry.lock() {
             registry.apply(&event);
         }
+        // Nobody subscribed is the normal case, and not an error.
+        let _ = stream.send(event);
     }
 }
 
@@ -257,20 +274,170 @@ async fn handle_client(stream: UnixStream, session: Arc<Session>) {
         if line.trim().is_empty() {
             continue;
         }
-        let response = match decode::<Request>(&line) {
-            Ok(request) => respond(request, &session).await,
-            Err(err) => Response::Error {
-                message: err.to_string(),
-            },
+        let request = match decode::<Request>(&line) {
+            Ok(request) => request,
+            Err(err) => {
+                if !write(
+                    &mut write_half,
+                    &Response::Error {
+                        message: err.to_string(),
+                    },
+                )
+                .await
+                {
+                    break;
+                }
+                continue;
+            }
         };
 
-        let Ok(payload) = encode(&response) else {
-            break;
-        };
-        if write_half.write_all(payload.as_bytes()).await.is_err() {
+        // Subscribing turns the connection one-way: the client stops asking
+        // and only reads until it goes away.
+        if let Request::Subscribe { services, logs } = request {
+            let filter = Filter::new(services, logs);
+            let receiver = session.stream.subscribe();
+            if write(&mut write_half, &Response::Ok { message: None }).await {
+                stream_events(receiver, filter, write_half).await;
+            }
+            return;
+        }
+
+        let response = respond(request, &session).await;
+
+        if !write(&mut write_half, &response).await {
             break;
         }
-        let _ = write_half.flush().await;
+    }
+}
+
+/// Write one response, reporting whether the client is still there.
+async fn write(sink: &mut tokio::net::unix::OwnedWriteHalf, response: &Response) -> bool {
+    let Ok(payload) = encode(response) else {
+        return false;
+    };
+    if sink.write_all(payload.as_bytes()).await.is_err() {
+        return false;
+    }
+    sink.flush().await.is_ok()
+}
+
+/// Which events a subscriber asked for.
+struct Filter {
+    services: Vec<String>,
+    logs: bool,
+}
+
+impl Filter {
+    fn new(services: Vec<String>, logs: bool) -> Self {
+        Self { services, logs }
+    }
+
+    fn wants(&self, event: &servicrab_core::ServiceEvent) -> bool {
+        if !self.logs && matches!(event.kind, EventKind::Log { .. }) {
+            return false;
+        }
+        self.services.is_empty()
+            || self
+                .services
+                .iter()
+                .any(|name| name == event.service.as_str())
+    }
+}
+
+/// Forward runtime events to one subscribed client until it disconnects.
+async fn stream_events(
+    mut events: tokio::sync::broadcast::Receiver<servicrab_core::ServiceEvent>,
+    filter: Filter,
+    mut sink: tokio::net::unix::OwnedWriteHalf,
+) {
+    loop {
+        let response = match events.recv().await {
+            Ok(event) => {
+                if !filter.wants(&event) {
+                    continue;
+                }
+                Response::Event {
+                    service: event.service.to_string(),
+                    event: to_wire_event(&event.kind),
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                Response::Lagged { skipped }
+            }
+            // The collector is gone, so the daemon is shutting down.
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        };
+        if !write(&mut sink, &response).await {
+            return;
+        }
+    }
+}
+
+/// Translate a runtime event into its wire form.
+fn to_wire_event(kind: &EventKind) -> Event {
+    use servicrab_core::ExitReason;
+
+    match kind {
+        EventKind::State(state) => Event::State {
+            state: to_wire_state(*state),
+        },
+        EventKind::Started { pgid } => Event::Started { pgid: *pgid },
+        EventKind::Log { stream, line } => Event::Log {
+            stream: match stream {
+                servicrab_core::Stream::Stdout => servicrab_protocol::Stream::Stdout,
+                servicrab_core::Stream::Stderr => servicrab_protocol::Stream::Stderr,
+            },
+            line: line.clone(),
+        },
+        EventKind::Exited { reason, uptime } => Event::Exited {
+            reason: reason.to_string(),
+            code: match reason {
+                ExitReason::Code(code) => Some(*code),
+                _ => None,
+            },
+            signal: match reason {
+                ExitReason::Signal(signal) => Some(*signal),
+                _ => None,
+            },
+            uptime_ms: uptime.as_millis() as u64,
+        },
+        EventKind::Backoff { delay, attempt } => Event::Backoff {
+            delay_ms: delay.as_millis() as u64,
+            attempt: *attempt,
+        },
+        EventKind::Skipped { dependency } => Event::Skipped {
+            dependency: dependency.to_string(),
+        },
+        EventKind::Stopping { reason } => Event::Stopping {
+            reason: reason.to_string(),
+        },
+        EventKind::Finished { summary } => Event::Finished {
+            summary: summary.clone(),
+        },
+        EventKind::Healthy => Event::Healthy,
+        EventKind::HealthProbeFailed {
+            message,
+            consecutive,
+            retries,
+        } => Event::HealthProbeFailed {
+            message: message.clone(),
+            consecutive: *consecutive,
+            retries: *retries,
+        },
+        EventKind::Unhealthy { message } => Event::Unhealthy {
+            message: message.clone(),
+        },
+        EventKind::WatchTriggered { path, changed } => Event::WatchTriggered {
+            path: path.display().to_string(),
+            changed: *changed,
+        },
+        EventKind::WatchFailed { message } => Event::WatchFailed {
+            message: message.clone(),
+        },
+        EventKind::WatchTruncated { limit } => Event::WatchTruncated { limit: *limit },
+        EventKind::Failed { message } => Event::Failed {
+            message: message.clone(),
+        },
     }
 }
 
@@ -470,21 +637,25 @@ async fn command(
 }
 
 /// Convert a runtime status into its wire representation.
-fn to_wire(status: &servicrab_core::ServiceStatus) -> servicrab_protocol::ServiceInfo {
+fn to_wire_state(state: ServiceState) -> servicrab_protocol::ServiceState {
     use servicrab_protocol::ServiceState as Wire;
 
+    match state {
+        ServiceState::Pending => Wire::Pending,
+        ServiceState::Starting => Wire::Starting,
+        ServiceState::Running => Wire::Running,
+        ServiceState::Backoff => Wire::Backoff,
+        ServiceState::Stopping => Wire::Stopping,
+        ServiceState::Stopped => Wire::Stopped,
+        ServiceState::Exited => Wire::Exited,
+        ServiceState::Failed => Wire::Failed,
+    }
+}
+
+fn to_wire(status: &servicrab_core::ServiceStatus) -> servicrab_protocol::ServiceInfo {
     servicrab_protocol::ServiceInfo {
         name: status.name.to_string(),
-        state: match status.state {
-            ServiceState::Pending => Wire::Pending,
-            ServiceState::Starting => Wire::Starting,
-            ServiceState::Running => Wire::Running,
-            ServiceState::Backoff => Wire::Backoff,
-            ServiceState::Stopping => Wire::Stopping,
-            ServiceState::Stopped => Wire::Stopped,
-            ServiceState::Exited => Wire::Exited,
-            ServiceState::Failed => Wire::Failed,
-        },
+        state: to_wire_state(status.state),
         pid: status.pid,
         uptime_secs: status.uptime.map(|d| d.as_secs()),
         restarts: status.restarts,

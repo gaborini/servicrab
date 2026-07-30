@@ -230,6 +230,33 @@ enum Commands {
         config: Option<std::path::PathBuf>,
     },
 
+    /// Follow the running daemon's live event stream.  Linux and macOS only.
+    Events {
+        /// Only follow these services.  Defaults to all of them.
+        services: Vec<String>,
+
+        /// Path to the configuration file.  If omitted, discovers
+        /// servicrab.toml by walking up from the current directory.
+        #[arg(long, short = 'c')]
+        config: Option<std::path::PathBuf>,
+
+        /// Print one JSON object per line instead of rendering for a terminal.
+        #[arg(long)]
+        json: bool,
+
+        /// Do not prefix lines with the service name.
+        #[arg(long)]
+        no_prefix: bool,
+
+        /// Prefix lines with a UTC timestamp.
+        #[arg(long, short = 't')]
+        timestamps: bool,
+
+        /// Leave captured stdout/stderr out of the stream.
+        #[arg(long)]
+        no_logs: bool,
+    },
+
     /// Show what the background daemon is doing.  Linux and macOS only.
     Status {
         /// Path to the configuration file.  If omitted, discovers
@@ -379,6 +406,23 @@ fn main() {
             commands::daemon::restart(config.as_deref(), &services)
         }
         Commands::Reload { config } => commands::daemon::reload(config.as_deref()),
+        Commands::Events {
+            services,
+            config,
+            json,
+            no_prefix,
+            timestamps,
+            no_logs,
+        } => commands::events::events(
+            &services,
+            config.as_deref(),
+            commands::events::EventsOptions {
+                json,
+                no_prefix,
+                timestamps,
+                no_logs,
+            },
+        ),
         Commands::Status { config, json } => commands::daemon::status(config.as_deref(), json),
         Commands::Down { config } => commands::daemon::down(config.as_deref()),
         Commands::Daemon { config, no_restart } => {
