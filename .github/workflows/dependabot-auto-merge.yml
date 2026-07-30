@@ -1,0 +1,62 @@
+name: Dependabot auto-merge
+
+# `main` asks for one approving review, which a bot's pull request can never
+# collect on its own.  Rather than dropping that requirement for everyone, the
+# weekly dependency bumps get an approval from here and merge themselves once
+# the five required checks are green.
+#
+# Dependabot's own `pull_request` runs get a read-only token, so the write access
+# needed to approve and to turn auto-merge on has to come from
+# `pull_request_target`.  That event runs in the context of the base branch with
+# a writable token, which is only safe because nothing below checks out or
+# executes the pull request's code.
+on: pull_request_target
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    name: approve and queue
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.repository == 'gaborini/servicrab'
+
+    steps:
+      - name: Read the update's metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v3
+
+      # `update-type` is the *highest* change in the pull request, so a grouped
+      # update that contains a single major bump is held back as a whole.  A
+      # major version is where a dependency is allowed to break us, and that is
+      # worth a pair of eyes.
+      - name: Approve the pull request
+        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A push to the branch dismisses stale approvals, and Dependabot
+          # rebases its branches, so this step runs again on every push.  Only
+          # approve when the approval is actually missing, to keep the
+          # notification noise down.
+          if [ "$(gh pr view "$PR_URL" --json reviewDecision -q .reviewDecision)" = "APPROVED" ]; then
+            echo "Already approved."
+          else
+            gh pr review --approve "$PR_URL"
+          fi
+
+      - name: Enable auto-merge
+        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr merge --auto --squash "$PR_URL"
+
+      - name: Explain why a major update was left alone
+        if: steps.meta.outputs.update-type == 'version-update:semver-major'
+        env:
+          NAMES: ${{ steps.meta.outputs.dependency-names }}
+        run: echo "Major update ($NAMES) — left for a human to review."

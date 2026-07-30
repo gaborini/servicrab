@@ -52,6 +52,18 @@ will say so after the merge, and the fix belongs to whoever merged it.
 Force-pushing to `main` and deleting it are blocked for everyone, maintainers
 included. Your own branch is yours: force-push it as much as you like.
 
+### Dependency updates
+
+Dependabot's weekly pull requests are the exception to the review rule: a bot
+cannot collect an approval, so the `Dependabot auto-merge` workflow approves them
+and turns on auto-merge. They still wait for the same five checks, and the merge
+only happens if those are green — which for a dependency bump is the review that
+matters.
+
+Major-version updates are excluded and wait for a human, including a grouped
+update that contains a single major bump. A major version is where a dependency
+is allowed to break us on purpose.
+
 ---
 
 ## Minimum supported Rust version

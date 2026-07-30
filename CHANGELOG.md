@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- A `Dependabot auto-merge` workflow. `main` now requires a pull request with
+  green checks and one approving review, which a bot cannot collect, so the
+  weekly dependency bumps are approved and queued for auto-merge from CI
+  instead. Major-version updates are left for a human, including a grouped
+  update that contains one — the checks are a real review for a patch bump, and
+  not much of one for a breaking change.
+
 ## [0.3.0] - 2026-07-30
 
 ### Added
@@ -274,6 +285,7 @@ config commands work and the runtime reports `UnsupportedPlatform`.
 - `servicrab up --json` and `servicrab watch --json` emit the same event lines
   the daemon streams, for scripts and wrappers.
 
+[Unreleased]: https://github.com/gaborini/servicrab/compare/v0.3.0...HEAD
 [0.3.0]: https://github.com/gaborini/servicrab/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/gaborini/servicrab/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/gaborini/servicrab/releases/tag/v0.1.0
