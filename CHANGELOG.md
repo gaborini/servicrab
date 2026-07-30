@@ -5,7 +5,11 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-07-30
+
+Mostly about the config file: a stack of a dozen services can now be split
+across files, carry per-checkout values, keep its optional parts out of the way
+until asked for, and say what "ready" means on each dependency edge.
 
 ### Added
 
@@ -240,5 +244,5 @@ config commands work and the runtime reports `UnsupportedPlatform`.
 - `servicrab up --json` and `servicrab watch --json` emit the same event lines
   the daemon streams, for scripts and wrappers.
 
-[Unreleased]: https://github.com/gaborini/servicrab/compare/v0.1.0...HEAD
+[0.2.0]: https://github.com/gaborini/servicrab/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/gaborini/servicrab/releases/tag/v0.1.0
