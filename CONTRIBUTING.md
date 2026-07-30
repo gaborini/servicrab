@@ -35,6 +35,25 @@ file.
 
 ---
 
+## What happens to your pull request
+
+`main` is protected, so a change reaches it through a pull request that has:
+
+- **the five CI checks green** — `fmt + clippy + test` on Linux and macOS, the
+  MSRV check, the Windows stub build, and the crates.io packaging dry run;
+- **one approving review** from a maintainer;
+- **every review conversation resolved**.
+
+Your branch does not have to be up to date with `main` before merging: this is a
+small project, and forcing a rebase for every unrelated commit costs more than it
+catches. If `main` moved in a way that actually conflicts with your change, CI
+will say so after the merge, and the fix belongs to whoever merged it.
+
+Force-pushing to `main` and deleting it are blocked for everyone, maintainers
+included. Your own branch is yours: force-push it as much as you like.
+
+---
+
 ## Minimum supported Rust version
 
 Servicrab builds on Rust **1.85** and newer. A CI job checks the workspace on
@@ -76,19 +95,38 @@ Docs: update README roadmap
 
 ## Releasing
 
-1. Update `version` in the workspace `Cargo.toml` and move the `Unreleased`
-   entries in `CHANGELOG.md` under the new version heading.
-2. Merge that to `main` and check CI is green.
-3. Tag it and push the tag:
+For maintainers. The version lives in three places in the workspace
+`Cargo.toml`: `[workspace.package]`, and the `version` of the two internal
+dependencies at the bottom.
+
+1. Bump all three, then `cargo update --workspace --offline` so `Cargo.lock`
+   follows.
+2. Move the `Unreleased` entries in `CHANGELOG.md` under the new version
+   heading, with the date, and add the compare link at the bottom of the file.
+3. Land that on `main` and wait for CI. A maintainer may push it directly;
+   branch protection exempts admins from the pull-request requirement, and a
+   release commit has nobody to review it.
+4. Tag it and push the tag:
 
    ```sh
-   git tag -a v0.2.0 -m "v0.2.0"
-   git push origin v0.2.0
+   git tag -a vX.Y.Z -m "servicrab X.Y.Z"
+   git push origin vX.Y.Z
    ```
 
-The `Release` workflow builds `x86_64` and `aarch64` binaries for Linux and
-macOS, attaches them (with `.sha256` files) to a GitHub release, and takes the
-release notes from the matching `CHANGELOG.md` section.
+   The `Release` workflow builds `x86_64` and `aarch64` binaries for Linux and
+   macOS, attaches them (with `.sha256` files and the generated man pages) to a
+   GitHub release, and takes the release notes from the matching `CHANGELOG.md`
+   section.
+
+5. Publish to crates.io. One command does all three crates in dependency order
+   and waits for the index in between:
+
+   ```sh
+   cargo publish --workspace --locked
+   ```
+
+Tag first, publish second: a crates.io version can never be deleted or reused,
+so it should only ever describe a commit that is already tagged and green.
 
 ---
 
