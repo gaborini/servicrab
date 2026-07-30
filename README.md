@@ -38,10 +38,14 @@ Linux and macOS) on the
 `.sha256` next to it:
 
 ```sh
-tag=$(curl -fsSL https://api.github.com/repos/gaborini/servicrab/releases/latest | grep -m1 tag_name | cut -d\" -f4)
-target=$(uname -m)-$([ "$(uname -s)" = Darwin ] && echo apple-darwin || echo unknown-linux-gnu)
-curl -fsSL "https://github.com/gaborini/servicrab/releases/download/${tag}/servicrab-${tag#v}-${target}.tar.gz" | tar -xz
-sudo install "servicrab-${tag#v}-${target}/servicrab" /usr/local/bin/
+tag=$(curl -fsSL https://api.github.com/repos/gaborini/servicrab/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)
+arch=$(uname -m); [ "$arch" = arm64 ] && arch=aarch64
+os=unknown-linux-gnu; [ "$(uname -s)" = Darwin ] && os=apple-darwin
+dir="servicrab-${tag#v}-${arch}-${os}"
+
+curl -fsSL "https://github.com/gaborini/servicrab/releases/download/${tag}/${dir}.tar.gz" | tar -xz
+sudo install "${dir}/servicrab" /usr/local/bin/
+servicrab --version
 ```
 
 ### From crates.io
