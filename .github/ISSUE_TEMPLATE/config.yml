@@ -1,0 +1,7 @@
+# Questions and anything that fits neither template are welcome as a blank
+# issue; a form should not be a barrier to asking.
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/gaborini/servicrab/security/advisories/new
+    about: Report privately instead of opening an issue. See SECURITY.md.

@@ -105,6 +105,25 @@ impl Session {
     }
 }
 
+/// Restrict the freshly bound socket to its owner.
+///
+/// Connecting to a Unix socket needs write permission on the socket file, and
+/// a client that can connect can start, stop and restart every service in the
+/// project.  `bind` applies the process umask, which is 022 on most systems but
+/// 002 on distributions that give each user a private group — there the whole
+/// group would be able to drive the daemon.  Setting the mode explicitly means
+/// the guarantee does not depend on how the operator's shell was configured.
+///
+/// A project socket may also land in the shared temp directory when the path
+/// next to the config would exceed the socket length limit, which makes this
+/// matter more, not less.
+fn restrict_socket(socket: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("could not restrict {} to its owner: {e}", socket.display()))
+}
+
 /// Run the daemon in this process until the stack stops or shutdown is
 /// requested. Returns the exit code to use.
 pub fn serve(
@@ -158,6 +177,7 @@ pub fn serve(
     let result = runtime.block_on(async {
         let listener = UnixListener::bind(&paths.socket)
             .map_err(|e| format!("could not listen on {}: {e}", paths.socket.display()))?;
+        restrict_socket(&paths.socket)?;
 
         // One channel drives shutdown, whether it was asked for by a signal or
         // over the socket.

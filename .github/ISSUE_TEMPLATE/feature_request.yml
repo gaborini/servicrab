@@ -1,0 +1,49 @@
+name: Feature request
+description: Suggest something servicrab should be able to do
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Servicrab tries to stay small and readable, so the useful part of a
+        feature request is the problem behind it rather than the API. A few
+        things are deliberately out of scope: it is not a container
+        orchestrator, not a production init system, and it has no TUI and no
+        plugin system. The
+        [README](https://github.com/gaborini/servicrab/blob/main/README.md)
+        lists the non-goals.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >
+        What are you trying to do, and how do you do it today? Concrete beats
+        general: a real stack that is awkward to run is the strongest argument.
+      placeholder: |
+        My migration service has to finish before the api starts, but
+        `depends_on` only waits for it to be running, so the api starts against
+        an unmigrated database.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+      description: >
+        A sketch is fine. If it touches `servicrab.toml`, showing the config you
+        would like to write is the clearest form.
+      render: toml
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: >
+        Including "why the existing options do not work" — for example why a
+        wrapper script or an existing flag is not enough.
+    validations:
+      required: false

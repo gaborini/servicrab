@@ -1,0 +1,44 @@
+name: Audit
+
+# A process supervisor can end up running as root, so the dependency tree is
+# worth auditing: RustSec advisories, unmaintained crates, licence drift, and
+# any source that is not crates.io.  The policy lives in deny.toml.
+#
+# This is deliberately a separate workflow from CI.  Advisories are published
+# on the RustSec calendar, not ours: a new one should not fail an unrelated
+# documentation pull request, and it should be found even in a week when nobody
+# opens one.  Hence the schedule, plus a run whenever the dependency set or the
+# policy itself changes.
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/audit.yml"
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/audit.yml"
+  schedule:
+    # Mondays, 06:00 UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources

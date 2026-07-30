@@ -6,7 +6,9 @@ Thank you for your interest in contributing! Servicrab is in early development, 
 
 ## Code of Conduct
 
-Be respectful and constructive. We follow the [Rust Code of Conduct](https://www.rust-lang.org/policies/code-of-conduct).
+Be respectful and constructive. This project follows the
+[Contributor Covenant](CODE_OF_CONDUCT.md); reporting instructions are in that
+file.
 
 ---
 
@@ -92,10 +94,14 @@ release notes from the matching `CHANGELOG.md` section.
 
 ## Reporting issues
 
-Please include:
+Use the [issue templates](https://github.com/gaborini/servicrab/issues/new/choose);
+they ask for what a report usually needs:
 - Your operating system and Rust version (`rustc --version`)
 - The `servicrab.toml` you are using (redact secrets)
 - The exact command you ran and the output
+
+Found a security problem instead? Do not open an issue — see
+[SECURITY.md](SECURITY.md).
 
 ---
 

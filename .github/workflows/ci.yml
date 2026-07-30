@@ -46,11 +46,13 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # --locked everywhere: without it cargo is free to pick up a newer
+      # transitive dependency, and CI would stop testing what Cargo.lock ships.
       - name: Clippy (deny warnings)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features --locked
 
   msrv:
     name: msrv (minimum supported Rust version)
@@ -77,6 +79,24 @@ jobs:
       # --locked matters: the promise is about the versions we ship in
       # Cargo.lock, not about whatever resolves today.
       - name: Check the workspace on the MSRV
+        run: cargo check --workspace --all-features --all-targets --locked
+
+  windows:
+    name: windows (stubs compile)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Windows is a non-goal: supervision is Unix-only and the runtime reports
+      # UnsupportedPlatform there.  What this job protects is the `cfg(not(unix))`
+      # stubs, which nobody compiles locally and which could rot unnoticed.
+      # Compiling is the whole promise — lints are not gated on a platform we do
+      # not ship, and the stubs legitimately leave Unix-only helpers unused.
+      - name: Check that the non-Unix build still compiles
         run: cargo check --workspace --all-features --all-targets --locked
 
   package:

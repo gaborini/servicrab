@@ -1,0 +1,88 @@
+name: Bug report
+description: Servicrab did something other than what it documents
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. The fields below are the ones that usually decide
+        whether a bug can be reproduced — the config and the exact output most
+        of all.
+
+        If this is a **security** issue, please close this page and follow
+        [SECURITY.md](https://github.com/gaborini/servicrab/blob/main/SECURITY.md)
+        instead.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did servicrab do, and what did you expect instead?
+      placeholder: |
+        `servicrab up` started the api service before the database was healthy,
+        so the api exited. I expected it to wait for the health check.
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: servicrab.toml
+      description: >
+        The configuration you ran, cut down to the smallest version that still
+        shows the problem. Redact secrets.
+      render: toml
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command and output
+      description: >
+        The exact command and its complete output. `RUST_LOG=debug` in front of
+        the command adds the lifecycle log, which is often the deciding detail.
+      render: console
+      placeholder: |
+        $ RUST_LOG=debug servicrab up
+        ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Servicrab version
+      description: Output of `servicrab --version`.
+      placeholder: servicrab 0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Other (note that supervision is Linux/macOS only)
+    validations:
+      required: true
+
+  - type: input
+    id: os-details
+    attributes:
+      label: OS version
+      description: e.g. `Ubuntu 24.04`, `macOS 15.3 (arm64)`.
+    validations:
+      required: true
+
+  - type: input
+    id: rustc
+    attributes:
+      label: Rust version
+      description: >
+        Output of `rustc --version`, if you built from source. Leave empty if
+        you installed a released binary.
+    validations:
+      required: false

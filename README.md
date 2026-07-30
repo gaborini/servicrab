@@ -23,7 +23,7 @@ Think of it as a minimal, zero-dependency alternative to [overmind](https://gith
 - `servicrab generate systemd|launchd` — hand the stack over to the init system, with `systemctl reload` wired to `servicrab reload`
 - Restart policies: `never`, `on-failure`, `always`, with exponential backoff
 - Environment: per-service variables, working directories, and dotenv-style `env_file` layering
-- Shell completions for bash, zsh, fish, PowerShell and elvish
+- Shell completions for bash, zsh, fish, PowerShell and elvish, and man pages via `servicrab man`
 - Dependency declarations and a deterministic start order
 
 ---
@@ -46,6 +46,13 @@ dir="servicrab-${tag#v}-${arch}-${os}"
 curl -fsSL "https://github.com/gaborini/servicrab/releases/download/${tag}/${dir}.tar.gz" | tar -xz
 sudo install "${dir}/servicrab" /usr/local/bin/
 servicrab --version
+```
+
+The tarball also contains the man pages in `man/`, one per command:
+
+```sh
+sudo install -m 644 "${dir}"/man/*.1 /usr/local/share/man/man1/
+man servicrab
 ```
 
 ### From crates.io
@@ -167,6 +174,7 @@ if you want shell semantics.
 | `servicrab daemon [--config PATH] [--no-restart]` | Run the daemon in the foreground (for systemd/launchd/containers) |
 | `servicrab generate <systemd\|launchd> [--config PATH] [--scope system\|user] [-o PATH] [--user NAME]` | Generate an init-system unit that runs the stack |
 | `servicrab completions <SHELL>` | Print a completion script for bash, zsh, fish, PowerShell or elvish |
+| `servicrab man [-o DIR]` | Print the man page in roff, or write one page per command into `DIR` |
 
 If `--config` is omitted, Servicrab discovers `servicrab.toml` by walking up
 from the current directory.
@@ -541,6 +549,23 @@ so nothing is installed behind your back.
 
 ---
 
+## Man pages
+
+Release tarballs ship the pages under `man/`. To generate them from any build:
+
+```bash
+servicrab man                                    # the main page, in roff, on stdout
+servicrab man -o /usr/local/share/man/man1       # one page per command
+man servicrab
+man servicrab-up
+```
+
+The pages are generated from the same command definitions as `--help`, so they
+cannot drift from it; the sections clap cannot know about — files, environment
+variables, exit codes — are written by hand.
+
+---
+
 ## Running in the background
 
 `up` is the interactive mode; `start` is the same stack without a terminal
@@ -759,10 +784,10 @@ servicrab/
 cargo fmt --all
 
 # Lint (warnings are errors in CI)
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
 # Test
-cargo test --workspace --all-features
+cargo test --workspace --all-features --locked
 
 # Run a specific test
 cargo test -p servicrab-core config::tests
@@ -770,6 +795,9 @@ cargo test -p servicrab-core config::tests
 # Check against the minimum supported Rust version
 rustup toolchain install 1.85
 cargo +1.85 check --workspace --all-features --all-targets --locked
+
+# Audit the dependency tree (licences, advisories, sources)
+cargo deny check
 ```
 
 The commands above are exactly what CI runs, so a clean local sweep means a
@@ -830,6 +858,8 @@ green pipeline.
 ### Phase 5 (current) — Release engineering
 - [x] Publishable crate metadata and a `CHANGELOG.md`
 - [x] Tagged releases with prebuilt Linux and macOS binaries (x86_64 + aarch64)
+- [x] Man pages (`servicrab man`), shipped in the release tarballs
+- [x] Dependency audit (`cargo-deny`) and automated dependency updates
 - [ ] Published to crates.io
 
 ---

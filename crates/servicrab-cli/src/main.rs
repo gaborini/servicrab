@@ -19,6 +19,7 @@
 //!   (Linux/macOS)
 //! - `servicrab generate <systemd|launchd>` — write an init-system unit
 //! - `servicrab completions <SHELL>` — print a shell completion script
+//! - `servicrab man` — print the man page in roff
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -318,6 +319,14 @@ enum Commands {
         shell: clap_complete::Shell,
     },
 
+    /// Print this program's man page (roff) to stdout.
+    Man {
+        /// Write one page per command into this directory instead, creating it
+        /// if needed.
+        #[arg(long, short = 'o')]
+        output: Option<std::path::PathBuf>,
+    },
+
     /// Supervise the stack in the foreground while serving the daemon socket.
     /// This is what `start` runs in the background; use it directly under
     /// systemd, launchd or a container.  Linux and macOS only.
@@ -457,6 +466,7 @@ fn main() {
             },
         ),
         Commands::Completions { shell } => commands::completions::run::<Cli>(shell).map(|()| 0),
+        Commands::Man { output } => commands::man::run::<Cli>(output.as_deref()).map(|()| 0),
         Commands::Logs {
             services,
             config,

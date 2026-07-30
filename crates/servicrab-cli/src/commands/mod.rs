@@ -8,5 +8,6 @@ pub mod generate;
 pub mod init;
 pub mod list;
 pub mod logs;
+pub mod man;
 pub mod run;
 pub mod up;
