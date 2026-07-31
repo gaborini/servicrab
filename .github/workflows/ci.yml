@@ -121,3 +121,25 @@ jobs:
       # long before a release tag depends on them.
       - name: Package every crate
         run: cargo package --workspace --locked
+
+  docs:
+    name: docs (rustdoc, deny warnings)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # The crate documentation is dense with intra-doc links, and a link that
+      # stops resolving is invisible without this: rustdoc emits a warning and
+      # exits zero, so `cargo doc` "succeeds" while shipping a broken page to
+      # docs.rs.  `-D warnings` is what turns that into a failure.
+      #
+      # --no-deps: our own links are the promise; a warning inside a dependency's
+      # documentation is not ours to fix and not ours to be blocked by.
+      - name: Build the documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps --locked
