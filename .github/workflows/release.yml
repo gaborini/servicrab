@@ -233,6 +233,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Provenance is signed with a short-lived Sigstore certificate obtained
+      # against an OIDC token, and the attestation is then persisted against the
+      # repository — one permission for each half.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v7
         with:
@@ -245,6 +250,44 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      # A per-target `.sha256` produced in the same job as its tarball proves
+      # nothing to a downloader: whatever could alter the tarball could rewrite
+      # the digest beside it.  Two things are added here, and neither is GPG or
+      # cosign, which would mean a key for the maintainer to hold and rotate.
+      #
+      # The aggregate file is the ergonomic half.  One `SHA256SUMS` verifies
+      # every asset in a single `shasum -a 256 -c`, and it is what a downloader
+      # who only wants to check a mirror actually reaches for.  The per-target
+      # files stay: they were published before, and dropping them would break
+      # anyone already fetching one.
+      - name: Aggregate the checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          # Sorted by filename so the file is stable across runs regardless of
+          # the order the four build jobs happened to finish in.
+          cat ./*.tar.gz.sha256 | sort -k2 > SHA256SUMS
+          # The digests were computed on four different runners; recompute them
+          # here to prove the artefact round-trip did not damage anything.
+          shasum -a 256 -c SHA256SUMS
+          echo "--- SHA256SUMS"
+          cat SHA256SUMS
+
+      # The trustworthy half.  The attestation binds each tarball's digest to
+      # this workflow, this repository and this commit, signed by Sigstore with a
+      # certificate GitHub issues to the run and which nobody here can reuse.
+      # `gh attestation verify` checks it without the verifier having to trust
+      # any file we publish alongside the artefact — which is exactly what the
+      # `.sha256` files cannot offer.
+      - name: Attest the release artefacts
+        uses: actions/attest-build-provenance@v4
+        with:
+          # Each tarball is its own subject, so `gh attestation verify
+          # servicrab-<version>-<target>.tar.gz --repo gaborini/servicrab`
+          # answers for the file a user actually downloaded, with no indirection
+          # through a checksum list.
+          subject-path: dist/*.tar.gz
 
       - name: Create the release
         env:
