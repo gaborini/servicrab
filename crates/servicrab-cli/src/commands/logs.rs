@@ -45,7 +45,7 @@ pub fn router_for(cfg: &Config) -> Option<LogRouter> {
 pub fn run(services: &[String], config: Option<&Path>, options: LogsOptions) -> Result<(), String> {
     let path = resolve_config_path(config).map_err(|e| format!("could not find config: {e}"))?;
 
-    let (cfg, _) = load(&path).map_err(|errors| {
+    let (cfg, warnings) = load(&path).map_err(|errors| {
         let msgs: Vec<String> = errors.iter().map(|e| format!("  • {e}")).collect();
         format!(
             "✗ {} has {} error(s):\n{}",
@@ -54,6 +54,10 @@ pub fn run(services: &[String], config: Option<&Path>, options: LogsOptions) -> 
             msgs.join("\n")
         )
     })?;
+
+    for warning in &warnings {
+        eprintln!("⚠  {warning}");
+    }
 
     let Some(settings) = cfg.project.logs.clone() else {
         return Err(format!(

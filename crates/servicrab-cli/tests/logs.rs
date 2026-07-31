@@ -407,6 +407,35 @@ command = ["{}"]
 }
 
 #[test]
+fn logs_reports_config_warnings() {
+    let dir = TempDir::new().unwrap();
+    let hello = script(dir.path(), "hello.sh", "echo hi");
+    // `max_restarts` alongside `restart = "never"` is inert, so loading warns.
+    // `logs` used to throw those warnings away, unlike the other commands.
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[project.logs]
+[services.api]
+command = ["{}"]
+restart = "never"
+max_restarts = 3
+"#,
+            hello.display()
+        ),
+    );
+
+    // The command itself still fails (nothing has been captured), which is
+    // exactly the case where a warning is easiest to lose.
+    let (_, _, stderr) = cli(&["logs"], &cfg);
+    assert!(stderr.contains("max_restarts"), "{stderr}");
+}
+
+#[test]
 fn logs_reports_when_nothing_has_been_captured_yet() {
     let dir = TempDir::new().unwrap();
     let hello = script(dir.path(), "hello.sh", "echo hi");

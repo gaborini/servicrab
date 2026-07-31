@@ -124,6 +124,21 @@ fn run_count(counter: &Path) -> usize {
         .unwrap_or(0)
 }
 
+/// Wait until the counting fixture has run at least `count` times.
+fn wait_for_runs(counter: &Path, count: usize) {
+    let deadline = Instant::now() + CEILING;
+    while Instant::now() < deadline {
+        if run_count(counter) >= count {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "timed out waiting for {count} runs; saw {}",
+        run_count(counter)
+    );
+}
+
 fn is_alive(pid: i32) -> bool {
     kill(Pid::from_raw(pid), None).is_ok()
 }
@@ -395,6 +410,38 @@ fn no_restart_flag_overrides_the_configured_policy() {
     let (code, _, _) = run_service(&cfg, "svc", &["--no-restart"]);
     assert_eq!(code, 1);
     assert_eq!(run_count(&counter), 1, "--no-restart must win");
+}
+
+#[test]
+fn zero_max_restarts_means_unlimited_restarts() {
+    let dir = TempDir::new().unwrap();
+    let counter = dir.path().join("count.txt");
+    let cfg = counting_config(
+        dir.path(),
+        &counter,
+        "exit 1",
+        "restart = \"on-failure\"\nrestart_delay = \"100ms\"\nrestart_max_delay = \"100ms\"\nmax_restarts = 0\n",
+    );
+
+    let mut child = spawn_service_with(&cfg, "svc", Stdio::null(), Stdio::piped());
+
+    // More runs than the default budget of 10 would ever allow, so the count
+    // rules out both a finite limit and the old "give up on the first failure"
+    // reading of `max_restarts = 0`.
+    wait_for_runs(&counter, 12);
+    assert!(
+        is_alive(child.id() as i32),
+        "the supervisor must not have given up"
+    );
+
+    kill(Pid::from_raw(child.id() as i32), Signal::SIGINT).unwrap();
+    let code = wait_bounded(&mut child);
+    let stderr = drain_stderr(&mut child);
+    assert_eq!(code, 130, "supervisor said: {stderr}");
+    assert!(
+        !stderr.contains("giving up"),
+        "the restart limit must never be reached: {stderr}"
+    );
 }
 
 // ── shutdown ───────────────────────────────────────────────────────────────

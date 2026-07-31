@@ -279,6 +279,7 @@ pub struct RestartTracker {
     policy: RestartPolicy,
     restart_delay: Duration,
     restart_max_delay: Duration,
+    /// Restarts allowed between stable runs; `0` means unlimited.
     max_restarts: u32,
     stable_after: Duration,
     attempts: u32,
@@ -286,6 +287,8 @@ pub struct RestartTracker {
 
 impl RestartTracker {
     /// Build a tracker from validated service settings.
+    ///
+    /// `max_restarts = 0` means unlimited restarts.
     pub fn new(
         policy: RestartPolicy,
         restart_delay: Duration,
@@ -370,18 +373,30 @@ impl RestartTracker {
             return RestartDecision::Stop;
         }
 
-        if self.attempts >= self.max_restarts {
+        if !self.budget_left() {
             return RestartDecision::Fail {
                 reason: ShutdownReason::RestartLimit,
             };
         }
 
         let delay = self.backoff_for_attempt(self.attempts);
-        self.attempts += 1;
+        // Saturating because an unlimited budget has no bound to stop the
+        // counter: the number is only reported, and a service that has crashed
+        // four billion times has bigger problems than an off-by-one.
+        self.attempts = self.attempts.saturating_add(1);
         RestartDecision::Restart {
             delay,
             attempt: self.attempts,
         }
+    }
+
+    /// Whether another restart attempt is allowed.
+    ///
+    /// `max_restarts = 0` means unlimited, which is the reading users expect
+    /// and the one Compose and systemd use.  "Give up on the first failure" is
+    /// what `restart = "never"` is for.
+    fn budget_left(&self) -> bool {
+        self.max_restarts == 0 || self.attempts < self.max_restarts
     }
 
     fn should_restart(&self, reason: ExitReason) -> bool {
@@ -681,14 +696,41 @@ mod tests {
     }
 
     #[test]
-    fn zero_max_restarts_fails_immediately() {
+    fn zero_max_restarts_means_unlimited() {
         let mut t =
             RestartTracker::new(RestartPolicy::Always, SEC, SEC, 0, Duration::from_secs(60));
+        // Well past any plausible finite budget, including the old default.
+        for expected in 1..=50 {
+            assert_eq!(
+                t.decide(outcome(ExitReason::Code(1)), None),
+                RestartDecision::Restart {
+                    delay: SEC,
+                    attempt: expected
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn an_unlimited_budget_still_obeys_the_policy() {
+        // "Unlimited" is about the budget, not about the policy: a clean exit
+        // under `on-failure` is still not a reason to restart.
+        let mut t = RestartTracker::new(
+            RestartPolicy::OnFailure,
+            SEC,
+            SEC,
+            0,
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            t.decide(outcome(ExitReason::Code(0)), None),
+            RestartDecision::Stop
+        );
+
+        let mut t = RestartTracker::new(RestartPolicy::Never, SEC, SEC, 0, Duration::from_secs(60));
         assert_eq!(
             t.decide(outcome(ExitReason::Code(1)), None),
-            RestartDecision::Fail {
-                reason: ShutdownReason::RestartLimit
-            }
+            RestartDecision::Stop
         );
     }
 

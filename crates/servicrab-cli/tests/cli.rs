@@ -246,6 +246,90 @@ fn list_json_output() {
     assert_eq!(first["restart"].as_str().unwrap(), "never");
 }
 
+#[test]
+fn list_handles_a_command_with_multi_byte_characters() {
+    // The preview used to be sliced at byte 29, which falls inside the last
+    // '€' here: `list` died with "not a char boundary" and exit 101.
+    let toml = "version = 1\n[project]\nname = \"demo\"\n[services.api]\ncommand = [\"echo\", \"x€€€€€€€€€\"]\n";
+    let (_dir, path) = temp_dir_with_config(toml);
+
+    cmd()
+        .arg("list")
+        .arg("--config")
+        .arg(&path)
+        .assert()
+        .success()
+        .stdout(contains("x€€€€€€€€€"));
+
+    let output = cmd()
+        .arg("list")
+        .arg("--config")
+        .arg(&path)
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output).unwrap()).expect("valid JSON");
+    assert_eq!(
+        json[0]["command"],
+        serde_json::json!(["echo", "x€€€€€€€€€"])
+    );
+}
+
+#[test]
+fn list_truncates_a_long_multi_byte_command_without_panicking() {
+    // Long enough that the preview has to cut, with the cut point inside a
+    // multi-byte character.
+    let arg = "€".repeat(40);
+    let toml = format!(
+        "version = 1\n[project]\nname = \"demo\"\n[services.api]\ncommand = [\"echo\", \"{arg}\"]\n"
+    );
+    let (_dir, path) = temp_dir_with_config(&toml);
+
+    // 29 characters of the command line, then the ellipsis.
+    let expected = format!("echo {}…", "€".repeat(24));
+    cmd()
+        .arg("list")
+        .arg("--config")
+        .arg(&path)
+        .assert()
+        .success()
+        // Cut at a character boundary, so the ellipsis follows whole '€'s.
+        .stdout(contains(expected));
+}
+
+#[test]
+fn list_reports_config_warnings() {
+    // `max_restarts` alongside `restart = "never"` is inert, so loading warns.
+    // `list` used to throw those warnings away, unlike the other commands.
+    let toml = "version = 1\n[project]\nname = \"demo\"\n[services.api]\ncommand = [\"echo\"]\nrestart = \"never\"\nmax_restarts = 3\n";
+    let (_dir, path) = temp_dir_with_config(toml);
+
+    cmd()
+        .arg("list")
+        .arg("--config")
+        .arg(&path)
+        .assert()
+        .success()
+        .stderr(contains("max_restarts"));
+
+    // On stderr, so `--json` output stays parseable on stdout.
+    let assert = cmd()
+        .arg("list")
+        .arg("--config")
+        .arg(&path)
+        .arg("--json")
+        .assert()
+        .success()
+        .stderr(contains("max_restarts"));
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    serde_json::from_str::<serde_json::Value>(&stdout).expect("valid JSON");
+}
+
 // ── profiles ───────────────────────────────────────────────────────────────
 
 #[test]
