@@ -18,6 +18,21 @@ env:
 permissions:
   contents: read
 
+# CI cancels superseded runs; a release must not.  There is no such thing as a
+# release run made irrelevant by a later one, hence `cancel-in-progress: false`
+# — cancelling one halfway would leave a release created and half its assets
+# uploaded.
+#
+# The group is the workflow, not the tag, so releases serialise completely.
+# Two runs for the *same* tag (a push and a dispatch of it, or a re-run) would
+# otherwise both reach `gh release create` and one would fail on a release that
+# already exists.  Two runs for *different* tags would instead race over which
+# one ends up marked latest, and the answer would depend on which finished
+# last.  Releases are rare enough that queueing costs nothing.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 jobs:
   # Every job used to work the version out for itself, from two different
   # expressions: the build job read `$GITHUB_REF_NAME` while the release job read
