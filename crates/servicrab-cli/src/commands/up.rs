@@ -15,8 +15,8 @@ use servicrab_core::runtime::stack::{
 };
 use servicrab_core::{
     event_channel, load, plan_stack, resolve_config_path, spawn_watchers, watched_services, Config,
-    EventKind, EventReceiver, LogRouter, Selection, ServiceName, ShutdownReason, SignalWatcher,
-    Stream,
+    EventKind, EventReceiver, LogRouter, LogSink, Selection, ServiceName, ShutdownReason,
+    SignalWatcher, Stream,
 };
 
 use crate::style::{self, BOLD, DIM, RESET, SERVICE_COLORS};
@@ -144,18 +144,28 @@ pub fn run(
 
 /// Drain the event stream, rendering everything as it arrives and copying
 /// captured output to the log files when file logging is enabled.
-async fn render(
-    mut events: EventReceiver,
-    printer: Printer,
-    mut logs: Option<LogRouter>,
-) -> Printer {
+///
+/// The file work happens on a blocking task behind [`LogSink`], so a slow disk
+/// delays the log rather than the async worker that is also driving child
+/// `wait()`s, health probes and the control channel.
+async fn render(mut events: EventReceiver, printer: Printer, logs: Option<LogRouter>) -> Printer {
+    let sink = logs.map(LogSink::spawn);
+
     while let Some(event) = events.recv().await {
-        if let (Some(router), EventKind::Log { line, .. }) = (logs.as_mut(), &event.kind) {
-            if let Some(problem) = router.record(&event.service, line) {
+        if let (Some(sink), EventKind::Log { line, .. }) = (sink.as_ref(), &event.kind) {
+            if let Some(problem) = sink.record(&event.service, line).await {
                 printer.warn(&problem);
             }
         }
         printer.event(&event.service, &event.kind);
+    }
+
+    // The stack has stopped; wait for the queued lines to reach the disk before
+    // the process goes away, so a graceful stop never loses output.
+    if let Some(sink) = sink {
+        if let Some(problem) = sink.shutdown().await {
+            printer.warn(&problem);
+        }
     }
     printer
 }

@@ -10,7 +10,7 @@ use std::path::Path;
 use servicrab_core::runtime::{lookup_service, OutputMode, RunOptions, RunOutcome};
 use servicrab_core::{
     event_channel, load, resolve_config_path, EventKind, EventReceiver, ExitReason,
-    ForegroundRunner, LogRouter, ShutdownReason, Stream,
+    ForegroundRunner, LogRouter, LogSink, ShutdownReason, Stream,
 };
 
 /// Exit code used when a run is cut short by Ctrl+C (`128 + SIGINT`).
@@ -99,12 +99,17 @@ fn foreground(
 }
 
 /// Echo captured output verbatim while copying it into the log file.
-async fn tee_output(mut events: EventReceiver, mut router: LogRouter) {
+///
+/// The file work runs on a blocking task, so a slow disk cannot stall the
+/// runtime that is waiting on the child.
+async fn tee_output(mut events: EventReceiver, router: LogRouter) {
+    let sink = LogSink::spawn(router);
+
     while let Some(event) = events.recv().await {
         let EventKind::Log { stream, line } = &event.kind else {
             continue;
         };
-        if let Some(problem) = router.record(&event.service, line) {
+        if let Some(problem) = sink.record(&event.service, line).await {
             eprintln!("⚠  {problem}");
         }
         match stream {
@@ -119,6 +124,11 @@ async fn tee_output(mut events: EventReceiver, mut router: LogRouter) {
                 let _ = err.flush();
             }
         }
+    }
+
+    // The run is over; the queued lines still have to reach the file.
+    if let Some(problem) = sink.shutdown().await {
+        eprintln!("⚠  {problem}");
     }
 }
 
