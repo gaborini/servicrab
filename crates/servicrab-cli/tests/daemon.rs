@@ -1412,7 +1412,9 @@ fn starting_a_remembered_service_takes_the_stop_back() {
 #[test]
 fn the_remembered_stop_is_a_plain_list_of_names() {
     // The file is state a human may have to look at — or edit — when a stack
-    // ends up in a shape nobody wanted.
+    // ends up in a shape nobody wanted.  The version line above the names lets
+    // the format change later; everything below it is still one name per line,
+    // so deleting a line remains a legitimate way to forget a stop.
     let dir = TempDir::new().unwrap();
     let cfg = two_policies(dir.path());
     let remembered = dir.path().join(".servicrab/stopped");
@@ -1422,10 +1424,119 @@ fn the_remembered_stop_is_a_plain_list_of_names() {
     assert!(!remembered.exists(), "nothing was stopped yet");
 
     assert_eq!(cli(&["stop", "api"], &cfg).0, 0);
-    assert_eq!(fs::read_to_string(&remembered).unwrap(), "api\n");
+    assert_eq!(
+        fs::read_to_string(&remembered).unwrap(),
+        "# servicrab stopped v1\napi\n"
+    );
 
     assert_eq!(cli(&["restart", "api"], &cfg).0, 0);
-    assert_eq!(fs::read_to_string(&remembered).unwrap(), "");
+    assert_eq!(
+        fs::read_to_string(&remembered).unwrap(),
+        "# servicrab stopped v1\n"
+    );
+}
+
+/// Two `stop`s at once must both be remembered.
+///
+/// Each arrives on its own connection and is handled by its own task, and the
+/// record was a read-modify-write with no lock and no temp+rename: one update
+/// simply vanished, and a crash mid-write left an empty file that reads back as
+/// "nothing was ever stopped".  The verdict is what a fresh daemon does with the
+/// file, not what the two commands printed.
+#[test]
+fn two_services_stopped_at_once_are_both_remembered() {
+    let dir = TempDir::new().unwrap();
+    let api = resident(dir.path(), "api.sh");
+    let cache = resident(dir.path(), "cache.sh");
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}"]
+restart = "unless-stopped"
+[services.cache]
+command = ["{}"]
+restart = "unless-stopped"
+"#,
+            api.display(),
+            cache.display()
+        ),
+    );
+    let remembered = dir.path().join(".servicrab/stopped");
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("both services to run", |s| {
+        state_of(s, "api") == "running" && state_of(s, "cache") == "running"
+    });
+
+    // Two separate processes, so the two requests really do overlap.
+    let mut stops = vec![
+        spawn_cli(&["stop", "api"], &cfg),
+        spawn_cli(&["stop", "cache"], &cfg),
+    ];
+    for stop in &mut stops {
+        assert_eq!(wait_bounded(stop), 0);
+    }
+
+    let contents = fs::read_to_string(&remembered).unwrap();
+    let names: Vec<&str> = contents
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["api", "cache"],
+        "an update was lost: {contents:?}"
+    );
+
+    // And a fresh daemon acts on both, which is what the file is for.
+    drop(daemon);
+    let daemon = Daemon::start(&cfg);
+    let status = daemon.wait_for_status("the stack to settle", |s| {
+        state_of(s, "api") == "stopped" && state_of(s, "cache") == "stopped"
+    });
+    assert_eq!(state_of(&status, "api"), "stopped", "{status}");
+    assert_eq!(state_of(&status, "cache"), "stopped", "{status}");
+}
+
+/// A name the configuration no longer declares must not stay remembered
+/// forever.
+///
+/// Every stop was recorded while only `unless-stopped` services were ever
+/// consulted, so a renamed or deleted service left its name behind for good and
+/// the file only grew.
+#[test]
+fn a_renamed_service_is_forgotten_at_the_next_start() {
+    let dir = TempDir::new().unwrap();
+    let cfg = two_policies(dir.path());
+    let remembered = dir.path().join(".servicrab/stopped");
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("api to run", |s| state_of(s, "api") == "running");
+    assert_eq!(cli(&["stop", "api"], &cfg).0, 0);
+    drop(daemon);
+
+    // Rename `api` to `web`, so the remembered name has nothing to refer to.
+    // Only the section header, or the replacement would mangle the script path
+    // too and the config would stop describing a runnable service.
+    let renamed = fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("[services.api]", "[services.web]");
+    fs::write(&cfg, renamed).unwrap();
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("web to run", |s| state_of(s, "web") == "running");
+
+    let contents = fs::read_to_string(&remembered).unwrap_or_default();
+    assert!(
+        !contents.contains("api"),
+        "the old name is still remembered: {contents:?}"
+    );
+    drop(daemon);
 }
 
 #[test]

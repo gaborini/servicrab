@@ -119,8 +119,14 @@ impl Session {
     /// Only `restart = "unless-stopped"` acts on this, and only when a stack is
     /// started, so a file we could not write costs nothing right now — it is
     /// logged and the command still succeeds.
-    fn remember(&self, service: &str, is_stopped: bool) {
-        if let Err(problem) = stopped::record(&self.stopped, service, is_stopped) {
+    ///
+    /// The write is a lock plus filesystem calls, so it goes to a blocking
+    /// thread: this is called from a connection task on the same runtime that
+    /// supervises the processes.
+    async fn remember(&self, service: &str, is_stopped: bool) {
+        let outcome =
+            stopped::record_blocking(self.stopped.clone(), service.to_string(), is_stopped).await;
+        if let Err(problem) = outcome {
             tracing::warn!("{problem}");
         }
     }
@@ -224,18 +230,6 @@ pub fn serve(
     options: DaemonOptions,
 ) -> Result<i32, String> {
     let plan = plan_stack(cfg, options.selection()).map_err(|e| e.to_string())?;
-    let held_back = stopped::held_back(cfg, &plan, &stopped::read(&paths.stopped));
-    if !held_back.is_empty() {
-        tracing::info!(
-            services = %held_back
-                .iter()
-                .map(ServiceName::as_str)
-                .collect::<Vec<_>>()
-                .join(", "),
-            file = %paths.stopped.display(),
-            "leaving hand-stopped services (and their dependents) stopped"
-        );
-    }
 
     paths.ensure_dir()?;
     // One daemon per project, decided by the kernel rather than by a check
@@ -250,6 +244,35 @@ pub fn serve(
         }
         Err(super::lock::LockError::Failed(problem)) => return Err(problem),
     };
+
+    // Startup is the one moment when the configuration has just been read and
+    // no request can be in flight, so it is where names of services that no
+    // longer exist get dropped.  Held after the lock, because it writes.
+    match stopped::reconcile(&paths.stopped, cfg) {
+        Ok(dropped) if !dropped.is_empty() => tracing::info!(
+            services = %dropped.iter().cloned().collect::<Vec<_>>().join(", "),
+            file = %paths.stopped.display(),
+            "forgetting hand-stopped services the configuration no longer declares"
+        ),
+        Ok(_) => {}
+        // The memory of a stop is a convenience; failing to tidy it is not a
+        // reason to refuse to start a stack.
+        Err(problem) => tracing::warn!("{problem}"),
+    }
+
+    let held_back = stopped::held_back(cfg, &plan, &stopped::read(&paths.stopped));
+    if !held_back.is_empty() {
+        tracing::info!(
+            services = %held_back
+                .iter()
+                .map(ServiceName::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+            file = %paths.stopped.display(),
+            "leaving hand-stopped services (and their dependents) stopped"
+        );
+    }
+
     // Holding the lock rules out every daemon that takes it, so anything still
     // answering on the socket is either a release from before the lock existed
     // or an impostor.  Refusing is the only safe answer to both.
@@ -715,7 +738,7 @@ async fn respond(request: Request, session: &Session) -> Response {
             // Starting a service is how an operator takes back a stop, whether
             // it happened in this daemon or in an earlier one.
             if matches!(response, Response::Ok { .. }) {
-                session.remember(&name, false);
+                session.remember(&name, false).await;
             }
             response
         }
@@ -726,7 +749,7 @@ async fn respond(request: Request, session: &Session) -> Response {
             })
             .await;
             if matches!(response, Response::Ok { .. }) {
-                session.remember(&name, true);
+                session.remember(&name, true).await;
             }
             response
         }
@@ -737,7 +760,7 @@ async fn respond(request: Request, session: &Session) -> Response {
             })
             .await;
             if matches!(response, Response::Ok { .. }) {
-                session.remember(&name, false);
+                session.remember(&name, false).await;
             }
             response
         }
