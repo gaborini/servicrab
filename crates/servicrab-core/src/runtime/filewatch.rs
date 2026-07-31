@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use tokio::sync::oneshot;
@@ -86,6 +87,9 @@ impl Scan {
 /// mid-scan is a change, not an error, and the next scan will notice it.  So is
 /// a subtree deeper than [`MAX_DEPTH`], which sets [`Scan::too_deep`] instead of
 /// risking a stack overflow.
+///
+/// This is blocking work — up to [`MAX_ENTRIES`] `symlink_metadata` calls plus a
+/// `read_dir` per directory — so async callers go through [`scan_off_thread`].
 pub fn scan(settings: &WatchSettings) -> Scan {
     let mut out = Scan::default();
     for root in &settings.paths {
@@ -95,6 +99,25 @@ pub fn scan(settings: &WatchSettings) -> Scan {
         }
     }
     out
+}
+
+/// [`scan`], moved onto a blocking thread.
+///
+/// A scan can stall for a long time on a slow, full or network-backed file
+/// system, and the watcher shares its worker threads with the supervisor: a
+/// scan on an async worker is a worker not driving child `wait()`s, health
+/// probes or the control channel.
+///
+/// The scan is a pure function of the file system, so a cancelled caller can
+/// simply abandon it; the detached thread finishes and throws its result away.
+/// `None` means the blocking pool is gone — the runtime is shutting down — and
+/// is deliberately not reported as "every file disappeared", which would ask
+/// for a restart on the way out.
+async fn scan_off_thread(settings: &Arc<WatchSettings>) -> Option<Scan> {
+    let settings = Arc::clone(settings);
+    tokio::task::spawn_blocking(move || scan(&settings))
+        .await
+        .ok()
 }
 
 fn walk(root: &Path, path: &Path, depth: usize, settings: &WatchSettings, out: &mut Scan) {
@@ -158,13 +181,21 @@ fn walk(root: &Path, path: &Path, depth: usize, settings: &WatchSettings, out: &
 /// the restart, so a `cargo build` writing a hundred files causes one restart
 /// rather than a hundred.  It waits for quiet at most [`MAX_DEBOUNCE_ROUNDS`]
 /// times: a tree that never settles must still get its restart.
+///
+/// Every scan runs on a blocking thread; the loop itself only sleeps and talks
+/// to channels.
 pub async fn watch_service(
     service: ServiceName,
     settings: WatchSettings,
     control: ControlTx,
     events: EventSender,
 ) {
-    let mut previous = scan(&settings);
+    // Shared with each blocking scan rather than cloned for it.
+    let settings = Arc::new(settings);
+
+    let Some(mut previous) = scan_off_thread(&settings).await else {
+        return;
+    };
     if previous.truncated {
         let _ = events.send(ServiceEvent::new(
             service.clone(),
@@ -175,7 +206,9 @@ pub async fn watch_service(
     loop {
         tokio::time::sleep(settings.interval).await;
 
-        let mut current = scan(&settings);
+        let Some(mut current) = scan_off_thread(&settings).await else {
+            return;
+        };
         let mut changed = previous.changes(&current);
         if changed.is_empty() {
             continue;
@@ -187,7 +220,9 @@ pub async fn watch_service(
         // keep the loop here forever and the restart would never be requested.
         for round in 0..MAX_DEBOUNCE_ROUNDS {
             tokio::time::sleep(settings.debounce).await;
-            let settled = scan(&settings);
+            let Some(settled) = scan_off_thread(&settings).await else {
+                return;
+            };
             let extra = current.changes(&settled);
             current = settled;
             if extra.is_empty() {
@@ -241,7 +276,10 @@ pub async fn watch_service(
 
         // A restart rewrites files itself (pid files, sockets); re-scan so the
         // next comparison starts from the post-restart state.
-        previous = scan(&settings);
+        let Some(next) = scan_off_thread(&settings).await else {
+            return;
+        };
+        previous = next;
     }
 }
 
@@ -462,5 +500,53 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let s = scan(&settings(&dir.path().join("nope"), &[]));
         assert!(s.files.is_empty());
+    }
+
+    #[test]
+    fn a_scan_goes_through_the_blocking_pool_rather_than_the_worker() {
+        // Deterministic rather than timing-based: with room for exactly one
+        // blocking thread, an occupied pool must hold the scan up.  A scan that
+        // ran inline on the async worker would finish regardless, so the timeout
+        // below is the assertion.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        let settings = Arc::new(settings(dir.path(), &[]));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async move {
+            let (release, blocked) = std::sync::mpsc::channel::<()>();
+            let occupied = tokio::task::spawn_blocking(move || {
+                let _ = blocked.recv();
+            });
+            // Make sure the pool's one thread is actually taken before timing
+            // anything: `spawn_blocking` only queues.
+            tokio::task::yield_now().await;
+
+            let held_up = tokio::time::timeout(
+                Duration::from_millis(200),
+                scan_off_thread(&Arc::clone(&settings)),
+            )
+            .await;
+            assert!(
+                held_up.is_err(),
+                "the scan did not wait for the blocking pool, so it ran on the worker"
+            );
+
+            drop(release);
+            occupied.await.unwrap();
+            let scanned = tokio::time::timeout(
+                Duration::from_secs(5),
+                scan_off_thread(&Arc::clone(&settings)),
+            )
+            .await
+            .expect("the scan runs once the pool is free")
+            .expect("the pool is up");
+            assert_eq!(scanned.files.len(), 1);
+        });
     }
 }
