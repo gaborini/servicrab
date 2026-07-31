@@ -30,7 +30,11 @@ jobs:
   meta:
     name: Resolve the tag and gate on the manifest
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      # Reading CI's verdict for the tagged commit needs the runs API.
+      actions: read
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       version: ${{ steps.resolve.outputs.version }}
@@ -82,6 +86,64 @@ jobs:
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "Releasing ${TAG}; the workspace version is ${manifest}."
+
+      # Nothing in this pipeline used to run a test: it built, asked the binary
+      # for its version, and published.  Pushing a tag on a red commit shipped
+      # it.
+      #
+      # Of the two ways to close that, this one demands CI's verdict for the
+      # exact commit the tag points at, rather than re-running the suite here.
+      # CI is five jobs — fmt, clippy and the suite on Linux and macOS, the MSRV
+      # check, the Windows stubs and `cargo package` — and re-running a subset of
+      # that in the release path would be a weaker check wearing the same badge.
+      # It is also the procedure the release notes already describe: push, wait
+      # for CI, then tag.  This step only makes the machine insist on it.
+      #
+      # The cost is that the verdict is only as good as CI's coverage of that
+      # tree, which is the same trust the branch protection on `main` already
+      # rests on.  A tag on a commit CI never saw is refused outright.
+      - name: Require CI to be green for the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+
+          # A tag pushed straight after the commit races CI rather than
+          # following it, and that is a wait, not a failure.  Bounded, so a
+          # never-scheduled run still ends the job instead of hanging on it.
+          deadline=$(( $(date +%s) + 900 ))
+          while :; do
+            runs=$(gh api \
+              "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${sha}&per_page=100" \
+              --jq '[.workflow_runs[] | {status, conclusion}]')
+            total=$(printf '%s' "$runs" | jq 'length')
+            green=$(printf '%s' "$runs" | jq '[.[] | select(.conclusion == "success")] | length')
+            # A re-run that failed counts: "green once, red later" is red.
+            red=$(printf '%s' "$runs" | jq '[.[] | select(.status == "completed" and .conclusion != "success")] | length')
+            pending=$(printf '%s' "$runs" | jq '[.[] | select(.status != "completed")] | length')
+
+            if [ "$red" -gt 0 ]; then
+              echo "::error::CI completed without succeeding for ${sha}, the commit ${TAG} points at; a tag is not a way to ship a red commit."
+              exit 1
+            fi
+            if [ "$green" -gt 0 ] && [ "$pending" -eq 0 ]; then
+              echo "CI is green for ${sha} (${green} run(s))."
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              if [ "$total" -eq 0 ]; then
+                echo "::error::no CI run exists for ${sha}. Push the commit and let CI finish before tagging it."
+              else
+                echo "::error::CI for ${sha} was still running when the wait ran out; ${pending} run(s) unfinished."
+              fi
+              exit 1
+            fi
+            echo "Waiting for CI on ${sha}: ${total} run(s), ${green} green, ${pending} unfinished."
+            sleep 30
+          done
 
   build:
     name: ${{ matrix.target }}
@@ -199,6 +261,11 @@ jobs:
           if [ -z "${notes//[[:space:]]/}" ]; then
             notes="See CHANGELOG.md."
           fi
+          # --verify-tag: the tag has to already exist.  Without it a typo in a
+          # dispatched tag name makes gh create that tag itself, off the default
+          # branch — a release whose assets came from one commit and whose tag
+          # names another.
           gh release create "$TAG" dist/* \
+            --verify-tag \
             --title "$TAG" \
             --notes "$notes"
