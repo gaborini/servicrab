@@ -251,6 +251,33 @@ pub fn validate_raw(
                     });
                 }
             }
+
+            // Not one of the fields above, because the setting is not inert:
+            // an unhealthy service still gets stopped, it just never comes
+            // back.  Only an explicit `restart` is warned about — the default
+            // covers the legitimate case of a health check used purely to gate
+            // dependents, where nothing is meant to be restarted.
+            let asks_for_restart = raw_svc
+                .health
+                .as_ref()
+                .is_some_and(|health| health.on_unhealthy.as_deref() == Some("restart"));
+            if asks_for_restart {
+                warnings.push(ConfigWarning::UnhealthyRestartWithoutPolicy {
+                    service: raw_name.clone(),
+                });
+            }
+        }
+
+        // Warning: a service that asks to be logged in a project that has no
+        // log directory.  `log_to_file` above is computed either way, but
+        // `LogRouter` is only built when `[project.logs]` exists, so the
+        // request is silently inert.  The raw table is what is checked, not the
+        // validated one, so a broken `[project.logs]` reports its own error
+        // instead of also producing this warning.
+        if raw.project.logs.is_none() && raw_svc.logs.as_ref().is_some_and(|logs| logs.enabled) {
+            warnings.push(ConfigWarning::LogsWithoutProjectLogs {
+                service: raw_name.clone(),
+            });
         }
 
         // Warning: executable not in PATH
@@ -2570,6 +2597,129 @@ max_restarts = 5
                 }
             )),
             "expected max_restarts warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn service_logs_warn_without_a_project_logs_table() {
+        let toml = r#"
+version = 1
+[project]
+name = "p"
+[services.s]
+command = ["echo"]
+[services.s.logs]
+enabled = true
+"#;
+        let (_, warnings) = load_from_str(toml).unwrap();
+        let warning = warnings
+            .iter()
+            .find(|w| matches!(w, ConfigWarning::LogsWithoutProjectLogs { .. }))
+            .unwrap_or_else(|| panic!("expected a logs warning, got: {warnings:?}"));
+        let msg = warning.to_string();
+        assert!(msg.contains("\"s\""), "{msg}");
+        assert!(msg.contains("[project.logs]"), "{msg}");
+    }
+
+    #[test]
+    fn service_logs_are_silent_when_the_project_declares_a_log_directory() {
+        let (_, warnings) = load_from_str(&with_logs("", "[services.api.logs]\nenabled = true"))
+            .expect("valid config");
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| matches!(w, ConfigWarning::LogsWithoutProjectLogs { .. })),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn disabled_service_logs_do_not_warn() {
+        // `enabled = false` is inert in exactly the same way, but it says the
+        // same thing the missing table does, so there is nothing to point out.
+        let toml = r#"
+version = 1
+[project]
+name = "p"
+[services.s]
+command = ["echo"]
+[services.s.logs]
+enabled = false
+"#;
+        let (_, warnings) = load_from_str(toml).unwrap();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| matches!(w, ConfigWarning::LogsWithoutProjectLogs { .. })),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn on_unhealthy_restart_warns_when_restart_never() {
+        let toml = r#"
+version = 1
+[project]
+name = "p"
+[services.s]
+command = ["echo"]
+restart = "never"
+[services.s.health]
+tcp = "127.0.0.1:5432"
+on_unhealthy = "restart"
+"#;
+        let (_, warnings) = load_from_str(toml).unwrap();
+        let warning = warnings
+            .iter()
+            .find(|w| matches!(w, ConfigWarning::UnhealthyRestartWithoutPolicy { .. }))
+            .unwrap_or_else(|| panic!("expected an on_unhealthy warning, got: {warnings:?}"));
+        let msg = warning.to_string();
+        assert!(msg.contains("\"s\""), "{msg}");
+        assert!(msg.contains("on_unhealthy"), "{msg}");
+    }
+
+    #[test]
+    fn on_unhealthy_restart_is_silent_with_a_restart_policy() {
+        let toml = r#"
+version = 1
+[project]
+name = "p"
+[services.s]
+command = ["echo"]
+restart = "on-failure"
+[services.s.health]
+tcp = "127.0.0.1:5432"
+on_unhealthy = "restart"
+"#;
+        let (_, warnings) = load_from_str(toml).unwrap();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| matches!(w, ConfigWarning::UnhealthyRestartWithoutPolicy { .. })),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_health_check_used_only_for_gating_does_not_warn() {
+        // No explicit `on_unhealthy`, so this is the readiness-gating case:
+        // `restart = "never"` is the intended configuration, not a trap.
+        let toml = r#"
+version = 1
+[project]
+name = "p"
+[services.s]
+command = ["echo"]
+restart = "never"
+[services.s.health]
+tcp = "127.0.0.1:5432"
+"#;
+        let (_, warnings) = load_from_str(toml).unwrap();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| matches!(w, ConfigWarning::UnhealthyRestartWithoutPolicy { .. })),
+            "{warnings:?}"
         );
     }
 

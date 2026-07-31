@@ -316,6 +316,14 @@ pub enum ConfigWarning {
         service: String,
         field: &'static str,
     },
+
+    /// A service asked for file logging but the project never declared where
+    /// log files go, so nothing is written.
+    LogsWithoutProjectLogs { service: String },
+
+    /// `on_unhealthy = "restart"` was combined with `restart = "never"`, so an
+    /// unhealthy service is stopped and never comes back.
+    UnhealthyRestartWithoutPolicy { service: String },
 }
 
 impl std::fmt::Display for ConfigWarning {
@@ -334,6 +342,18 @@ impl std::fmt::Display for ConfigWarning {
                 write!(
                     f,
                     "service {service:?}: field `{field}` has no effect when restart = \"never\""
+                )
+            }
+            ConfigWarning::LogsWithoutProjectLogs { service } => {
+                write!(
+                    f,
+                    "service {service:?}: [logs] enabled has no effect without a [project.logs] table, so no output is written to a file"
+                )
+            }
+            ConfigWarning::UnhealthyRestartWithoutPolicy { service } => {
+                write!(
+                    f,
+                    "service {service:?}: [health] on_unhealthy = \"restart\" only stops the service when restart = \"never\"; use on-failure, always or unless-stopped to bring it back"
                 )
             }
         }
