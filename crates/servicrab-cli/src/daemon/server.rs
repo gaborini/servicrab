@@ -288,7 +288,12 @@ pub fn serve(
     // Bound before the runtime exists: the umask that keeps the socket private
     // is process-global, so no other thread may be creating files while it is
     // in effect.
-    let bound = bind_socket(&paths.socket)?;
+    let bound = bind_socket(&paths.socket).map_err(|problem| {
+        // A path too long to bind is the one failure whose cause is not in the
+        // message: it means every private directory we could have moved the
+        // socket to was refused, and only the rejections say which and why.
+        format!("{problem}{}", paths.socket_advice())
+    })?;
 
     let registry = Arc::new(Mutex::new(StatusRegistry::new(plan.iter().map(|name| {
         let has_health = cfg

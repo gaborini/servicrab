@@ -460,6 +460,23 @@ mod imp {
                         "no daemon is running for {} — start one with `servicrab start`",
                         cfg.project.name
                     );
+                    // Nothing else would lead them to a relocated socket, and
+                    // "not running" is exactly the moment someone starts
+                    // looking for one.  Said only when it is somewhere
+                    // surprising, so the ordinary output does not change.
+                    if !paths.socket_is_in_place() {
+                        println!(
+                            "{}",
+                            style::paint(
+                                style::color_enabled(),
+                                DIM,
+                                &format!(
+                                    "  its socket would be {} (the project's path is too long to hold one)",
+                                    paths.socket.display()
+                                )
+                            )
+                        );
+                    }
                 }
                 return Ok(1);
             }
