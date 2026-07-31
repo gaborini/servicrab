@@ -17,6 +17,8 @@ use servicrab_core::{
 const EXIT_SIGINT: i32 = 130;
 /// Exit code used when the supervisor itself was terminated (`128 + SIGTERM`).
 const EXIT_SIGTERM: i32 = 143;
+/// Exit code used when the controlling terminal went away (`128 + SIGHUP`).
+const EXIT_SIGHUP: i32 = 129;
 
 /// Run the `run` subcommand, returning the process exit code to use.
 pub fn run(service: &str, config: Option<&Path>, no_restart: bool) -> Result<i32, String> {
@@ -131,6 +133,7 @@ fn exit_code(outcome: RunOutcome) -> i32 {
         RunOutcome::Stopped { reason } => match reason {
             ShutdownReason::UserInterrupt => EXIT_SIGINT,
             ShutdownReason::Terminated => EXIT_SIGTERM,
+            ShutdownReason::HangUp => EXIT_SIGHUP,
             // `run` supervises a single service with no daemon around it, so
             // nobody can ask for a targeted stop; treat it as a clean one.
             ShutdownReason::Requested => 0,
@@ -187,6 +190,12 @@ mod tests {
                 reason: ShutdownReason::Terminated
             }),
             143
+        );
+        assert_eq!(
+            exit_code(RunOutcome::Stopped {
+                reason: ShutdownReason::HangUp
+            }),
+            129
         );
         assert_eq!(
             exit_code(RunOutcome::Stopped {

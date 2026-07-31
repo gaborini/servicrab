@@ -25,6 +25,8 @@ use crate::style::{self, BOLD, DIM, RESET, SERVICE_COLORS};
 const EXIT_SIGINT: i32 = 130;
 /// Exit code used when the supervisor itself was terminated (`128 + SIGTERM`).
 const EXIT_SIGTERM: i32 = 143;
+/// Exit code used when the controlling terminal went away (`128 + SIGHUP`).
+const EXIT_SIGHUP: i32 = 129;
 
 /// Command-line options for `up`.
 #[derive(Debug, Clone, Copy, Default)]
@@ -134,6 +136,7 @@ pub fn run(
     Ok(match outcome.shutdown {
         Some(ShutdownReason::UserInterrupt) => EXIT_SIGINT,
         Some(ShutdownReason::Terminated) => EXIT_SIGTERM,
+        Some(ShutdownReason::HangUp) => EXIT_SIGHUP,
         Some(_) => 1,
         None => 0,
     })

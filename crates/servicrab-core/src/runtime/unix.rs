@@ -261,11 +261,16 @@ async fn next_unhealthy(health: &mut Option<mpsc::UnboundedReceiver<HealthSignal
     }
 }
 
-/// SIGINT/SIGTERM handling for the current process.
+/// SIGINT/SIGTERM/SIGHUP handling for the current process.
 ///
 /// The watcher forwards every signal it sees into a shutdown channel so that
 /// one or many [`ServiceRunner`]s can react to it.  A second signal is
 /// forwarded as well, which the runners interpret as "stop waiting, kill now".
+///
+/// SIGHUP has to be registered explicitly: its default disposition kills the
+/// supervisor outright, and every service's process group would then be left
+/// running — which is exactly what closing a terminal on a foreground `up`
+/// does.
 #[derive(Debug)]
 pub struct SignalWatcher {
     tx: ShutdownTx,
@@ -273,7 +278,7 @@ pub struct SignalWatcher {
 }
 
 impl SignalWatcher {
-    /// Install SIGINT and SIGTERM handlers.
+    /// Install SIGINT, SIGTERM and SIGHUP handlers.
     ///
     /// `label` only gives signal-registration errors a useful subject: a
     /// service name for `run`, the project name for `up`.
@@ -292,6 +297,13 @@ impl SignalWatcher {
                 source,
             }
         })?;
+        let mut sighup = signal(SignalKind::hangup()).map_err(|source| {
+            RuntimeError::SignalRegistrationFailed {
+                service: label.to_string(),
+                signal: "SIGHUP",
+                source,
+            }
+        })?;
 
         let (tx, _rx) = shutdown_channel();
         let sender = tx.clone();
@@ -300,6 +312,7 @@ impl SignalWatcher {
                 let reason = tokio::select! {
                     _ = sigint.recv() => ShutdownReason::UserInterrupt,
                     _ = sigterm.recv() => ShutdownReason::Terminated,
+                    _ = sighup.recv() => ShutdownReason::HangUp,
                 };
                 // `send` fails only when every receiver is gone, in which case
                 // there is nothing left to shut down.
