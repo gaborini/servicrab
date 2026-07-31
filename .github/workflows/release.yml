@@ -38,6 +38,7 @@ jobs:
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       version: ${{ steps.resolve.outputs.version }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -85,7 +86,23 @@ jobs:
 
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "Releasing ${TAG}; the workspace version is ${manifest}."
+
+          # The trigger is `tags: ["v*"]`, so a `v1.0.0-rc1` tag runs this
+          # workflow just like a final one — and `gh release create` passed
+          # neither `--prerelease` nor `--latest=false`, so the release candidate
+          # would have become the "latest" release.  The install snippet in the
+          # README resolves `releases/latest`, so everyone following the
+          # documented install would have been handed a release candidate.
+          #
+          # Anything after the patch level is a prerelease, which is the semver
+          # rule and matches the `v<semver>` shape checked above.
+          case "$version" in
+            *-*) prerelease=true ;;
+            *)   prerelease=false ;;
+          esac
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+
+          echo "Releasing ${TAG}; the workspace version is ${manifest}; prerelease=${prerelease}."
 
       # Nothing in this pipeline used to run a test: it built, asked the binary
       # for its version, and published.  Pushing a tag on a red commit shipped
@@ -294,6 +311,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.meta.outputs.tag }}
           VERSION: ${{ needs.meta.outputs.version }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
         run: |
           set -euo pipefail
           notes=$(awk -v tag="${VERSION}" '
@@ -304,6 +322,20 @@ jobs:
           if [ -z "${notes//[[:space:]]/}" ]; then
             notes="See CHANGELOG.md."
           fi
+
+          # `--latest` is stated in both directions rather than left to gh, which
+          # decides it "automatically based on date and version": a release cut
+          # today for an older maintenance branch would otherwise claim to be the
+          # latest.  On a prerelease, `--latest=false` is what actually keeps the
+          # README's `releases/latest` install pointing at the last final
+          # release; `--prerelease` alone only labels it in the UI.
+          flags=()
+          if [ "$PRERELEASE" = "true" ]; then
+            flags+=(--prerelease --latest=false)
+          else
+            flags+=(--latest)
+          fi
+
           # --verify-tag: the tag has to already exist.  Without it a typo in a
           # dispatched tag name makes gh create that tag itself, off the default
           # branch — a release whose assets came from one commit and whose tag
@@ -311,4 +343,5 @@ jobs:
           gh release create "$TAG" dist/* \
             --verify-tag \
             --title "$TAG" \
-            --notes "$notes"
+            --notes "$notes" \
+            "${flags[@]}"
