@@ -22,6 +22,24 @@ use crate::runtime::stack::{Control, ControlTx};
 /// cannot pin a core.
 const MAX_ENTRIES: usize = 20_000;
 
+/// Stop descending after this many directory levels.
+///
+/// [`MAX_ENTRIES`] bounds the number of *files*, not the depth, and [`walk`] is
+/// recursive: a pathologically deep tree would overflow the stack, which aborts
+/// the whole supervisor rather than failing a scan.  Sixty-four levels is far
+/// beyond any real source tree.
+const MAX_DEPTH: usize = 64;
+
+/// How many times the debounce loop may re-scan before it gives up on waiting
+/// for quiet.
+///
+/// Any file that changes faster than `debounce` — a log inside the watched
+/// tree, a build directory — keeps the tree from ever settling.  Without a cap
+/// the loop re-scans forever, `changed` grows without bound, and the restart the
+/// watcher exists to request is never made.  The pending change is not lost:
+/// hitting the cap simply forces the restart out now.
+const MAX_DEBOUNCE_ROUNDS: usize = 10;
+
 /// What a single scan recorded about one file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileStamp {
@@ -38,6 +56,8 @@ pub struct Scan {
     pub files: BTreeMap<PathBuf, FileStamp>,
     /// Whether the scan hit [`MAX_ENTRIES`] and stopped early.
     pub truncated: bool,
+    /// Whether the scan hit [`MAX_DEPTH`] and left a subtree unvisited.
+    pub too_deep: bool,
 }
 
 impl Scan {
@@ -63,11 +83,13 @@ impl Scan {
 /// Walk the configured paths and record a stamp for every file.
 ///
 /// Unreadable entries are skipped rather than reported: a file that vanishes
-/// mid-scan is a change, not an error, and the next scan will notice it.
+/// mid-scan is a change, not an error, and the next scan will notice it.  So is
+/// a subtree deeper than [`MAX_DEPTH`], which sets [`Scan::too_deep`] instead of
+/// risking a stack overflow.
 pub fn scan(settings: &WatchSettings) -> Scan {
     let mut out = Scan::default();
     for root in &settings.paths {
-        walk(root, root, settings, &mut out);
+        walk(root, root, 0, settings, &mut out);
         if out.truncated {
             break;
         }
@@ -75,7 +97,7 @@ pub fn scan(settings: &WatchSettings) -> Scan {
     out
 }
 
-fn walk(root: &Path, path: &Path, settings: &WatchSettings, out: &mut Scan) {
+fn walk(root: &Path, path: &Path, depth: usize, settings: &WatchSettings, out: &mut Scan) {
     if out.files.len() >= MAX_ENTRIES {
         out.truncated = true;
         return;
@@ -95,13 +117,25 @@ fn walk(root: &Path, path: &Path, settings: &WatchSettings, out: &mut Scan) {
     };
 
     if meta.is_dir() {
+        // Recursion is bounded here rather than by [`MAX_ENTRIES`]: a deep tree
+        // holding few files would still exhaust the stack, and a stack overflow
+        // is an abort the supervisor cannot catch.
+        if depth >= MAX_DEPTH {
+            out.too_deep = true;
+            tracing::warn!(
+                path = %path.display(),
+                limit = MAX_DEPTH,
+                "not descending any further into the watched tree"
+            );
+            return;
+        }
         let Ok(entries) = std::fs::read_dir(path) else {
             return;
         };
         let mut children: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
         children.sort();
         for child in children {
-            walk(root, &child, settings, out);
+            walk(root, &child, depth + 1, settings, out);
             if out.truncated {
                 return;
             }
@@ -122,7 +156,8 @@ fn walk(root: &Path, path: &Path, settings: &WatchSettings, out: &mut Scan) {
 ///
 /// After a change the watcher waits for `debounce` of quiet before asking for
 /// the restart, so a `cargo build` writing a hundred files causes one restart
-/// rather than a hundred.
+/// rather than a hundred.  It waits for quiet at most [`MAX_DEBOUNCE_ROUNDS`]
+/// times: a tree that never settles must still get its restart.
 pub async fn watch_service(
     service: ServiceName,
     settings: WatchSettings,
@@ -146,8 +181,11 @@ pub async fn watch_service(
             continue;
         }
 
-        // Wait for the tree to settle before acting on the first change.
-        loop {
+        // Wait for the tree to settle before acting on the first change — but
+        // only for a bounded number of rounds.  A file that changes faster than
+        // `debounce` (a log inside the tree, a build directory) would otherwise
+        // keep the loop here forever and the restart would never be requested.
+        for round in 0..MAX_DEBOUNCE_ROUNDS {
             tokio::time::sleep(settings.debounce).await;
             let settled = scan(&settings);
             let extra = current.changes(&settled);
@@ -156,6 +194,13 @@ pub async fn watch_service(
                 break;
             }
             changed.extend(extra);
+            if round + 1 == MAX_DEBOUNCE_ROUNDS {
+                tracing::warn!(
+                    service = %service,
+                    rounds = MAX_DEBOUNCE_ROUNDS,
+                    "the watched tree is still changing; restarting anyway"
+                );
+            }
         }
 
         changed.sort();
@@ -367,6 +412,49 @@ mod tests {
         });
         assert_eq!(s.files.len(), 1);
         assert!(s.files.contains_key(&file));
+    }
+
+    #[test]
+    fn a_tree_deeper_than_the_limit_is_reported_rather_than_overflowing_the_stack() {
+        // `MAX_ENTRIES` bounds files, not depth, and `walk` is recursive: a deep
+        // tree would abort the supervisor with a stack overflow.
+        let dir = TempDir::new().unwrap();
+        let mut deep = dir.path().to_path_buf();
+        for i in 0..(MAX_DEPTH + 5) {
+            deep = deep.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("buried.txt"), "x").unwrap();
+        std::fs::write(dir.path().join("shallow.txt"), "y").unwrap();
+
+        let s = scan(&settings(dir.path(), &[]));
+        assert!(s.too_deep, "the depth limit should be reported");
+        // What is reachable is still recorded, so the watcher keeps working.
+        assert!(
+            s.files.keys().any(|p| p.ends_with("shallow.txt")),
+            "{:?}",
+            s.files.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !s.files.keys().any(|p| p.ends_with("buried.txt")),
+            "the file below the limit should not have been visited"
+        );
+    }
+
+    #[test]
+    fn a_tree_within_the_depth_limit_is_scanned_whole() {
+        let dir = TempDir::new().unwrap();
+        let mut deep = dir.path().to_path_buf();
+        // The root itself is depth 0, so `MAX_DEPTH` levels of directories fit.
+        for i in 0..(MAX_DEPTH - 1) {
+            deep = deep.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("reachable.txt"), "x").unwrap();
+
+        let s = scan(&settings(dir.path(), &[]));
+        assert!(!s.too_deep, "a normal tree must not trip the limit");
+        assert_eq!(s.files.len(), 1);
     }
 
     #[test]

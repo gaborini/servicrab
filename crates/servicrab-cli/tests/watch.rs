@@ -10,6 +10,8 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nix::sys::signal::{kill, Signal};
@@ -239,6 +241,49 @@ fn up_also_restarts_on_a_watched_change() {
 }
 
 // ── entry checks ───────────────────────────────────────────────────────────
+
+#[test]
+fn a_tree_that_never_settles_still_gets_its_restart() {
+    // A file changing faster than the debounce window keeps the tree from ever
+    // being quiet.  Without a cap on the settle loop the watcher re-scans
+    // forever and the restart it exists to request is never made.
+    let dir = TempDir::new().unwrap();
+    let cfg = project(
+        dir.path(),
+        "paths = [\"src\"]\ninterval = \"200ms\"\ndebounce = \"100ms\"",
+    );
+    let starts_log = dir.path().join("starts.log");
+
+    let child = spawn("watch", &cfg);
+    wait_for_starts(&starts_log, 1);
+
+    // A writer that keeps a file in the watched tree changing throughout.
+    let noisy = dir.path().join("src/noisy.txt");
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut n = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                n += 1;
+                // Growing content, so the change is visible even to a
+                // second-granularity mtime.
+                let _ = fs::write(&noisy, "x".repeat(n as usize % 4096 + 1));
+                std::thread::sleep(Duration::from_millis(40));
+            }
+        })
+    };
+
+    // The verdict comes from the service actually starting again, within the
+    // file's own bounded wait.
+    let result = std::panic::catch_unwind(|| wait_for_starts(&starts_log, 2));
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    let stderr = interrupt(child);
+    result.unwrap_or_else(|_| {
+        panic!("the watcher never requested a restart; supervisor said: {stderr}")
+    });
+}
 
 #[test]
 fn watch_refuses_to_start_when_nothing_is_watched() {
