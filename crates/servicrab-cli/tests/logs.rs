@@ -436,7 +436,10 @@ fn every_line_reaches_the_file_across_a_graceful_stop() {
     // lines that were still buffered when the stack was asked to stop.  They
     // have to be on disk by the time the process exits, in order, with nothing
     // missing in between.
-    const LINES: usize = 2_000;
+    // Fewer than the event channel's log-line allowance, so nothing is dropped
+    // and the batched flush is what the test is about; far more than one flush
+    // batch, so the tail really is still buffered when the stop arrives.
+    const LINES: usize = 900;
 
     let dir = TempDir::new().unwrap();
     let done = dir.path().join("printed");
@@ -444,7 +447,7 @@ fn every_line_reaches_the_file_across_a_graceful_stop() {
         dir.path(),
         "chatty.sh",
         &format!(
-            "i=1\nwhile [ $i -le {LINES} ]; do echo \"line $i\"; i=$((i+1)); done\necho printed > {}\nsleep 30",
+            "awk 'BEGIN{{for (i = 1; i <= {LINES}; i++) print \"line \" i}}'\necho printed > {}\nsleep 30",
             done.display()
         ),
     );
@@ -468,11 +471,22 @@ restart = "never"
     );
 
     let mut stack = spawn(&["up"], &cfg);
+    // Keep reading the terminal output, so the renderer never stalls on a full
+    // pipe: what is being tested here is the batched flush, not the drop policy
+    // that a stalled consumer would trigger.
+    let terminal = stack.stdout.take().expect("stdout");
+    let drain = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut sink = Vec::new();
+        let _ = std::io::BufReader::new(terminal).read_to_end(&mut sink);
+    });
+
     // The script is done printing, so every line is either in the pipe, in the
     // queue or already written — a stop from here must lose none of them.
     wait_for_file(&done);
     interrupt(&stack);
     wait_bounded(&mut stack);
+    drain.join().expect("drain thread");
 
     let written = fs::read_to_string(dir.path().join("logs/api.log")).unwrap();
     let seen: Vec<&str> = written.lines().collect();

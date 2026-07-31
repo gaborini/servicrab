@@ -153,7 +153,7 @@ async fn render(mut events: EventReceiver, printer: Printer, logs: Option<LogRou
 
     while let Some(event) = events.recv().await {
         if let (Some(sink), EventKind::Log { line, .. }) = (sink.as_ref(), &event.kind) {
-            if let Some(problem) = sink.record(&event.service, line).await {
+            if let Some(problem) = sink.record(&event.service, line) {
                 printer.warn(&problem);
             }
         }

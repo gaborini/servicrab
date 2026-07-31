@@ -17,11 +17,16 @@
 //! full, at least every [`FLUSH_EVERY_LINES`] lines.  Nothing is left in the
 //! buffer when the writer stops: it flushes when the queue ends and again when the
 //! file is dropped.
+//!
+//! Handing a line over never waits.  A file system that cannot keep up with a
+//! service's output at all costs log lines, loudly, rather than costing the
+//! supervisor its responsiveness.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
@@ -37,11 +42,12 @@ const FLUSH_EVERY_LINES: usize = 256;
 
 /// How many lines may wait for the blocking writer.
 ///
-/// The queue is bounded so a stalled disk cannot grow the supervisor's heap.
-/// Reaching the bound makes [`LogSink::record`] wait, which is back-pressure
-/// rather than loss: the drop policy lives one stage upstream, on the event
-/// channel, where the loss can be reported as an event.
-const QUEUE_CAPACITY: usize = 512;
+/// Reaching this bound means the file system is not keeping up with a service's
+/// output at all, and the line is dropped rather than made to wait: the callers
+/// of [`LogSink::record`] are the pumps that also keep the status registry
+/// current and feed the event stream, so making *them* wait for the disk is the
+/// very thing this module exists to avoid.
+const QUEUE_CAPACITY: usize = 4096;
 
 /// A rotating, append-only log file for one service.
 #[derive(Debug)]
@@ -280,11 +286,18 @@ struct Entry {
 /// writing files themselves, so a slow disk delays the log rather than the
 /// runtime.  Ordering per service is preserved: one queue, one writer, first in
 /// first out.
+///
+/// [`LogSink::record`] never waits.  If the writer falls [`QUEUE_CAPACITY`]
+/// lines behind, the line is dropped and said to be dropped: a supervisor that
+/// stops answering its control channel because a log file is slow is worse than
+/// a log with a hole in it.
 #[derive(Debug)]
 pub struct LogSink {
     entries: mpsc::Sender<Entry>,
     writer: tokio::task::JoinHandle<()>,
     problem: Arc<Mutex<Option<String>>>,
+    /// Lines the writer was too far behind to accept.
+    dropped: AtomicU64,
 }
 
 impl LogSink {
@@ -302,23 +315,37 @@ impl LogSink {
             entries,
             writer,
             problem,
+            dropped: AtomicU64::new(0),
         }
     }
 
-    /// Hand one line to the writer, waiting when the writer is behind.
+    /// Hand one line to the writer, dropping it if the writer is too far behind.
     ///
-    /// Returns a problem the writer ran into, the first time it happened.  The
-    /// report is necessarily one-sided in time: the writer is asynchronous now,
-    /// so the failure surfaces on a later call rather than on the one that
-    /// caused it.
-    pub async fn record(&self, service: &ServiceName, line: &str) -> Option<String> {
+    /// Returns something worth telling the operator: the first failure the
+    /// writer ran into, or how far behind it has fallen.  The report is
+    /// necessarily one-sided in time — the writer is asynchronous now, so a
+    /// failure surfaces on a later call rather than on the one that caused it.
+    pub fn record(&self, service: &ServiceName, line: &str) -> Option<String> {
         let entry = Entry {
             service: service.clone(),
             line: line.to_string(),
         };
-        // A closed queue means the writer task is gone, which only happens when
-        // the runtime is shutting down; the line is not worth a diagnostic.
-        let _ = self.entries.send(entry).await;
+        match self.entries.try_send(entry) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let dropped = self.dropped.fetch_add(1, Ordering::AcqRel) + 1;
+                // The first one, then one report per queue's worth: a disk that
+                // stays stuck must not turn into its own flood of warnings.
+                if dropped == 1 || dropped % QUEUE_CAPACITY as u64 == 0 {
+                    return Some(format!(
+                        "the log writer cannot keep up; dropped {dropped} line(s) so far"
+                    ));
+                }
+            }
+            // A closed queue means the writer task is gone, which only happens
+            // when the runtime is shutting down; not worth a diagnostic.
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
         self.take_problem()
     }
 
@@ -328,6 +355,7 @@ impl LogSink {
             entries,
             writer,
             problem,
+            ..
         } = self;
         drop(entries);
         // The writer drains what is queued, flushes, and returns; it never
@@ -643,17 +671,61 @@ mod tests {
             BTreeSet::new(),
         ));
 
-        // More lines than the queue holds, so the handover has to wait at least
-        // once and the writer has to flush more than one batch.
-        let total = QUEUE_CAPACITY * 3;
+        // Fewer lines than the queue holds, so nothing is dropped and the whole
+        // batch has to be on disk once the sink is shut down.
+        let total = QUEUE_CAPACITY / 2;
         for i in 0..total {
-            sink.record(&name, &format!("line {i}")).await;
+            sink.record(&name, &format!("line {i}"));
         }
         assert!(sink.shutdown().await.is_none());
 
         let contents = fs::read_to_string(dir.path().join("api.log")).unwrap();
         let expected: Vec<String> = (0..total).map(|i| format!("line {i}")).collect();
         assert_eq!(contents.lines().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn handing_a_line_over_never_waits_for_the_writer() {
+        // The whole point of the sink: the caller is an async pump that also
+        // drives the status registry and the event stream, so it must never be
+        // made to wait for a file system.  With the blocking pool's one thread
+        // occupied the writer cannot run at all, and `record` still has to
+        // return.
+        let dir = TempDir::new().unwrap();
+        let name = service("api");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async move {
+            let (release, blocked) = std::sync::mpsc::channel::<()>();
+            let occupied = tokio::task::spawn_blocking(move || {
+                let _ = blocked.recv();
+            });
+            tokio::task::yield_now().await;
+
+            let sink = LogSink::spawn(LogRouter::new(
+                settings(dir.path(), 1 << 20, 3),
+                BTreeSet::new(),
+            ));
+
+            let mut complaint = None;
+            // More than the queue holds, so the overflow has to be dropped
+            // rather than queued or waited on.
+            for i in 0..QUEUE_CAPACITY * 2 {
+                complaint = complaint.or(sink.record(&name, &format!("line {i}")));
+            }
+            assert!(
+                complaint.is_some_and(|c| c.contains("cannot keep up")),
+                "a sink that cannot keep up has to say so"
+            );
+
+            drop(release);
+            occupied.await.unwrap();
+            sink.shutdown().await;
+        });
     }
 
     #[tokio::test]
@@ -663,7 +735,7 @@ mod tests {
         fs::write(&blocked, "not a directory").unwrap();
         let sink = LogSink::spawn(LogRouter::new(settings(&blocked, 1024, 3), BTreeSet::new()));
 
-        sink.record(&service("api"), "one").await;
+        sink.record(&service("api"), "one");
         // The writer is asynchronous, so the problem may only be collected by
         // the shutdown that waits for it.
         assert!(sink.shutdown().await.is_some());

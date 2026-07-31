@@ -109,7 +109,7 @@ async fn tee_output(mut events: EventReceiver, router: LogRouter) {
         let EventKind::Log { stream, line } = &event.kind else {
             continue;
         };
-        if let Some(problem) = sink.record(&event.service, line).await {
+        if let Some(problem) = sink.record(&event.service, line) {
             eprintln!("⚠  {problem}");
         }
         match stream {
