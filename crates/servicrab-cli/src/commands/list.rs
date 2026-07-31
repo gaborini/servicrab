@@ -198,7 +198,7 @@ mod tests {
     fn a_multi_byte_command_is_cut_on_a_character_boundary() {
         // Byte 29 lands inside the last '€', which is what used to panic.
         let cmd = "echo x€€€€€€€€€";
-        assert_eq!(truncate(cmd, 30), cmd, "16 characters is under the limit");
+        assert_eq!(truncate(cmd, 30), cmd, "15 characters is under the limit");
 
         // Long enough to be cut, with the cut point inside a multi-byte
         // character: the result must stay valid UTF-8 and count characters.
