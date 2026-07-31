@@ -735,6 +735,65 @@ mod tests {
     }
 
     #[test]
+    fn an_unlimited_budget_still_stops_on_a_user_shutdown() {
+        // The interaction of two independently-added features: `max_restarts =
+        // 0` removes the only bound that would otherwise end the restart loop,
+        // so this pins that a user-requested stop still wins over an unlimited
+        // budget.
+        for reason in [
+            ShutdownReason::UserInterrupt,
+            ShutdownReason::Terminated,
+            ShutdownReason::HangUp,
+            ShutdownReason::Requested,
+        ] {
+            let mut t =
+                RestartTracker::new(RestartPolicy::Always, SEC, SEC, 0, Duration::from_secs(60));
+            // Crash a few times first, so the tracker is mid-loop rather than
+            // fresh when the shutdown arrives.
+            for _ in 0..3 {
+                t.decide(outcome(ExitReason::Code(1)), None);
+            }
+            assert_eq!(
+                t.decide(outcome(ExitReason::Code(1)), Some(reason)),
+                RestartDecision::Stop,
+                "unlimited budget must not survive {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_user_shutdown_outranks_an_exhausted_budget() {
+        // This is what actually pins the order of the two checks in `decide`.
+        // Moving the user-requested short-circuit below the budget check leaves
+        // every other test green — including the unlimited case above, because
+        // an unlimited budget never reaches `Fail` — and only shows up here: a
+        // service the user stopped must report `Stop`, not blame the restart
+        // limit for a shutdown the user asked for.
+        let mut t =
+            RestartTracker::new(RestartPolicy::Always, SEC, SEC, 2, Duration::from_secs(60));
+        for _ in 0..2 {
+            assert!(matches!(
+                t.decide(outcome(ExitReason::Code(1)), None),
+                RestartDecision::Restart { .. }
+            ));
+        }
+        // The budget is now spent: without a shutdown this is a `Fail`.
+        assert_eq!(
+            t.clone().decide(outcome(ExitReason::Code(1)), None),
+            RestartDecision::Fail {
+                reason: ShutdownReason::RestartLimit
+            }
+        );
+        assert_eq!(
+            t.decide(
+                outcome(ExitReason::Code(1)),
+                Some(ShutdownReason::UserInterrupt)
+            ),
+            RestartDecision::Stop
+        );
+    }
+
+    #[test]
     fn stable_period_resets_attempt_counter() {
         let mut t = tracker(RestartPolicy::Always);
         // Two quick crashes advance the backoff.
