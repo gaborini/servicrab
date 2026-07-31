@@ -187,6 +187,9 @@ pub fn validate_raw(
             &mut errors,
         );
 
+        // No range check to make: every `u32` is meaningful, and `0` is the
+        // unlimited budget rather than an out-of-domain value (see
+        // `RestartTracker::budget_left`).
         let max_restarts = raw_svc.max_restarts.unwrap_or(10);
 
         let stable_after = parse_duration_field(
@@ -2531,6 +2534,30 @@ restart_delay = "2s"
                 }
             )),
             "expected restart_delay warning"
+        );
+    }
+
+    #[test]
+    fn max_restarts_warns_when_restart_never() {
+        let toml = r#"
+version = 1
+[project]
+name = "p"
+[services.s]
+command = ["echo"]
+restart = "never"
+max_restarts = 5
+"#;
+        let (_, warnings) = load_from_str(toml).unwrap();
+        assert!(
+            warnings.iter().any(|w| matches!(
+                w,
+                ConfigWarning::RestartSettingsIgnored {
+                    field: "max_restarts",
+                    ..
+                }
+            )),
+            "expected max_restarts warning, got: {warnings:?}"
         );
     }
 

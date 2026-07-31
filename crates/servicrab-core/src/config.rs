@@ -376,7 +376,8 @@ pub struct Service {
     pub restart_delay: Duration,
     /// Maximum delay between restart attempts (exponential-backoff ceiling).
     pub restart_max_delay: Duration,
-    /// Maximum number of restart attempts before giving up.
+    /// Maximum number of restart attempts before giving up; `0` means
+    /// unlimited.
     pub max_restarts: u32,
     /// How long the process must run before it is considered stable.
     pub stable_after: Duration,
