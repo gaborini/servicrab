@@ -13,9 +13,12 @@
 //! its own connection attempts.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use nix::sys::signal::{killpg, Signal};
+use nix::unistd::Pid;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -160,6 +163,13 @@ struct Slot {
     service: Arc<Service>,
     deps: Vec<DependencyEdge>,
     readiness: Arc<watch::Sender<DependencyStatus>>,
+    /// The process group of the process currently running, or `0`.
+    ///
+    /// Written by the supervision task from the `Started` event and cleared
+    /// when the process ends, so [`stop_all`] can sweep the group of a task it
+    /// has to abort — `abort` alone only reaches the direct child, through
+    /// `kill_on_drop`.
+    pgid: Arc<AtomicI32>,
     /// Present exactly while a supervision task is alive.
     stop: Option<crate::runtime::ShutdownTx>,
     handle: Option<JoinHandle<()>>,
@@ -193,10 +203,12 @@ impl Slot {
 
         let (stop_tx, stop_rx) = shutdown_channel();
         self.stop = Some(stop_tx);
+        self.pgid.store(0, Ordering::Relaxed);
         self.handle = Some(tokio::spawn(supervise_service(
             Arc::clone(&self.service),
             self.deps.clone(),
             Arc::clone(&self.readiness),
+            Arc::clone(&self.pgid),
             stop_rx,
             events,
             options,
@@ -643,6 +655,7 @@ impl RunState {
                 service,
                 deps: Vec::new(),
                 readiness: Arc::new(state_tx),
+                pgid: Arc::new(AtomicI32::new(0)),
                 stop: None,
                 handle: None,
                 restart_when_stopped: false,
@@ -782,7 +795,33 @@ async fn stop_all(
 
         if tokio::time::timeout(grace, &mut handle).await.is_err() {
             tracing::warn!(service = %name, ?grace, "service did not stop in time; detaching");
+            // Invariant: no process group of ours outlives the supervisor.
+            // Aborting the task drops its `ProcessHandle`, and
+            // `kill_on_drop(true)` only reaches the direct child — a grandchild
+            // such as `node` under `npm` would be orphaned.  Sweep the group
+            // first, while there is still a task that knows about it.
+            sweep_group(name, state.slots.get(name));
             handle.abort();
+        }
+    }
+}
+
+/// `SIGKILL` the process group a slot last reported, if it still has one.
+fn sweep_group(name: &ServiceName, slot: Option<&Slot>) {
+    let Some(pgid) = slot.map(|slot| slot.pgid.load(Ordering::Relaxed)) else {
+        return;
+    };
+    // Zero means the service has no process running: either it never started
+    // or its last one has already been reaped, and the kernel is free to hand
+    // that group id to somebody else.
+    if pgid == 0 {
+        return;
+    }
+    match killpg(Pid::from_raw(pgid), Signal::SIGKILL) {
+        Ok(()) => tracing::warn!(service = %name, pgid, "swept the process group before detaching"),
+        Err(errno) if crate::runtime::unix::group_is_gone(errno) => {}
+        Err(errno) => {
+            tracing::warn!(service = %name, pgid, %errno, "could not sweep the process group")
         }
     }
 }
@@ -916,6 +955,7 @@ async fn supervise_service(
     service: Arc<Service>,
     deps: Vec<DependencyEdge>,
     readiness: Arc<watch::Sender<DependencyStatus>>,
+    pgid: Arc<AtomicI32>,
     mut stop: ShutdownRx,
     events: EventSender,
     options: RunOptions,
@@ -959,9 +999,21 @@ async fn supervise_service(
     let (tx, mut rx) = event_channel();
     let relay = {
         let global = events.clone();
+        let pgid = Arc::clone(&pgid);
         let mut tracker = ReadinessTracker::new();
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
+                // Publish the process group the supervisor may have to sweep if
+                // it ever has to abort this task, and take it away again as
+                // soon as the process is gone: the kernel is free to reuse the
+                // id once its leader has been reaped.
+                match &event.kind {
+                    EventKind::Started { pgid: group } => pgid.store(*group, Ordering::Relaxed),
+                    EventKind::Exited { .. } | EventKind::Finished { .. } => {
+                        pgid.store(0, Ordering::Relaxed)
+                    }
+                    _ => {}
+                }
                 if let Some(next) = tracker.observe(&event.kind) {
                     // `send_modify` rather than `send`, for the reason above.
                     readiness.send_modify(|status| *status = next);
@@ -979,6 +1031,9 @@ async fn supervise_service(
     };
 
     let _ = relay.await;
+    // The process is gone by the time the runner returns; nothing left to
+    // sweep even if this task is aborted from here on.
+    pgid.store(0, Ordering::Relaxed);
 
     let result = match result {
         Ok(outcome) => ServiceResult::Finished(outcome),
@@ -1072,6 +1127,7 @@ async fn wait_for_dependencies(deps: &[DependencyEdge], stop: &mut ShutdownRx) -
 mod tests {
     use super::*;
     use crate::runtime::Selection;
+    use std::os::unix::process::CommandExt;
 
     fn name(raw: &str) -> ServiceName {
         crate::validation::validate_service_name(raw).expect("valid test name")
@@ -1415,6 +1471,78 @@ command = ["sleep", "60"]
             Readiness::Ready,
             "a running service must look ready to a dependent added later"
         );
+    }
+
+    #[tokio::test]
+    async fn a_detached_service_has_its_process_group_swept() {
+        // Aborting the supervision task drops its `ProcessHandle`, and
+        // `kill_on_drop(true)` only reaches the direct child, so `stop_all`
+        // sweeps the group first.  Here the group is a real process tree the
+        // supervisor never gets to signal, standing in for a task that has
+        // wedged past its grace period.
+        let dir = tempfile::TempDir::new().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let mut state = state_for(config(BASE));
+        let mut leader = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "trap '' TERM INT; sleep 30 & echo $! > {}; wait",
+                pidfile.display()
+            ))
+            .process_group(0)
+            .spawn()
+            .expect("spawned a stand-in process group");
+        let pgid = leader.id() as i32;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let grandchild = loop {
+            if let Ok(pid) = std::fs::read_to_string(&pidfile)
+                .unwrap_or_default()
+                .trim()
+                .parse::<i32>()
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fixture never recorded its grandchild"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        let slot = state.slots.get_mut(&name("api")).expect("slot exists");
+        slot.pgid.store(pgid, Ordering::Relaxed);
+
+        // A task that never finishes: `stop_all` has to give up on it.
+        let (stop, stop_rx) = shutdown_channel();
+        let mut stops = BTreeMap::new();
+        stops.insert(name("api"), stop);
+        let mut handles = BTreeMap::new();
+        handles.insert(
+            name("api"),
+            tokio::spawn(async move {
+                let _rx = stop_rx;
+                std::future::pending::<()>().await;
+            }),
+        );
+
+        // `stop_all` waits out `shutdown_timeout + STOP_GRACE`; with a paused
+        // clock that costs no wall time and stays bounded.
+        tokio::time::pause();
+        stop_all(&state, ShutdownReason::Terminated, &stops, &mut handles).await;
+        tokio::time::resume();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while nix::sys::signal::kill(Pid::from_raw(grandchild), None).is_ok()
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            nix::sys::signal::kill(Pid::from_raw(grandchild), None).is_err(),
+            "grandchild {grandchild} of the detached group {pgid} was orphaned"
+        );
+        let _ = leader.wait();
     }
 
     #[tokio::test]

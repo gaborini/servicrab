@@ -498,6 +498,93 @@ restart = "always"
 }
 
 #[test]
+fn a_retired_service_does_not_leave_its_process_group_behind() {
+    // A service dropped by a reload is still winding down when the daemon is
+    // told to stop, and it is no longer in the config, so `stop_all` treats it
+    // specially.  Whichever way it ends — signalled, escalated or detached —
+    // its whole process group has to go, not just the direct child.
+    let dir = TempDir::new().unwrap();
+    let api = resident(dir.path(), "api.sh");
+    let grandchild_pid = dir.path().join("grandchild.pid");
+    let deaf = script(
+        dir.path(),
+        "deaf.sh",
+        &format!(
+            "trap '' TERM\n\
+             (trap '' TERM; echo $$ > {}; while true; do sleep 0.2; done) &\n\
+             while true; do sleep 0.2; done",
+            grandchild_pid.display()
+        ),
+    );
+
+    let with_deaf = format!(
+        r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}"]
+restart = "always"
+[services.deaf]
+command = ["{}"]
+restart = "always"
+shutdown_timeout = "50s"
+"#,
+        api.display(),
+        deaf.display()
+    );
+    let cfg = write_config(dir.path(), &with_deaf);
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("both services to run", |s| {
+        s.matches("running").count() == 2
+    });
+    let deadline = Instant::now() + CEILING;
+    while !grandchild_pid.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let grandchild: i32 = fs::read_to_string(&grandchild_pid)
+        .expect("the fixture should have recorded its grandchild")
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(is_alive(grandchild), "fixture grandchild should be running");
+
+    // Retire the service.  It ignores SIGTERM, so it is still in its 50s
+    // shutdown when the daemon is told to stop.
+    fs::write(
+        &cfg,
+        format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}"]
+restart = "always"
+"#,
+            api.display()
+        ),
+    )
+    .unwrap();
+    let (code, stdout, stderr) = daemon.reload();
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.contains("1 removed"), "{stdout}");
+
+    let (code, stdout, stderr) = cli(&["down"], &cfg);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+
+    let deadline = Instant::now() + CEILING;
+    while is_alive(grandchild) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !is_alive(grandchild),
+        "grandchild {grandchild} outlived the supervisor"
+    );
+}
+
+#[test]
 fn a_reload_that_adds_a_dependency_does_not_block_the_dependent() {
     // A service with no dependents has no readiness subscriber, so its status
     // is only recorded if the supervisor writes it unconditionally.  A reload
