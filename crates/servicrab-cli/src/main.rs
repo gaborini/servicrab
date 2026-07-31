@@ -24,6 +24,27 @@
 //! - `servicrab completions <SHELL>` — print a shell completion script
 //! - `servicrab man` — print the man page in roff
 
+// These two rustdoc lints are allowed for this crate only, and only because of
+// the clap derive.
+//
+// The doc comments on `Cli`, `Command` and their fields are not documentation in
+// the rustdoc sense: clap turns them verbatim into the `servicrab --help` text.
+// `servicrab run --help` prints "as defined in [services.<name>]" and
+// `servicrab watch --help` prints "declares a [watch] block" — so rustdoc sees
+// `[services.<name>]` as an unclosed `<name>` HTML tag and `[watch]` as a broken
+// intra-doc link, when both are literally the config syntax we want the user to
+// read.
+//
+// The v1.0 stability contract freezes the CLI help output, so the text cannot be
+// reworded to satisfy rustdoc's HTML pedantry. Narrowing the lint here is the
+// only resolution that leaves the user-facing string alone.
+//
+// This is deliberately *not* done for `servicrab-core` or `servicrab-protocol`:
+// there the doc comments really are documentation, intra-doc links really do
+// need to resolve, and both crates keep these lints at deny.
+#![allow(rustdoc::invalid_html_tags)]
+#![allow(rustdoc::broken_intra_doc_links)]
+
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 

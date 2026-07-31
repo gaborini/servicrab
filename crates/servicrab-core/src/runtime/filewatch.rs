@@ -55,9 +55,10 @@ pub struct FileStamp {
 pub struct Scan {
     /// Every watched file, keyed by absolute path.
     pub files: BTreeMap<PathBuf, FileStamp>,
-    /// Whether the scan hit [`MAX_ENTRIES`] and stopped early.
+    /// Whether the scan hit the `MAX_ENTRIES` file limit and stopped early.
     pub truncated: bool,
-    /// Whether the scan hit [`MAX_DEPTH`] and left a subtree unvisited.
+    /// Whether the scan hit the `MAX_DEPTH` recursion limit and left a subtree
+    /// unvisited.
     pub too_deep: bool,
 }
 
@@ -85,11 +86,12 @@ impl Scan {
 ///
 /// Unreadable entries are skipped rather than reported: a file that vanishes
 /// mid-scan is a change, not an error, and the next scan will notice it.  So is
-/// a subtree deeper than [`MAX_DEPTH`], which sets [`Scan::too_deep`] instead of
-/// risking a stack overflow.
+/// a subtree deeper than the internal `MAX_DEPTH` limit (64 levels), which sets
+/// [`Scan::too_deep`] instead of risking a stack overflow.
 ///
-/// This is blocking work — up to [`MAX_ENTRIES`] `symlink_metadata` calls plus a
-/// `read_dir` per directory — so async callers go through [`scan_off_thread`].
+/// This is blocking work — up to `MAX_ENTRIES` (20 000) `symlink_metadata` calls
+/// plus a `read_dir` per directory — so async callers go through
+/// `scan_off_thread`.
 pub fn scan(settings: &WatchSettings) -> Scan {
     let mut out = Scan::default();
     for root in &settings.paths {
@@ -179,8 +181,9 @@ fn walk(root: &Path, path: &Path, depth: usize, settings: &WatchSettings, out: &
 ///
 /// After a change the watcher waits for `debounce` of quiet before asking for
 /// the restart, so a `cargo build` writing a hundred files causes one restart
-/// rather than a hundred.  It waits for quiet at most [`MAX_DEBOUNCE_ROUNDS`]
-/// times: a tree that never settles must still get its restart.
+/// rather than a hundred.  It waits for quiet at most ten rounds (the internal
+/// `MAX_DEBOUNCE_ROUNDS` cap): a tree that never settles must still get its
+/// restart.
 ///
 /// Every scan runs on a blocking thread; the loop itself only sleeps and talks
 /// to channels.

@@ -14,7 +14,7 @@
 //! Flushing is batched rather than per line: the writer flushes as soon as it has
 //! caught up with the queue — which for the modest volumes a supervised service
 //! produces is still after every single line — and, while a flood keeps the queue
-//! full, at least every [`FLUSH_EVERY_LINES`] lines.  Nothing is left in the
+//! full, at least every `FLUSH_EVERY_LINES` (256) lines.  Nothing is left in the
 //! buffer when the writer stops: it flushes when the queue ends and again when the
 //! file is dropped.
 //!
@@ -287,7 +287,7 @@ struct Entry {
 /// runtime.  Ordering per service is preserved: one queue, one writer, first in
 /// first out.
 ///
-/// [`LogSink::record`] never waits.  If the writer falls [`QUEUE_CAPACITY`]
+/// [`LogSink::record`] never waits.  If the writer falls `QUEUE_CAPACITY` (4096)
 /// lines behind, the line is dropped and said to be dropped: a supervisor that
 /// stops answering its control channel because a log file is slow is worse than
 /// a log with a hole in it.
