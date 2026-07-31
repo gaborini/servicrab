@@ -324,7 +324,17 @@ impl<'a> StackSupervisor<'a> {
                     break;
                 }
                 Some(report) = report_rx.recv() => {
-                    running -= 1;
+                    // Invariant: every report comes from a task that was
+                    // counted when it was spawned, so the counter is never at
+                    // zero here.  Saturate rather than wrap anyway: in a
+                    // release build an undercount would turn into `usize::MAX`
+                    // and `up` would never notice that its stack had finished.
+                    debug_assert!(
+                        running > 0,
+                        "report from {} has no matching spawn",
+                        report.service
+                    );
+                    running = running.saturating_sub(1);
                     let failed = report.result.is_failure();
                     tracing::debug!(service = %report.service, "service finished");
 
@@ -530,7 +540,25 @@ impl<'a> StackSupervisor<'a> {
             let Some(service) = config.services.get(name).cloned() else {
                 continue;
             };
-            state.insert_slot(name, Arc::new(service));
+            let service = Arc::new(service);
+            match state.slots.get_mut(name) {
+                // The slot is still there because an earlier reload dropped it
+                // and its supervision task has not reported back yet.  Revive
+                // that slot rather than replacing it: its `stop` channel and
+                // task handle are the only way the supervisor can still reach
+                // the process that is winding down, and `insert_slot` would
+                // throw both away.
+                Some(slot) => {
+                    debug_assert!(slot.retired, "a live slot for {name} was reported as added");
+                    slot.retired = false;
+                    slot.service = service;
+                    // The replacement is spawned once the old task reports —
+                    // the same hand-off a `restart` uses — so exactly one
+                    // process for this service is ever alive.
+                    slot.restart_when_stopped = slot.stop.is_some();
+                }
+                None => state.insert_slot(name, service),
+            }
         }
 
         for name in &diff.changed {
@@ -555,6 +583,11 @@ impl<'a> StackSupervisor<'a> {
 
         for name in &diff.added {
             if let Some(slot) = state.slots.get_mut(name) {
+                // A revived slot is waiting for its predecessor to report; the
+                // report arm spawns it then.
+                if slot.restart_when_stopped || slot.is_running() {
+                    continue;
+                }
                 slot.spawn(self.events.clone(), run_options, reports.clone());
                 *running += 1;
             }
@@ -584,7 +617,24 @@ impl RunState {
     ///
     /// Dependencies are wired up separately, once every slot exists: a
     /// service must be able to subscribe to slots added after it.
+    ///
+    /// Invariant: this never replaces a slot that still has a supervision task
+    /// behind it.  Overwriting one would discard the `stop` channel and the
+    /// `JoinHandle` that are the supervisor's only hold on a live process
+    /// group, leaving it to outlive the supervisor.  A reload that brings a
+    /// retiring service back revives its slot instead — see
+    /// [`StackSupervisor::reload`].
     fn insert_slot(&mut self, name: &ServiceName, service: Arc<Service>) {
+        debug_assert!(
+            !self
+                .slots
+                .get(name)
+                .is_some_and(|slot| slot.stop.is_some() || slot.handle.is_some()),
+            "insert_slot would overwrite the live slot for {name}"
+        );
+        // The initial receiver is dropped on purpose: a service with no
+        // dependents has no subscriber, and the sender is written with
+        // `send_modify` throughout so the value stays truthful anyway.
         let (state_tx, state_rx) = watch::channel(DependencyStatus::new());
         drop(state_rx);
         self.slots.insert(
@@ -1169,6 +1219,24 @@ command = ["sleep", "60"]
         let cfg = config(BASE);
         let plan = crate::runtime::plan_stack(&cfg, Selection::default()).unwrap();
         assert_eq!(state.diff(&cfg, &plan).added, vec![name("worker")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "would overwrite the live slot")]
+    fn inserting_over_a_live_slot_is_a_bug() {
+        // A slot with a `stop` channel is the supervisor's only hold on a live
+        // process group; replacing it would leak that group.  The assertion
+        // makes a future regression fail here rather than in production.
+        let mut state = state_for(config(BASE));
+        let (stop, _rx) = shutdown_channel();
+        state
+            .slots
+            .get_mut(&name("worker"))
+            .expect("slot exists")
+            .stop = Some(stop);
+
+        let service = state.config.services[&name("worker")].clone();
+        state.insert_slot(&name("worker"), Arc::new(service));
     }
 
     #[test]
