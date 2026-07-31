@@ -209,12 +209,18 @@ mod tests {
     #[test]
     fn state_lives_next_to_the_config() {
         let dir = TempDir::new().expect("temp dir");
-        let paths = DaemonPaths::for_config(&dir.path().join("servicrab.toml"));
         let root = dir.path().canonicalize().expect("canonicalize");
+        // Pinned: macOS temp paths are long enough that whether the socket
+        // relocates depends on `$XDG_RUNTIME_DIR`, and that is process-global.
+        let runtime = a_runtime_dir();
+        let paths = with_runtime_dir(Some(runtime.path()), || {
+            DaemonPaths::for_config(&root.join("servicrab.toml"))
+        });
 
         assert_eq!(paths.dir, root.join(".servicrab"));
-        assert_eq!(paths.socket, root.join(".servicrab/daemon.sock"));
         assert_eq!(paths.pid, root.join(".servicrab/daemon.pid"));
+        assert_eq!(paths.log, root.join(".servicrab/daemon.log"));
+        assert_eq!(paths.stopped, root.join(".servicrab/stopped"));
     }
 
     /// Two spellings of one project are one project.
@@ -227,23 +233,45 @@ mod tests {
     fn the_same_project_spelled_two_ways_gets_one_socket() {
         let dir = TempDir::new().expect("temp dir");
         std::fs::create_dir_all(dir.path().join("app")).expect("create");
+        let runtime = a_runtime_dir();
 
-        let plain = DaemonPaths::for_config(&dir.path().join("app/servicrab.toml"));
-        let dotted = DaemonPaths::for_config(&dir.path().join("./app/./servicrab.toml"));
-        let detoured = DaemonPaths::for_config(&dir.path().join("app/../app/servicrab.toml"));
+        let (plain, dotted, detoured) = with_runtime_dir(Some(runtime.path()), || {
+            (
+                DaemonPaths::for_config(&dir.path().join("app/servicrab.toml")),
+                DaemonPaths::for_config(&dir.path().join("./app/./servicrab.toml")),
+                DaemonPaths::for_config(&dir.path().join("app/../app/servicrab.toml")),
+            )
+        });
 
         assert_eq!(plain.socket, dotted.socket);
         assert_eq!(plain.socket, detoured.socket);
-        assert!(plain.socket.is_absolute(), "{}", plain.socket.display());
+        assert_eq!(plain.dir, detoured.dir);
+        assert!(plain.dir.is_absolute(), "{}", plain.dir.display());
+    }
+
+    /// A project whose path leaves room for the socket keeps it next to the
+    /// config, which is where the documentation and every third-party client
+    /// look for it.
+    #[test]
+    fn a_short_project_keeps_its_socket_next_to_the_config() {
+        let dir = a_runtime_dir();
+        let root = dir.path().canonicalize().expect("canonicalize");
+        let runtime = a_runtime_dir();
+
+        let paths = with_runtime_dir(Some(runtime.path()), || {
+            DaemonPaths::for_config(&root.join("servicrab.toml"))
+        });
+
+        assert_eq!(paths.socket, root.join(".servicrab/daemon.sock"));
     }
 
     #[test]
     fn a_relative_config_becomes_an_absolute_socket() {
         let paths = DaemonPaths::for_config(Path::new("servicrab.toml"));
-        assert!(paths.socket.is_absolute(), "{}", paths.socket.display());
         // The length limit has to be measured against this, not against the
-        // three characters the operator typed.
-        assert!(paths.socket.ends_with(".servicrab/daemon.sock"));
+        // fourteen characters the operator typed.
+        assert!(paths.dir.is_absolute(), "{}", paths.dir.display());
+        assert!(paths.dir.ends_with(".servicrab"));
     }
 
     #[test]

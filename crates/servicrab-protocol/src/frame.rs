@@ -63,7 +63,7 @@ mod tests {
         assert_eq!(
             request,
             Request::Subscribe {
-                services: Vec::new(),
+                services: std::collections::BTreeSet::new(),
                 logs: true,
             }
         );
@@ -72,7 +72,7 @@ mod tests {
     #[test]
     fn a_subscribe_request_survives_a_round_trip() {
         let request = Request::Subscribe {
-            services: vec!["api".to_string()],
+            services: ["api".to_string()].into_iter().collect(),
             logs: false,
         };
         let line = encode(&request).unwrap();

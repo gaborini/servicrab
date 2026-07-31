@@ -15,7 +15,7 @@ use servicrab_core::{
     ServiceName, ShutdownReason, SignalWatcher, StatusRegistry,
 };
 use servicrab_protocol::{decode, encode, Request, Response};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 
@@ -29,6 +29,38 @@ const STREAM_BACKLOG: usize = 4096;
 
 /// How long the daemon waits for the log collector to drain on shutdown.
 const COLLECTOR_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The largest request the daemon will assemble, in bytes.
+///
+/// Every real request is a short JSON object; the longest is a `subscribe` with
+/// a service list, which [`servicrab_protocol::MAX_SUBSCRIBE_SERVICES`] bounds
+/// separately.  64 KiB is far more than any of them needs and small enough that
+/// [`MAX_CONNECTIONS`] of them cannot exhaust memory.
+const MAX_FRAME: usize = 64 * 1024;
+
+/// How long a connection may say nothing before it is closed.
+///
+/// The CLI sends its request immediately and a subscriber stops reading in a
+/// different loop, so no legitimate client is idle here.  Generous anyway: a
+/// machine under load should not lose a command it already sent.
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How many clients may be connected at once.
+///
+/// Each one costs a file descriptor and a task, and a daemon that has been
+/// talked out of every descriptor in the process cannot supervise anything.  A
+/// handful of CLI invocations plus a few `events` subscribers is the realistic
+/// load, so this leaves two orders of magnitude of headroom.
+const MAX_CONNECTIONS: usize = 64;
+
+/// How many malformed lines one connection may send before it is closed.
+const MAX_MALFORMED: u32 = 3;
+
+/// How long to wait after `accept` fails before trying again.
+///
+/// `EMFILE` and `ENFILE` are not transient, and retrying straight away spun
+/// this loop at 100% CPU.
+const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Options for the daemon body.
 #[derive(Debug, Clone, Default)]
@@ -361,10 +393,27 @@ async fn collect(
 }
 
 /// Serve clients until the task is cancelled.
+///
+/// Every limit here exists because the socket is reachable before any request
+/// is understood, so an abusive client must cost the daemon a bounded amount of
+/// memory, file descriptors and CPU.
 async fn accept_loop(listener: UnixListener, session: Arc<Session>) {
+    // Counts live connections; each guard decrements on drop, including on a
+    // panic inside the handler.
+    let live = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            continue;
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(err) => {
+                // Running out of file descriptors is not transient, and
+                // retrying immediately spun this loop at 100% CPU with nothing
+                // logged.  Backing off gives whoever holds them a chance to let
+                // go, and says so.
+                tracing::warn!("could not accept a connection: {err}");
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+                continue;
+            }
         };
         // The socket's mode is the first line of defence, not the only one that
         // should exist: a project on a filesystem that ignores Unix modes, or a
@@ -382,39 +431,146 @@ async fn accept_loop(listener: UnixListener, session: Arc<Session>) {
                 continue;
             }
         }
+        // One task per connection with no cap is a way to be talked out of
+        // every file descriptor in the process.  Refusing the newest connection
+        // keeps the ones already being served, and the client sees a closed
+        // socket, which its own error handling already covers.
+        let Ok(permit) = Arc::clone(&live).try_acquire_owned() else {
+            tracing::warn!(
+                limit = MAX_CONNECTIONS,
+                "refused a connection: too many clients"
+            );
+            continue;
+        };
+
         let session = Arc::clone(&session);
         // One task per client keeps a stuck reader from blocking everybody
         // else.
         tokio::spawn(async move {
             handle_client(stream, session).await;
+            drop(permit);
         });
     }
 }
 
+/// Read one request line, bounded in both size and time.
+///
+/// `tokio::io::Lines` grows its `String` until it finds a newline, so a stream
+/// that never sends one is a way to drive the daemon out of memory.  Reading
+/// into a capped buffer turns that into a closed connection.
+async fn read_request(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    line: &mut Vec<u8>,
+) -> ReadOutcome {
+    line.clear();
+    // `read_until` on a `take`-limited reader stops at the cap instead of
+    // growing the buffer forever.  One extra byte is allowed through so that a
+    // request of exactly `MAX_FRAME` bytes plus its newline still fits.
+    let read = tokio::time::timeout(IDLE_TIMEOUT, async {
+        let mut capped = (&mut *reader).take(MAX_FRAME as u64 + 1);
+        capped.read_until(b'\n', line).await
+    });
+    match read.await {
+        // The client went away — or it filled the cap without a newline, and
+        // the limited reader has nothing more to give.
+        Ok(Ok(0)) if line.is_empty() => ReadOutcome::Closed,
+        Ok(Ok(_)) | Ok(Err(_)) if !line.ends_with(b"\n") => {
+            // No newline means either a half-open connection that closed
+            // mid-request or a stream that never intends to send one.  Both are
+            // the end of this connection; only the second is worth a warning.
+            if line.len() > MAX_FRAME {
+                ReadOutcome::TooLong
+            } else {
+                ReadOutcome::Closed
+            }
+        }
+        Ok(Ok(_)) => ReadOutcome::Line,
+        Ok(Err(err)) => ReadOutcome::Broken(err.to_string()),
+        Err(_) => ReadOutcome::Idle,
+    }
+}
+
+/// What one read attempt produced.
+enum ReadOutcome {
+    /// A whole line is in the buffer.
+    Line,
+    /// The peer closed the connection.
+    Closed,
+    /// [`MAX_FRAME`] bytes arrived with no newline among them.
+    TooLong,
+    /// Nothing arrived for [`IDLE_TIMEOUT`].
+    Idle,
+    /// The read itself failed.
+    Broken(String),
+}
+
 async fn handle_client(stream: UnixStream, session: Arc<Session>) {
     let (read_half, mut write_half) = stream.into_split();
-    let mut lines = BufReader::new(read_half).lines();
+    let mut reader = BufReader::new(read_half);
+    let mut buffer = Vec::with_capacity(1024);
+    let mut strikes = 0_u32;
 
-    while let Ok(Some(line)) = lines.next_line().await {
+    loop {
+        match read_request(&mut reader, &mut buffer).await {
+            ReadOutcome::Line => {}
+            ReadOutcome::Closed => return,
+            ReadOutcome::TooLong => {
+                tracing::warn!(
+                    limit = MAX_FRAME,
+                    "closing a connection that sent an oversized request"
+                );
+                let _ = write(
+                    &mut write_half,
+                    &Response::Error {
+                        message: format!("a request may not exceed {MAX_FRAME} bytes"),
+                    },
+                )
+                .await;
+                return;
+            }
+            ReadOutcome::Idle => {
+                tracing::debug!(
+                    timeout = ?IDLE_TIMEOUT,
+                    "closing an idle connection"
+                );
+                return;
+            }
+            ReadOutcome::Broken(problem) => {
+                tracing::debug!("a client connection broke: {problem}");
+                return;
+            }
+        }
+
+        // A request has to be valid UTF-8 to be JSON; treating it as a
+        // malformed line rather than an error of ours keeps the strike count
+        // honest.
+        let Ok(line) = std::str::from_utf8(&buffer) else {
+            if !strike(
+                &mut strikes,
+                &mut write_half,
+                "a request must be valid UTF-8",
+            )
+            .await
+            {
+                return;
+            }
+            continue;
+        };
         if line.trim().is_empty() {
             continue;
         }
-        let request = match decode::<Request>(&line) {
+        let request = match decode::<Request>(line) {
             Ok(request) => request,
             Err(err) => {
-                if !write(
-                    &mut write_half,
-                    &Response::Error {
-                        message: err.to_string(),
-                    },
-                )
-                .await
-                {
-                    break;
+                // Answering and carrying on let garbage be pumped forever.
+                if !strike(&mut strikes, &mut write_half, &err.to_string()).await {
+                    return;
                 }
                 continue;
             }
         };
+        // A client that talks sense has nothing held against it.
+        strikes = 0;
 
         // Subscribing turns the connection one-way: the client stops asking
         // and only reads until it goes away.
@@ -430,9 +586,40 @@ async fn handle_client(stream: UnixStream, session: Arc<Session>) {
         let response = respond(request, &session).await;
 
         if !write(&mut write_half, &response).await {
-            break;
+            return;
         }
     }
+}
+
+/// Answer a malformed line and count it against the connection.
+///
+/// Returns whether the connection should carry on.  A client that cannot form a
+/// request is either broken or probing; either way, three tries is enough
+/// courtesy, and closing beats letting garbage be pumped in forever.
+async fn strike(
+    strikes: &mut u32,
+    sink: &mut tokio::net::unix::OwnedWriteHalf,
+    message: &str,
+) -> bool {
+    *strikes += 1;
+    let alive = write(
+        sink,
+        &Response::Error {
+            message: message.to_string(),
+        },
+    )
+    .await;
+    if !alive {
+        return false;
+    }
+    if *strikes >= MAX_MALFORMED {
+        tracing::warn!(
+            strikes = *strikes,
+            "closing a connection that keeps sending malformed requests"
+        );
+        return false;
+    }
+    true
 }
 
 /// Write one response, reporting whether the client is still there.
@@ -448,12 +635,15 @@ async fn write(sink: &mut tokio::net::unix::OwnedWriteHalf, response: &Response)
 
 /// Which events a subscriber asked for.
 struct Filter {
-    services: Vec<String>,
+    /// Empty means every service.  A set, because this is consulted once per
+    /// event per subscriber, and a linear scan of a client-supplied list turned
+    /// a busy stack into work proportional to the list length.
+    services: std::collections::BTreeSet<String>,
     logs: bool,
 }
 
 impl Filter {
-    fn new(services: Vec<String>, logs: bool) -> Self {
+    fn new(services: std::collections::BTreeSet<String>, logs: bool) -> Self {
         Self { services, logs }
     }
 
@@ -461,11 +651,7 @@ impl Filter {
         if !self.logs && matches!(event.kind, EventKind::Log { .. }) {
             return false;
         }
-        self.services.is_empty()
-            || self
-                .services
-                .iter()
-                .any(|name| name == event.service.as_str())
+        self.services.is_empty() || self.services.contains(event.service.as_str())
     }
 }
 

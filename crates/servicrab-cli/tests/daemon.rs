@@ -1051,7 +1051,209 @@ fn an_unknown_service_is_rejected_by_the_daemon() {
     assert!(stderr.contains("api"), "{stderr}");
 }
 
-// ── profiles ───────────────────────────────────────────────────────────────
+// ── socket hardening ───────────────────────────────────────────────────────
+
+/// A newline-free stream must not be able to grow the daemon's memory without
+/// bound.
+///
+/// `Lines` assembles a `String` until it finds a newline, so a client that never
+/// sends one is a way to drive the daemon into the OOM killer.  The verdict here
+/// is the daemon's state afterwards: it has to close the abusive connection and
+/// still answer a legitimate client.
+#[test]
+fn an_oversized_request_closes_the_connection_and_leaves_the_daemon_alive() {
+    use std::io::{Read, Write};
+
+    let dir = TempDir::new().unwrap();
+    let cfg = one_service(dir.path());
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("api to run", |s| s.contains("running"));
+    let socket = dir.path().join(".servicrab/daemon.sock");
+
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket).expect("connect");
+    stream
+        .set_write_timeout(Some(CEILING))
+        .expect("write timeout");
+    stream
+        .set_read_timeout(Some(CEILING))
+        .expect("read timeout");
+
+    // 4 MiB with no newline anywhere: far past any frame limit worth having,
+    // and nothing a real request could resemble.
+    let chunk = vec![b'x'; 64 * 1024];
+    let mut written = 0usize;
+    while written < 4 * 1024 * 1024 {
+        match stream.write_all(&chunk) {
+            Ok(()) => written += chunk.len(),
+            // The daemon closing on us is the intended outcome, and it can
+            // happen before we finish writing.
+            Err(_) => break,
+        }
+    }
+    let _ = stream.flush();
+
+    // The connection must end on the daemon's initiative, within a bound.
+    let mut sink = Vec::new();
+    let closed = stream.read_to_end(&mut sink);
+    assert!(
+        closed.is_ok(),
+        "the daemon left the abusive connection open: {closed:?}"
+    );
+    drop(stream);
+
+    // And the daemon is still there, supervising, and answering.
+    let status = daemon.wait_for_status("api to still be running", |s| s.contains("running"));
+    assert!(status.contains("api"), "{status}");
+    assert_eq!(
+        cli(&["restart", "api"], &cfg).0,
+        0,
+        "the daemon stopped working"
+    );
+}
+
+/// Garbage cannot be pumped in forever.
+///
+/// Answering a malformed line and carrying on means an unbounded amount of work
+/// per connection.  After a few strikes the daemon closes, and — the part that
+/// matters — it is still serving everybody else.
+#[test]
+fn repeated_malformed_requests_close_the_connection_only() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let dir = TempDir::new().unwrap();
+    let cfg = one_service(dir.path());
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("api to run", |s| s.contains("running"));
+    let socket = dir.path().join(".servicrab/daemon.sock");
+
+    let stream = std::os::unix::net::UnixStream::connect(&socket).expect("connect");
+    stream
+        .set_read_timeout(Some(CEILING))
+        .expect("read timeout");
+    stream
+        .set_write_timeout(Some(CEILING))
+        .expect("write timeout");
+    let mut writer = stream.try_clone().expect("clone");
+    let mut reader = BufReader::new(stream);
+
+    // Keep sending nonsense until the daemon stops listening.  The bound is the
+    // number of attempts, so a daemon that never closes fails rather than hangs.
+    let mut answers = 0;
+    let mut closed = false;
+    for _ in 0..64 {
+        if writer.write_all(b"{\"type\":\"fly\"}\n").is_err() || writer.flush().is_err() {
+            closed = true;
+            break;
+        }
+        let mut reply = String::new();
+        match reader.read_line(&mut reply) {
+            Ok(0) => {
+                closed = true;
+                break;
+            }
+            Ok(_) => {
+                assert!(reply.contains("\"error\""), "unexpected reply: {reply}");
+                answers += 1;
+            }
+            Err(_) => {
+                closed = true;
+                break;
+            }
+        }
+    }
+
+    assert!(
+        closed,
+        "the daemon answered {answers} malformed lines without ever giving up"
+    );
+    assert!(
+        answers < 64,
+        "the daemon never struck the connection out ({answers} answers)"
+    );
+
+    // The strike-out is per connection, not per daemon.
+    let status = daemon.wait_for_status("api to still be running", |s| s.contains("running"));
+    assert!(status.contains("api"), "{status}");
+    assert_eq!(
+        cli(&["restart", "api"], &cfg).0,
+        0,
+        "the daemon stopped working"
+    );
+}
+
+/// The connection cap must be a cap on *live* connections, not a budget that
+/// runs down over the daemon's lifetime.
+///
+/// A permit that outlived its connection would leave the daemon reachable but
+/// useless after 64 clients, which is a handful of CLI invocations.  Each round
+/// here completes a whole request/response exchange, so the daemon has demonstrably
+/// finished with one connection before the next is opened.
+#[test]
+fn the_connection_cap_is_released_when_a_client_leaves() {
+    let dir = TempDir::new().unwrap();
+    let cfg = one_service(dir.path());
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("api to run", |s| s.contains("running"));
+    let socket = dir.path().join(".servicrab/daemon.sock");
+
+    // Well past the cap of 64, so a permit leaking once per client would stop
+    // this dead partway through.
+    let deadline = Instant::now() + CEILING;
+    for round in 0..200 {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon stopped keeping up; reached round {round}"
+        );
+        let reply = ping(&socket)
+            .unwrap_or_else(|err| panic!("connection {round} did not get an answer: {err}"));
+        assert!(reply.contains("\"pong\""), "round {round}: {reply}");
+    }
+
+    assert_eq!(cli(&["status"], &cfg).0, 0, "the daemon stopped answering");
+}
+
+/// One ping over a fresh connection, with a bounded wait for the answer.
+fn ping(socket: &Path) -> std::io::Result<String> {
+    use std::io::{BufRead, BufReader, Write};
+
+    let stream = std::os::unix::net::UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(CEILING))?;
+    stream.set_write_timeout(Some(CEILING))?;
+
+    let mut writer = stream.try_clone()?;
+    writer.write_all(b"{\"type\":\"ping\"}\n")?;
+    writer.flush()?;
+
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply)?;
+    Ok(reply)
+}
+
+/// A dead-quiet connection is closed rather than held forever.
+///
+/// There was no read timeout at all, so a client that connected and said nothing
+/// kept a task and a descriptor for as long as the daemon lived.
+#[test]
+fn a_silent_connection_does_not_block_a_real_one() {
+    let dir = TempDir::new().unwrap();
+    let cfg = one_service(dir.path());
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("api to run", |s| s.contains("running"));
+    let socket = dir.path().join(".servicrab/daemon.sock");
+
+    // Held open on purpose and never written to.
+    let _silent: Vec<std::os::unix::net::UnixStream> = (0..8)
+        .map(|_| std::os::unix::net::UnixStream::connect(&socket).expect("connect"))
+        .collect();
+
+    // Whatever the daemon does about them, it must keep serving.
+    assert_eq!(cli(&["status"], &cfg).0, 0);
+    assert_eq!(cli(&["restart", "api"], &cfg).0, 0);
+}
 
 #[test]
 fn a_daemon_keeps_its_profiles_across_a_reload() {
