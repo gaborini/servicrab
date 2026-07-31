@@ -28,14 +28,18 @@ jobs:
   # tag and the version are resolved once, here, and every job downstream reads
   # them from this job's outputs rather than from the event.
   meta:
-    name: Resolve the tag
+    name: Resolve the tag and gate on the manifest
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       version: ${{ steps.resolve.outputs.version }}
     steps:
-      - name: Resolve the tag and the version it claims
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve the tag and check it against the manifest
         id: resolve
         env:
           # The expression the release job already used, and the only one that is
@@ -44,9 +48,40 @@ jobs:
         run: |
           set -euo pipefail
           version="${TAG#v}"
+
+          # The header of this file states that the tag matches the workspace
+          # version, and until now nothing enforced it: a `v1.0.0` tag on a
+          # commit whose manifest still said `0.3.0` built and shipped in
+          # silence, and the mismatch only surfaced at `cargo publish`.
+          #
+          # A tag that is not `v<semver>` at all means the workflow was
+          # dispatched with something that is not a release tag — a branch name,
+          # most likely, which is exactly how the asset-naming bug above got in.
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::'${TAG}' is not a release tag; expected v<major>.<minor>.<patch>[-prerelease]."
+            exit 1
+          fi
+
+          # Read from [workspace.package] only, so a `version` key in another
+          # table cannot answer for the workspace.  No toolchain is installed in
+          # this job on purpose: the gate has to fail within seconds, before four
+          # runners spend half an hour building something to be thrown away.
+          manifest=$(awk -F'"' '
+            /^\[/ { in_wp = ($0 == "[workspace.package]"); next }
+            in_wp && /^version[[:space:]]*=/ { print $2; exit }
+          ' Cargo.toml)
+          if [ -z "$manifest" ]; then
+            echo "::error::could not read version from [workspace.package] in Cargo.toml."
+            exit 1
+          fi
+          if [ "$version" != "$manifest" ]; then
+            echo "::error::tag ${TAG} claims version ${version}, but [workspace.package] in Cargo.toml says ${manifest}; the tag and the manifest have to agree before a release is cut."
+            exit 1
+          fi
+
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "Releasing ${TAG} (version ${version})."
+          echo "Releasing ${TAG}; the workspace version is ${manifest}."
 
   build:
     name: ${{ matrix.target }}
@@ -107,7 +142,20 @@ jobs:
       - name: Smoke-test the binary
         # Cross-built macOS x86_64 cannot run on an arm runner.
         if: matrix.target != 'x86_64-apple-darwin'
-        run: ./target/${{ matrix.target }}/release/servicrab --version
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          reported=$(./target/${{ matrix.target }}/release/servicrab --version)
+          echo "$reported"
+          # The manifest gate in `meta` reads a text file; this reads the binary
+          # that is actually being shipped, so a stale build directory or a
+          # patch-level override somewhere in the tree cannot slip a differently
+          # versioned executable into a tarball named after the tag.
+          if [ "$reported" != "servicrab ${VERSION}" ]; then
+            echo "::error::the built binary reports '${reported}', but the tag says version ${VERSION}."
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v7
         with:
