@@ -308,6 +308,11 @@ impl Printer {
                 "!",
                 &format!("watch: more than {limit} files; narrow `paths` or add `ignore` entries"),
             ),
+            EventKind::LogLinesDropped { count } => self.status(
+                service,
+                "!",
+                &format!("dropped {count} output line(s): faster than they could be consumed"),
+            ),
             // State transitions and the final summary are already conveyed by
             // the events above; showing them too would only add noise.
             EventKind::State(_) | EventKind::Finished { .. } => {}

@@ -210,6 +210,11 @@ mod imp {
                         "watch: more than {limit} files; narrow `paths` or add `ignore` entries"
                     ),
                 ),
+                Event::LogLinesDropped { count } => self.status(
+                    service,
+                    "!",
+                    &format!("dropped {count} output line(s): faster than they could be consumed"),
+                ),
                 // Unlike `up`, a client that just attached has no idea what
                 // the services are doing, so state changes are worth showing.
                 Event::State { state } => self.status(service, "·", &state.to_string()),

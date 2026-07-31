@@ -154,6 +154,12 @@ pub type ControlTx = mpsc::UnboundedSender<Control>;
 pub type ControlRx = mpsc::UnboundedReceiver<Control>;
 
 /// Create a control channel.
+///
+/// Unbounded on purpose: what travels here is one message per operator request
+/// or per watch-triggered restart, so its cardinality is bounded by the number
+/// of services rather than by anything a child process can produce.  Only the
+/// log-line path needs a bound; see
+/// [`crate::runtime::event::MAX_QUEUED_LOG_LINES`].
 pub fn control_channel() -> (ControlTx, ControlRx) {
     mpsc::unbounded_channel()
 }
@@ -292,6 +298,8 @@ impl<'a> StackSupervisor<'a> {
             output: OutputMode::Capture,
         };
 
+        // Unbounded like the control channel, and for the same reason: exactly
+        // one report per spawned service run.
         let (report_tx, mut report_rx) = mpsc::unbounded_channel::<ServiceReport>();
         let mut state = RunState {
             config: Arc::new(self.config.clone()),

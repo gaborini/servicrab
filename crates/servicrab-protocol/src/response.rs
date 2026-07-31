@@ -207,6 +207,12 @@ pub enum Event {
         /// How many files the watcher is willing to scan.
         limit: usize,
     },
+    /// Captured output was dropped because the service produced it faster than
+    /// the supervisor could consume it.
+    LogLinesDropped {
+        /// How many lines were dropped since this was last reported.
+        count: u64,
+    },
     /// The service failed fatally.
     Failed {
         /// A human-readable description of the failure.

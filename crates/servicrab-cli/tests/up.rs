@@ -426,6 +426,106 @@ command = ["{0}"]
     );
 }
 
+/// A service that prints faster than the supervisor can render must not grow
+/// the supervisor's heap without limit.  The bound comes with a drop policy, and
+/// the policy has to be *visible*: the operator sees a `LogLinesDropped` event
+/// rather than silently missing output.
+#[test]
+fn a_flooding_service_has_its_output_dropped_and_says_so() {
+    // Far more than the channel's log-line allowance, and more than fits in the
+    // pipe the renderer writes to while it is blocked below.
+    const LINES: usize = 20_000;
+
+    let dir = TempDir::new().unwrap();
+    let printed = dir.path().join("printed");
+    script(
+        dir.path(),
+        "flood.sh",
+        &format!(
+            "awk 'BEGIN{{for (i = 1; i <= {LINES}; i++) print \"line \" i}}'\necho done > {}\nsleep 30",
+            printed.display()
+        ),
+    );
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+
+[project]
+name = "demo"
+
+[services.api]
+command = ["{0}"]
+restart = "never"
+"#,
+            dir.path().join("flood.sh").display()
+        ),
+    );
+
+    // Both streams are piped and neither is read yet, so the renderer blocks on
+    // its first full stdout write and the queue behind it has to absorb the
+    // flood — or refuse to.
+    let mut child = Command::new(binary())
+        .arg("up")
+        .arg("--config")
+        .arg(&cfg)
+        .env_remove("RUST_LOG")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn servicrab up");
+
+    // The script is done printing, so every line has been read off the pipe and
+    // either queued or dropped.
+    wait_for_file(&printed);
+
+    // Now let the renderer catch up, which is when it gets to the report.
+    let mut stdout = child.stdout.take().expect("stdout");
+    let drain = std::thread::spawn(move || {
+        let mut sink = String::new();
+        use std::io::Read;
+        let _ = stdout.read_to_string(&mut sink);
+        sink.lines().filter(|l| l.contains("line ")).count()
+    });
+
+    let mut stderr = std::io::BufReader::new(child.stderr.take().expect("stderr"));
+    let mut reported = None;
+    let deadline = Instant::now() + CEILING;
+    let mut seen = String::new();
+    while Instant::now() < deadline {
+        let mut line = String::new();
+        use std::io::BufRead;
+        if stderr.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        seen.push_str(&line);
+        if line.contains("dropped") {
+            reported = Some(line);
+            break;
+        }
+    }
+
+    kill(Pid::from_raw(child.id() as i32), Signal::SIGINT).unwrap();
+    wait_bounded(&mut child);
+    let rendered = drain.join().expect("drain thread");
+
+    let reported = reported.unwrap_or_else(|| {
+        panic!("the drop was never reported; stderr so far:\n{seen}\nrendered {rendered} line(s)")
+    });
+    assert!(
+        reported.contains("output line(s)"),
+        "unexpected report: {reported}"
+    );
+    // The verdict is the observable one: output really was dropped, so the
+    // supervisor never had to hold all of it.
+    assert!(
+        rendered < LINES,
+        "nothing was dropped, so the channel was not bounded ({rendered} of {LINES} rendered)"
+    );
+}
+
 // ── ordering, dependencies, shutdown ───────────────────────────────────────
 
 /// The verdict comes from the supervisor's own event stream, not from what the
