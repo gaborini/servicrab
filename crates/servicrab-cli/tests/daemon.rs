@@ -476,10 +476,205 @@ restart = "always"
     );
 }
 
+/// The daemon asks the kernel who connected and serves only its own user.
+///
+/// The socket's mode is the first line of defence, but not the only one that
+/// should exist: a project on a filesystem that ignores Unix modes, or a
+/// directory an operator loosened, would otherwise hand full start/stop/
+/// shutdown authority to a stranger.  A test cannot become another user without
+/// root, so this pins the mechanism instead — the credentials the daemon reads
+/// are the ones the connecting process really has, and they arrive before any
+/// request is parsed.
+#[test]
+fn the_daemon_reads_the_credentials_of_whoever_connects() {
+    let dir = TempDir::new().unwrap();
+    let cfg = one_service(dir.path());
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("api to run", |s| s.contains("running"));
+
+    let socket = dir.path().join(".servicrab/daemon.sock");
+    let stream = std::os::unix::net::UnixStream::connect(&socket).expect("connect");
+
+    // Both directions of the check agree on this process, so a daemon comparing
+    // the peer uid against its own accepts us and would refuse anyone else.
+    let ours = nix::unistd::getuid().as_raw();
+    assert_eq!(peer_uid(&stream), ours);
+
+    // And the connection is a working one, so the check is not simply refusing
+    // everybody.
+    let (code, stdout, _) = cli(&["status"], &cfg);
+    assert_eq!(code, 0, "{stdout}");
+}
+
+/// The uid the kernel reports for the other end of `stream`.
+fn peer_uid(stream: &std::os::unix::net::UnixStream) -> u32 {
+    use nix::sys::socket::getsockopt;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
+            .expect("peer credentials")
+            .uid()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        getsockopt(stream, nix::sys::socket::sockopt::LocalPeerCred)
+            .expect("peer credentials")
+            .uid()
+    }
+}
+
 /// Quote a path for `sh -c`.  The test paths are temp dirs, so this only has to
 /// survive spaces, but it must not silently mangle anything either.
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+}
+
+/// A project whose own directory is too deep to hold a socket must still get a
+/// daemon, and the socket must land in `$XDG_RUNTIME_DIR` rather than in the
+/// shared temp directory.
+///
+/// A name in `/tmp` is predictable to every local user: a stranger can squat it
+/// (and `/tmp` being sticky means the project can then never start a daemon at
+/// all), or bind their own listener and answer every `status`, `stop`, `down`
+/// and `reload` the operator sends.
+#[test]
+fn a_deeply_nested_project_puts_its_socket_in_the_runtime_dir() {
+    let dir = TempDir::new().unwrap();
+    // Short enough to hold a socket, which is what a real `/run/user/1000` is.
+    let runtime = TempDir::new_in("/tmp").unwrap();
+
+    let deep = dir.path().join("nested".repeat(12)).join("more".repeat(12));
+    fs::create_dir_all(&deep).unwrap();
+    let svc = resident(dir.path(), "api.sh");
+    let cfg = config(
+        &deep,
+        &format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}"]
+restart = "always"
+"#,
+            svc.display()
+        ),
+    );
+
+    let env = [("XDG_RUNTIME_DIR", runtime.path().to_str().unwrap())];
+    let _daemon = DaemonIn::start(&cfg, &env);
+
+    let deadline = Instant::now() + CEILING;
+    let socket = loop {
+        let found: Vec<PathBuf> = fs::read_dir(runtime.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("servicrab-") && name.ends_with(".sock"))
+            })
+            .collect();
+        if let Some(socket) = found.into_iter().next() {
+            break socket;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no socket appeared in {}",
+            runtime.path().display()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    // Relocated to the private per-user directory, and nowhere else.
+    assert!(socket.starts_with(runtime.path()), "{}", socket.display());
+    assert_eq!(
+        fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // And it is a working daemon, not just a file.
+    let status = wait_for_status_in("api to run", &cfg, &env, |s| s.contains("running"));
+    assert!(status.contains("api"), "{status}");
+
+    // The rest of the state stays with the project.
+    assert!(deep.join(".servicrab/daemon.pid").exists());
+    assert!(
+        !deep.join(".servicrab/daemon.sock").exists(),
+        "the socket should have moved out of the project"
+    );
+}
+
+/// `cli`, plus environment variables the socket location depends on.
+fn cli_with_env(args: &[&str], config_path: &Path, env: &[(&str, &str)]) -> (i32, String, String) {
+    let mut command = Command::new(binary());
+    command
+        .args(args)
+        .arg("--config")
+        .arg(config_path)
+        .env_remove("RUST_LOG")
+        .env("NO_COLOR", "1");
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command.output().expect("failed to run servicrab");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+fn wait_for_status_in(
+    what: &str,
+    config_path: &Path,
+    env: &[(&str, &str)],
+    predicate: impl Fn(&str) -> bool,
+) -> String {
+    let deadline = Instant::now() + CEILING;
+    loop {
+        let (_, status, _) = cli_with_env(&["status"], config_path, env);
+        if predicate(&status) {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for {what}; last status:\n{status}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The [`Daemon`] guard for a project whose socket location depends on the
+/// environment, so `down` has to be given the same one.
+struct DaemonIn {
+    config: PathBuf,
+    env: Vec<(String, String)>,
+}
+
+impl DaemonIn {
+    fn start(config: &Path, env: &[(&str, &str)]) -> Self {
+        let (code, stdout, stderr) = cli_with_env(&["start"], config, env);
+        assert_eq!(code, 0, "start failed: {stdout}{stderr}");
+        Self {
+            config: config.to_path_buf(),
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        }
+    }
+}
+
+impl Drop for DaemonIn {
+    fn drop(&mut self) {
+        let env: Vec<(&str, &str)> = self
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let _ = cli_with_env(&["down"], &self.config, &env);
+    }
 }
 
 #[test]

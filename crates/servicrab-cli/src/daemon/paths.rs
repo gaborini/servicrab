@@ -3,6 +3,13 @@
 //! Everything lives next to the config file so that two projects never fight
 //! over one daemon, and so that removing the project directory removes its
 //! runtime state with it.
+//!
+//! The socket is the exception, because it has a hard path length limit that a
+//! deeply nested project can exceed.  When that happens it moves to
+//! `$XDG_RUNTIME_DIR`, which the system creates 0700 and per-user.  It never
+//! moves to the shared temp directory: a name there is predictable to every
+//! local user, and `/tmp` being sticky means a squatted path can be neither
+//! unlinked nor bound, so the project could never start a daemon at all.
 
 use std::path::{Path, PathBuf};
 
@@ -32,23 +39,15 @@ pub struct DaemonPaths {
 impl DaemonPaths {
     /// Derive the paths for a project from its config file.
     ///
-    /// A deeply nested project would overflow the socket path limit, so in
-    /// that case the socket (and only the socket) moves to the temp dir under
-    /// a name derived from the config path.
+    /// The socket lives next to the config like everything else.  Only when
+    /// that path would overflow the socket length limit does it move to
+    /// `$XDG_RUNTIME_DIR`, under a name derived from the project directory.
     pub fn for_config(config: &Path) -> Self {
-        let dir = config
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(".servicrab");
+        let dir = project_dir(config).join(".servicrab");
         let socket = dir.join("daemon.sock");
-        let socket = if socket.as_os_str().len() > MAX_SOCKET_PATH {
-            std::env::temp_dir().join(format!("servicrab-{}.sock", digest(config)))
-        } else {
-            socket
-        };
 
         Self {
-            socket,
+            socket: relocate_if_too_long(socket, &dir),
             pid: dir.join("daemon.pid"),
             log: dir.join("daemon.log"),
             stopped: dir.join("stopped"),
@@ -63,12 +62,90 @@ impl DaemonPaths {
     }
 }
 
-/// A short, stable, filesystem-safe digest of a path.
-fn digest(path: &Path) -> String {
-    // FNV-1a: tiny, dependency-free, and a collision only costs a confusing
-    // "address already in use" for two projects with the same hash.
+/// The directory holding `config`, absolute wherever we can make it so.
+///
+/// `--config` is taken verbatim, so it may well be relative.  Two spellings of
+/// one project (`a/servicrab.toml` and `./a/servicrab.toml`) have to reach the
+/// same daemon, and the length limit has to be measured against the path the
+/// kernel will actually see.
+fn project_dir(config: &Path) -> PathBuf {
+    let parent = config.parent().unwrap_or_else(|| Path::new("."));
+    // The project directory exists in every real use; `canonicalize` resolves
+    // symlinks too, so the same directory reached two ways is one project.
+    if let Ok(resolved) = parent.canonicalize() {
+        return resolved;
+    }
+    // It does not exist yet — `generate` and the error paths both hit this.
+    // Absolute is still better than relative, and no worse than before.
+    match std::env::current_dir() {
+        Ok(cwd) if parent.is_relative() => normalize(&cwd.join(parent)),
+        _ => parent.to_path_buf(),
+    }
+}
+
+/// Drop `.` and `..` components lexically, for a path we cannot ask the
+/// filesystem about.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Move the socket out of the project when its path is too long for `bind`.
+///
+/// `$XDG_RUNTIME_DIR` is created by the system as 0700 and per-user, so a name
+/// in it is no more reachable than one inside the project.  The shared temp
+/// directory is not an option: `$TMPDIR` puts the location under an attacker's
+/// influence, the name would be predictable to every local user, and `/tmp`
+/// being sticky means a pre-created path can be neither unlinked nor bound.
+///
+/// With nowhere private to go we keep the long path.  `bind` then fails with
+/// `ENAMETOOLONG`, which names the real problem, where a fallback into a shared
+/// directory would silently trade a startup failure for a spoofable socket.
+fn relocate_if_too_long(socket: PathBuf, dir: &Path) -> PathBuf {
+    if socket.as_os_str().len() <= MAX_SOCKET_PATH {
+        return socket;
+    }
+    let Some(runtime) = runtime_dir() else {
+        return socket;
+    };
+
+    let moved = runtime.join(format!("servicrab-{}.sock", project_slug(dir)));
+    if moved.as_os_str().len() <= MAX_SOCKET_PATH {
+        moved
+    } else {
+        socket
+    }
+}
+
+/// `$XDG_RUNTIME_DIR`, if it is set to an absolute path.
+///
+/// A relative value would resolve against whatever directory the command
+/// happened to start in, so two invocations for one project could disagree
+/// about where the socket is.
+fn runtime_dir() -> Option<PathBuf> {
+    let value = std::env::var_os("XDG_RUNTIME_DIR")?;
+    let path = PathBuf::from(value);
+    (path.is_absolute() && path.is_dir()).then_some(path)
+}
+
+/// A short, stable, filesystem-safe name for the project at `dir`.
+///
+/// FNV-1a: tiny and dependency-free.  It is not a security boundary — the
+/// directory it names is per-user and 0700, and the peer check is what keeps
+/// strangers out — so all it has to do is separate two projects.  A collision
+/// costs one confusing "already running" for two projects with the same hash.
+fn project_slug(dir: &Path) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in path.as_os_str().to_string_lossy().as_bytes() {
+    for byte in dir.as_os_str().as_encoded_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
@@ -78,34 +155,170 @@ fn digest(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
-    #[test]
-    fn state_lives_next_to_the_config() {
-        let paths = DaemonPaths::for_config(Path::new("/srv/app/servicrab.toml"));
-        assert_eq!(paths.dir, PathBuf::from("/srv/app/.servicrab"));
-        assert_eq!(
-            paths.socket,
-            PathBuf::from("/srv/app/.servicrab/daemon.sock")
-        );
-        assert_eq!(paths.pid, PathBuf::from("/srv/app/.servicrab/daemon.pid"));
+    /// The socket location reads `$XDG_RUNTIME_DIR`, which is process-global,
+    /// so the tests that set it must not run beside each other.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Set `$XDG_RUNTIME_DIR` for the duration of `body`.
+    fn with_runtime_dir<T>(value: Option<&Path>, body: impl FnOnce() -> T) -> T {
+        let _guard = ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("XDG_RUNTIME_DIR");
+        match value {
+            // Safety: the mutex above is what keeps this off other threads.
+            Some(path) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", path) },
+            None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
+        }
+        let out = body();
+        match previous {
+            Some(old) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", old) },
+            None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
+        }
+        out
+    }
+
+    /// A directory nested deeply enough that the socket path inside it cannot
+    /// fit, returned with the config file inside it.
+    fn a_project_too_deep_for_a_socket() -> (TempDir, PathBuf) {
+        let root = TempDir::new().expect("temp dir");
+        let deep = root
+            .path()
+            .join("nested".repeat(12))
+            .join("more".repeat(12));
+        std::fs::create_dir_all(&deep).expect("create the deep project");
+        let config = deep.join("servicrab.toml");
+        (root, config)
+    }
+
+    /// A stand-in for `$XDG_RUNTIME_DIR` that is short enough to hold a socket.
+    ///
+    /// A real one is `/run/user/1000`; macOS's per-user temp directory, which
+    /// is what `TempDir` uses by default, is 60 bytes on its own and would
+    /// leave no room for the socket name.
+    fn a_runtime_dir() -> TempDir {
+        let short = PathBuf::from("/tmp");
+        let root = if short.is_dir() {
+            short
+        } else {
+            std::env::temp_dir()
+        };
+        TempDir::new_in(root).expect("temp dir")
     }
 
     #[test]
-    fn a_very_long_path_moves_the_socket_to_the_temp_dir() {
-        let deep = PathBuf::from("/".to_string() + &"nested/".repeat(30)).join("servicrab.toml");
-        let paths = DaemonPaths::for_config(&deep);
+    fn state_lives_next_to_the_config() {
+        let dir = TempDir::new().expect("temp dir");
+        let paths = DaemonPaths::for_config(&dir.path().join("servicrab.toml"));
+        let root = dir.path().canonicalize().expect("canonicalize");
 
+        assert_eq!(paths.dir, root.join(".servicrab"));
+        assert_eq!(paths.socket, root.join(".servicrab/daemon.sock"));
+        assert_eq!(paths.pid, root.join(".servicrab/daemon.pid"));
+    }
+
+    /// Two spellings of one project are one project.
+    ///
+    /// The length check used to run on the path as typed, so a short relative
+    /// path whose absolute form was too long slipped through and failed `bind`
+    /// with ENAMETOOLONG — and `-c a/servicrab.toml` and `-c ./a/servicrab.toml`
+    /// hashed differently, giving one project two sockets.
+    #[test]
+    fn the_same_project_spelled_two_ways_gets_one_socket() {
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::create_dir_all(dir.path().join("app")).expect("create");
+
+        let plain = DaemonPaths::for_config(&dir.path().join("app/servicrab.toml"));
+        let dotted = DaemonPaths::for_config(&dir.path().join("./app/./servicrab.toml"));
+        let detoured = DaemonPaths::for_config(&dir.path().join("app/../app/servicrab.toml"));
+
+        assert_eq!(plain.socket, dotted.socket);
+        assert_eq!(plain.socket, detoured.socket);
+        assert!(plain.socket.is_absolute(), "{}", plain.socket.display());
+    }
+
+    #[test]
+    fn a_relative_config_becomes_an_absolute_socket() {
+        let paths = DaemonPaths::for_config(Path::new("servicrab.toml"));
+        assert!(paths.socket.is_absolute(), "{}", paths.socket.display());
+        // The length limit has to be measured against this, not against the
+        // three characters the operator typed.
+        assert!(paths.socket.ends_with(".servicrab/daemon.sock"));
+    }
+
+    #[test]
+    fn a_long_path_moves_the_socket_to_the_runtime_dir() {
+        let runtime = a_runtime_dir();
+        let (_root, config) = a_project_too_deep_for_a_socket();
+
+        let paths = with_runtime_dir(Some(runtime.path()), || DaemonPaths::for_config(&config));
+
+        assert!(
+            paths.socket.starts_with(runtime.path()),
+            "{} is not in the runtime dir",
+            paths.socket.display()
+        );
+        // Only the socket moves; the rest of the state stays with the project.
         assert!(paths.dir.ends_with(".servicrab"));
-        assert!(paths.socket.starts_with(std::env::temp_dir()));
+        assert!(paths.pid.starts_with(&paths.dir));
+    }
+
+    /// With no private directory to move to, the long path stays put and `bind`
+    /// reports it.  The shared temp directory is never an answer: a name there
+    /// is predictable to every local user, and `/tmp` being sticky means a
+    /// squatted path can be neither unlinked nor bound.
+    #[test]
+    fn without_a_runtime_dir_the_socket_stays_in_the_project() {
+        let (_root, config) = a_project_too_deep_for_a_socket();
+
+        let paths = with_runtime_dir(None, || DaemonPaths::for_config(&config));
+
+        assert!(paths.socket.starts_with(&paths.dir), "{paths:?}");
+        assert!(
+            !paths.socket.starts_with(std::env::temp_dir()),
+            "the socket must never land in the shared temp directory"
+        );
+    }
+
+    /// A relative `$XDG_RUNTIME_DIR` would resolve against whatever directory
+    /// each command started in, so one project would get several sockets.
+    #[test]
+    fn a_relative_runtime_dir_is_ignored() {
+        let (_root, config) = a_project_too_deep_for_a_socket();
+
+        let paths = with_runtime_dir(Some(Path::new("relative/run")), || {
+            DaemonPaths::for_config(&config)
+        });
+
+        assert!(paths.socket.starts_with(&paths.dir), "{paths:?}");
     }
 
     #[test]
     fn different_projects_get_different_sockets() {
-        let one = PathBuf::from("/".to_string() + &"nested/".repeat(30)).join("a.toml");
-        let two = PathBuf::from("/".to_string() + &"nested/".repeat(30)).join("b.toml");
-        assert_ne!(
-            DaemonPaths::for_config(&one).socket,
-            DaemonPaths::for_config(&two).socket
+        let runtime = a_runtime_dir();
+        let (_root, one) = a_project_too_deep_for_a_socket();
+        let (_other_root, two) = a_project_too_deep_for_a_socket();
+
+        let (first, second) = with_runtime_dir(Some(runtime.path()), || {
+            (DaemonPaths::for_config(&one), DaemonPaths::for_config(&two))
+        });
+
+        assert!(first.socket.starts_with(runtime.path()));
+        assert_ne!(first.socket, second.socket);
+    }
+
+    #[test]
+    fn a_relocated_socket_is_short_enough_to_bind() {
+        let runtime = a_runtime_dir();
+        let (_root, config) = a_project_too_deep_for_a_socket();
+
+        let paths = with_runtime_dir(Some(runtime.path()), || DaemonPaths::for_config(&config));
+
+        assert!(
+            paths.socket.as_os_str().len() <= MAX_SOCKET_PATH,
+            "{} is {} bytes",
+            paths.socket.display(),
+            paths.socket.as_os_str().len()
         );
     }
 }

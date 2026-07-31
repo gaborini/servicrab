@@ -154,6 +154,10 @@ impl Session {
 /// exists: the umask is process-global, so it must not be visible to any other
 /// thread creating a file.  `set_permissions` afterwards is not the mechanism
 /// but a check, for a platform that might ignore the umask for sockets.
+///
+/// The mode is not the only line of defence — [`super::peer`] asks the kernel
+/// who connected — but it is the one that keeps a stranger from ever reaching
+/// `accept`.
 fn bind_socket(socket: &Path) -> Result<std::os::unix::net::UnixListener, String> {
     use nix::sys::stat::{umask, Mode};
     use std::os::unix::fs::PermissionsExt;
@@ -362,6 +366,22 @@ async fn accept_loop(listener: UnixListener, session: Arc<Session>) {
         let Ok((stream, _)) = listener.accept().await else {
             continue;
         };
+        // The socket's mode is the first line of defence, not the only one that
+        // should exist: a project on a filesystem that ignores Unix modes, or a
+        // directory an operator loosened, would otherwise hand the whole stack
+        // to a stranger.  Asking the kernel does not depend on any of that.
+        match super::peer::is_the_same_user(&stream) {
+            Ok(true) => {}
+            Ok(false) => {
+                let peer = super::peer::peer_uid(&stream).unwrap_or_default();
+                tracing::warn!(uid = peer, "refused a connection from another user");
+                continue;
+            }
+            Err(problem) => {
+                tracing::warn!("{problem}; refusing the connection");
+                continue;
+            }
+        }
         let session = Arc::clone(&session);
         // One task per client keeps a stuck reader from blocking everybody
         // else.
