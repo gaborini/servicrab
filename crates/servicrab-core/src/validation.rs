@@ -991,8 +991,20 @@ fn validate_health(
     };
 
     // `retries` is the number of consecutive failures needed to declare the
-    // service unhealthy, so it is always at least one probe.
-    let retries = raw.retries.unwrap_or(3).max(1);
+    // service unhealthy, so it is always at least one probe.  Zero used to be
+    // rewritten to one; it is an error now, like every other out-of-domain
+    // value in this file, because silently disagreeing with the config is a
+    // worse answer than refusing it.
+    let retries = match raw.retries {
+        Some(0) => {
+            errors.push(ConfigError::InvalidHealthRetries {
+                service: service.to_string(),
+            });
+            1
+        }
+        Some(retries) => retries,
+        None => 3,
+    };
 
     Some(HealthCheck {
         probe: probe?,
@@ -1562,21 +1574,21 @@ interval = "10ms""#,
     }
 
     #[test]
-    fn zero_retries_are_normalised_to_one() {
-        let (cfg, _) = load_from_str(&with_health(
+    fn zero_retries_are_rejected() {
+        // A service cannot be declared unhealthy without a single failed
+        // probe, so zero is out of domain rather than a value to be corrected.
+        let err = expect_one_error(&with_health(
             r#"tcp = "127.0.0.1:5432"
 retries = 0"#,
-        ))
-        .unwrap();
-        let health = cfg
-            .services
-            .values()
-            .next()
-            .unwrap()
-            .health
-            .clone()
-            .unwrap();
-        assert_eq!(health.retries, 1);
+        ));
+        assert!(
+            matches!(err, ConfigError::InvalidHealthRetries { .. }),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains("retries must be at least 1"),
+            "{err}"
+        );
     }
 
     #[test]

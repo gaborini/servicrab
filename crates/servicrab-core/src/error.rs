@@ -234,6 +234,11 @@ pub enum ConfigError {
         reason: String,
     },
 
+    /// `[health] retries` is zero, which would mean "unhealthy without ever
+    /// probing".
+    #[error("service {service:?}: [health] retries must be at least 1, got 0")]
+    InvalidHealthRetries { service: String },
+
     /// A malformed byte size in `[project.logs]`.
     #[error("project.logs: invalid size {value:?} for field `{field}`: {reason}")]
     InvalidSize {
