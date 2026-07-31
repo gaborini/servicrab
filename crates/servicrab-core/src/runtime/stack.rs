@@ -182,7 +182,14 @@ impl Slot {
     ) {
         // A previous run may have left the status at something a dependent
         // would read as a verdict; it must not act on that stale news.
-        let _ = self.readiness.send(DependencyStatus::new());
+        //
+        // `send_modify` rather than `send`: the value has to be there for a
+        // dependent that subscribes later, even when nobody is watching yet.
+        // `send` returns `Err` *without writing* when there is no receiver, and
+        // a service with no dependents has none until a reload gives it one.
+        self.readiness.send_modify(|status| {
+            *status = DependencyStatus::new();
+        });
 
         let (stop_tx, stop_rx) = shutdown_channel();
         self.stop = Some(stop_tx);
@@ -894,6 +901,11 @@ async fn supervise_service(
 
     // Relay the runner's events to the stack-wide stream while deriving the
     // readiness signal that dependents are waiting on.
+    //
+    // The readiness value is kept up to date whether or not anybody is
+    // subscribed: a service with no dependents still has to hold a truthful
+    // status, because a reload can add a dependent at any moment and that
+    // dependent reads the current value before it ever sees a change.
     let (tx, mut rx) = event_channel();
     let relay = {
         let global = events.clone();
@@ -901,7 +913,8 @@ async fn supervise_service(
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 if let Some(next) = tracker.observe(&event.kind) {
-                    let _ = readiness.send(next);
+                    // `send_modify` rather than `send`, for the reason above.
+                    readiness.send_modify(|status| *status = next);
                 }
                 let _ = global.send(event);
             }
@@ -1296,6 +1309,44 @@ command = ["sleep", "60"]
             condition,
             status,
         }]
+    }
+
+    #[tokio::test]
+    async fn readiness_is_recorded_even_without_a_subscriber() {
+        // The relay writes the readiness of a service that nobody depends on;
+        // `watch::Sender::send` would refuse to write with no receiver, and a
+        // later `reload` adding a dependent would then read a stale `Pending`.
+        let state = state_for(config(BASE));
+        let readiness = state.slots[&name("api")].readiness.clone();
+        let (tx, mut rx) = event_channel();
+
+        let relay = {
+            let readiness = readiness.clone();
+            let mut tracker = ReadinessTracker::new();
+            tokio::spawn(async move {
+                while let Some(event) = rx.recv().await {
+                    if let Some(next) = tracker.observe(&event.kind) {
+                        readiness.send_modify(|status| *status = next);
+                    }
+                }
+            })
+        };
+
+        assert_eq!(readiness.receiver_count(), 0, "nothing depends on api");
+        for kind in started() {
+            tx.send(ServiceEvent::new(name("api"), kind))
+                .expect("relay alive");
+        }
+        drop(tx);
+        relay.await.expect("relay task");
+
+        assert_eq!(
+            readiness
+                .borrow()
+                .readiness(DependencyCondition::ServiceStarted),
+            Readiness::Ready,
+            "a running service must look ready to a dependent added later"
+        );
     }
 
     #[tokio::test]

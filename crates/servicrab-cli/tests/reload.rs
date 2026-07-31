@@ -363,6 +363,74 @@ command = ["{}"]
 }
 
 #[test]
+fn a_reload_that_adds_a_dependency_does_not_block_the_dependent() {
+    // A service with no dependents has no readiness subscriber, so its status
+    // is only recorded if the supervisor writes it unconditionally.  A reload
+    // that gives it a dependent makes that dependent read the recorded value
+    // first: a stale `pending` there blocks the dependent forever.
+    let dir = TempDir::new().unwrap();
+    let api = resident(dir.path(), "api.sh");
+    let db = resident(dir.path(), "db.sh");
+    let independent = format!(
+        r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}"]
+restart = "always"
+[services.db]
+command = ["{}"]
+restart = "always"
+"#,
+        api.display(),
+        db.display()
+    );
+    let cfg = write_config(dir.path(), &independent);
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("both services to run", |s| {
+        s.matches("running").count() == 2
+    });
+    let api_pid = daemon.pid_of("api");
+
+    // `db` has been up for a while by now, so the only record of its readiness
+    // is the one the supervisor kept while nobody was watching.
+    fs::write(
+        &cfg,
+        format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}"]
+restart = "always"
+depends_on = ["db"]
+[services.db]
+command = ["{}"]
+restart = "always"
+"#,
+            api.display(),
+            db.display()
+        ),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = daemon.reload();
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.contains("1 changed"), "{stdout}");
+
+    // The dependent has to come back up: `db` is running, so its dependency is
+    // satisfied the moment it is consulted.
+    let fresh = daemon.wait_for_pid_change("api", api_pid);
+    assert_ne!(fresh, api_pid);
+    daemon.wait_for_status("both services to run again", |s| {
+        s.matches("running").count() == 2
+    });
+}
+
+#[test]
 fn a_reloaded_service_can_be_controlled_by_name() {
     let dir = TempDir::new().unwrap();
     let api = resident(dir.path(), "api.sh");
