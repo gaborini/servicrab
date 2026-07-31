@@ -1264,7 +1264,10 @@ command = ["sleep", "60"]
     }
 
     #[test]
-    fn a_retired_slot_is_added_again_rather_than_reused() {
+    fn a_retired_slot_is_reported_as_added_again() {
+        // The slot itself is revived rather than replaced (see
+        // `StackSupervisor::reload`), but as far as the diff is concerned the
+        // service is coming back, so it belongs in `added`.
         let mut state = state_for(config(BASE));
         state
             .slots
