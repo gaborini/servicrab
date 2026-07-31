@@ -302,6 +302,34 @@ fn list_truncates_a_long_multi_byte_command_without_panicking() {
         .stdout(contains(expected));
 }
 
+#[test]
+fn list_reports_config_warnings() {
+    // `max_restarts` alongside `restart = "never"` is inert, so loading warns.
+    // `list` used to throw those warnings away, unlike the other commands.
+    let toml = "version = 1\n[project]\nname = \"demo\"\n[services.api]\ncommand = [\"echo\"]\nrestart = \"never\"\nmax_restarts = 3\n";
+    let (_dir, path) = temp_dir_with_config(toml);
+
+    cmd()
+        .arg("list")
+        .arg("--config")
+        .arg(&path)
+        .assert()
+        .success()
+        .stderr(contains("max_restarts"));
+
+    // On stderr, so `--json` output stays parseable on stdout.
+    let assert = cmd()
+        .arg("list")
+        .arg("--config")
+        .arg(&path)
+        .arg("--json")
+        .assert()
+        .success()
+        .stderr(contains("max_restarts"));
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    serde_json::from_str::<serde_json::Value>(&stdout).expect("valid JSON");
+}
+
 // ── profiles ───────────────────────────────────────────────────────────────
 
 #[test]
