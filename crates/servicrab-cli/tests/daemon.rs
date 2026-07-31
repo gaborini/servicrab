@@ -408,6 +408,80 @@ restart = "always"
     assert_eq!(mode, 0o600, "socket mode is {mode:o}, expected 600");
 }
 
+/// The mode must hold from the instant the socket exists, not only once the
+/// daemon is up.
+///
+/// Binding and then chmod-ing leaves a window where the socket is live and
+/// group-writable, and whoever connects in it gets full start/stop/shutdown
+/// authority.  Sampling the mode after `start` returns cannot see that window,
+/// so this test watches for the socket to appear and reads the mode on its very
+/// first sighting — under a umask of 000, which is what makes the window as
+/// wide as it can possibly be.
+#[test]
+fn the_socket_is_never_group_writable_even_for_an_instant() {
+    let dir = TempDir::new().unwrap();
+    let svc = resident(dir.path(), "api.sh");
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}"]
+restart = "always"
+"#,
+            svc.display()
+        ),
+    );
+    let socket = dir.path().join(".servicrab/daemon.sock");
+
+    // `sh -c 'umask 000; …'` rather than touching this process's umask: that is
+    // global, and the other tests in this binary run in parallel.
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "umask 000; exec {} daemon --config {}",
+            shell_quote(&binary()),
+            shell_quote(&cfg)
+        ))
+        .env_remove("RUST_LOG")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn the daemon");
+
+    // Spin without a sleep: the window this is looking for is microseconds
+    // wide, so any pause would step right over it.
+    let deadline = Instant::now() + CEILING;
+    let mode = loop {
+        if let Ok(meta) = fs::metadata(&socket) {
+            break meta.permissions().mode() & 0o777;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the socket never appeared within {CEILING:?}"
+        );
+    };
+
+    let _ = kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM);
+    wait_bounded(&mut child);
+
+    assert_eq!(
+        mode, 0o600,
+        "the socket was {mode:o} when it first existed: anyone in the group \
+         could have driven the daemon"
+    );
+}
+
+/// Quote a path for `sh -c`.  The test paths are temp dirs, so this only has to
+/// survive spaces, but it must not silently mangle anything either.
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+}
+
 #[test]
 fn starting_twice_is_refused() {
     let dir = TempDir::new().unwrap();

@@ -134,23 +134,49 @@ impl Session {
     }
 }
 
-/// Restrict the freshly bound socket to its owner.
+/// Bind the project socket so that it is unreachable by anyone else from the
+/// moment it exists.
 ///
 /// Connecting to a Unix socket needs write permission on the socket file, and
 /// a client that can connect can start, stop and restart every service in the
 /// project.  `bind` applies the process umask, which is 022 on most systems but
 /// 002 on distributions that give each user a private group — there the whole
-/// group would be able to drive the daemon.  Setting the mode explicitly means
-/// the guarantee does not depend on how the operator's shell was configured.
+/// group would be able to drive the daemon.
 ///
-/// A project socket may also land in the shared temp directory when the path
-/// next to the config would exceed the socket length limit, which makes this
-/// matter more, not less.
-fn restrict_socket(socket: &Path) -> Result<(), String> {
+/// Restricting the mode after `bind` is not enough: between the two calls the
+/// socket is live and group-writable, and whoever wins that race gets full
+/// start/stop/shutdown authority.  The invariant this function keeps is
+/// therefore stronger than "ends up 0600": **the socket is never reachable by
+/// anyone but its owner, not even for an instant.**  A umask around `bind`
+/// is what buys that, because the mode is applied when the inode is created.
+///
+/// The bind is deliberately synchronous and happens before the async runtime
+/// exists: the umask is process-global, so it must not be visible to any other
+/// thread creating a file.  `set_permissions` afterwards is not the mechanism
+/// but a check, for a platform that might ignore the umask for sockets.
+fn bind_socket(socket: &Path) -> Result<std::os::unix::net::UnixListener, String> {
+    use nix::sys::stat::{umask, Mode};
     use std::os::unix::fs::PermissionsExt;
 
-    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("could not restrict {} to its owner: {e}", socket.display()))
+    // 0o177 masks away every bit but the owner's read and write.
+    let previous = umask(Mode::from_bits_truncate(0o177));
+    let bound = std::os::unix::net::UnixListener::bind(socket);
+    umask(previous);
+
+    let listener = bound.map_err(|e| format!("could not listen on {}: {e}", socket.display()))?;
+
+    let mode = std::fs::metadata(socket)
+        .map(|meta| meta.permissions().mode() & 0o777)
+        .unwrap_or(0);
+    if mode != 0o600 {
+        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("could not restrict {} to its owner: {e}", socket.display()))?;
+    }
+
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("could not prepare {}: {e}", socket.display()))?;
+    Ok(listener)
 }
 
 /// Run the daemon in this process until the stack stops or shutdown is
@@ -200,6 +226,10 @@ pub fn serve(
     // A socket file always survives its daemon, and the lock proves ours is
     // gone, so a leftover here is stale.
     let _ = std::fs::remove_file(&paths.socket);
+    // Bound before the runtime exists: the umask that keeps the socket private
+    // is process-global, so no other thread may be creating files while it is
+    // in effect.
+    let bound = bind_socket(&paths.socket)?;
 
     let registry = Arc::new(Mutex::new(StatusRegistry::new(plan.iter().map(|name| {
         let has_health = cfg
@@ -225,9 +255,8 @@ pub fn serve(
         .map_err(|e| format!("failed to start the async runtime: {e}"))?;
 
     let result = runtime.block_on(async {
-        let listener = UnixListener::bind(&paths.socket)
+        let listener = UnixListener::from_std(bound)
             .map_err(|e| format!("could not listen on {}: {e}", paths.socket.display()))?;
-        restrict_socket(&paths.socket)?;
 
         // One channel drives shutdown, whether it was asked for by a signal or
         // over the socket.
