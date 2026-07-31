@@ -434,6 +434,113 @@ restart = "always"
     assert!(stderr.contains("already running"), "{stderr}");
 }
 
+/// Two starts that overlap must not both end up supervising the stack.
+///
+/// Checking the socket and then binding it is a race: interleaved, the second
+/// process unlinks the first one's live socket and binds its own, and both
+/// daemons then run the whole stack — duplicate processes, duplicate port
+/// binds.  The pidfile lock is what decides, so the verdict here is the number
+/// of service processes the project actually has, not what either `start` said.
+#[test]
+fn two_concurrent_starts_leave_exactly_one_daemon() {
+    let dir = TempDir::new().unwrap();
+    // A distinctive argument makes this service countable with `pgrep -f`
+    // without matching anything else on the machine.
+    let marker = format!("servicrab-race-{}", std::process::id());
+    let svc = script(
+        dir.path(),
+        "api.sh",
+        "trap 'exit 0' TERM INT\nwhile true; do sleep 0.2; done",
+    );
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}", "{marker}"]
+restart = "always"
+"#,
+            svc.display()
+        ),
+    );
+
+    let daemon = Daemon::guard(&cfg);
+    let mut starts: Vec<Child> = (0..2).map(|_| spawn_cli(&["start"], &cfg)).collect();
+    let codes: Vec<i32> = starts.iter_mut().map(wait_bounded).collect();
+
+    assert_eq!(
+        codes.iter().filter(|code| **code == 0).count(),
+        1,
+        "exactly one start should have succeeded, got {codes:?}"
+    );
+
+    // The survivor is a working daemon, not just a process holding a lock.
+    let status = daemon.wait_for_status("api to run", |s| s.contains("running"));
+    assert!(status.contains("api"), "{status}");
+
+    // And there is one copy of the service, not two.  Both daemons would have
+    // started their own, and the second one would have unlinked the first's
+    // socket, so `status` alone cannot tell the two cases apart.
+    let processes = wait_for_processes(&marker, 1);
+    assert_eq!(
+        processes, 1,
+        "{processes} copies of the service are running; two daemons supervised it"
+    );
+
+    // The loser did not take the winner's runtime files with it when it exited.
+    assert!(
+        dir.path().join(".servicrab/daemon.sock").exists(),
+        "the socket was removed under the running daemon"
+    );
+    assert!(
+        dir.path().join(".servicrab/daemon.pid").exists(),
+        "the pidfile was removed under the running daemon"
+    );
+
+    assert_eq!(cli(&["down"], &cfg).0, 0);
+    assert_eq!(
+        wait_for_processes(&marker, 0),
+        0,
+        "a service outlived the daemon"
+    );
+}
+
+/// How many processes match `marker`, once that count has settled on `expected`
+/// or the ceiling runs out.
+///
+/// Polling rather than sleeping: a second daemon needs a moment to spawn its
+/// own copy, and asserting too early would pass for the wrong reason.
+fn wait_for_processes(marker: &str, expected: usize) -> usize {
+    let deadline = Instant::now() + CEILING;
+    let mut seen = count_processes(marker);
+    while seen != expected && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        seen = count_processes(marker);
+    }
+    // One more look after a settling pause, so a *second* copy that arrives
+    // late still fails the test rather than sneaking in after it passed.
+    if seen == expected {
+        std::thread::sleep(Duration::from_millis(500));
+        seen = count_processes(marker);
+    }
+    seen
+}
+
+fn count_processes(marker: &str) -> usize {
+    let output = Command::new("pgrep")
+        .arg("-f")
+        .arg(marker)
+        .output()
+        .expect("pgrep is available on Linux and macOS");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+}
+
 #[test]
 fn status_without_a_daemon_is_not_an_error_message_soup() {
     let dir = TempDir::new().unwrap();

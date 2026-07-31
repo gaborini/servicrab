@@ -176,14 +176,29 @@ pub fn serve(
     }
 
     paths.ensure_dir()?;
-    // A socket file always survives its daemon, so a stale one is only an
-    // error if somebody is still listening on it.
+    // One daemon per project, decided by the kernel rather than by a check
+    // that another start could slip past.  The lock is held for the whole run.
+    let lock = match super::lock::ProjectLock::acquire(&paths.pid) {
+        Ok(lock) => lock,
+        Err(super::lock::LockError::Held) => {
+            return Err(format!(
+                "a daemon is already running for this project (pidfile: {})",
+                paths.pid.display()
+            ))
+        }
+        Err(super::lock::LockError::Failed(problem)) => return Err(problem),
+    };
+    // Holding the lock rules out every daemon that takes it, so anything still
+    // answering on the socket is either a release from before the lock existed
+    // or an impostor.  Refusing is the only safe answer to both.
     if super::client::is_running(&paths.socket) {
         return Err(format!(
             "a daemon is already running for this project (socket: {})",
             paths.socket.display()
         ));
     }
+    // A socket file always survives its daemon, and the lock proves ours is
+    // gone, so a leftover here is stale.
     let _ = std::fs::remove_file(&paths.socket);
 
     let registry = Arc::new(Mutex::new(StatusRegistry::new(plan.iter().map(|name| {
@@ -256,7 +271,8 @@ pub fn serve(
         session.respawn_watchers(cfg, &plan);
         let server = tokio::spawn(accept_loop(listener, Arc::clone(&session)));
 
-        write_pid(&paths.pid)?;
+        // The pidfile is already written and locked; this is the point where a
+        // client can reach us.
         tracing::info!(project = %project, socket = %paths.socket.display(), "daemon ready");
 
         let supervisor = StackSupervisor::new(cfg, plan, stack_options, events_tx)
@@ -277,9 +293,10 @@ pub fn serve(
     });
 
     // Clean up even when the run failed, so the next start is not blocked by
-    // our leftovers.
+    // our leftovers.  Dropping the lock removes the pidfile, and it goes last:
+    // until then no other daemon can get as far as binding the socket.
     let _ = std::fs::remove_file(&paths.socket);
-    let _ = std::fs::remove_file(&paths.pid);
+    drop(lock);
 
     let outcome = result?;
     if !outcome.is_success() {
@@ -638,9 +655,4 @@ async fn command(
             message: "the stack stopped before the command completed".to_string(),
         },
     }
-}
-
-fn write_pid(path: &Path) -> Result<(), String> {
-    std::fs::write(path, format!("{}\n", std::process::id()))
-        .map_err(|e| format!("could not write {}: {e}", path.display()))
 }

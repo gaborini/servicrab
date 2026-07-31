@@ -13,6 +13,8 @@ use crate::daemon::{stopped, DaemonPaths};
 
 /// How long to wait for a freshly spawned daemon to answer.
 const START_TIMEOUT: Duration = Duration::from_secs(15);
+/// How often to check on a daemon that has not answered yet.
+const START_POLL: Duration = Duration::from_millis(50);
 /// How long to wait for a stopping daemon to disappear.
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long `--wait` waits for readiness when `--timeout` is not given.
@@ -105,6 +107,10 @@ mod imp {
 
         let (cfg, config_path, paths) = setup(config)?;
 
+        // An advisory fast path for a friendly message.  It cannot be
+        // authoritative — another `start` may be between this check and its
+        // daemon's lock — so the daemon takes the pidfile lock and this code
+        // reports whatever it says.
         if client::is_running(&paths.socket) {
             return Err(format!(
                 "a daemon is already running for {} — use `servicrab status` or `servicrab down`",
@@ -153,16 +159,7 @@ mod imp {
             .spawn()
             .map_err(|e| format!("could not start the daemon: {e}"))?;
 
-        if !client::wait_until_running(&paths.socket, START_TIMEOUT) {
-            // Reap it so a failed start does not leave a zombie behind.
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!(
-                "the daemon did not come up within {}s — see {}",
-                START_TIMEOUT.as_secs(),
-                paths.log.display()
-            ));
-        }
+        wait_for_the_daemon(&mut child, &paths)?;
 
         let color = style::color_enabled();
         println!(
@@ -195,8 +192,54 @@ mod imp {
         Ok(0)
     }
 
-    /// What a status snapshot says about one service's readiness.
+    /// Wait for the spawned daemon to answer, or to tell us why it will not.
     ///
+    /// Two starts can race here, and only one of them gets the project lock.
+    /// The loser exits straight away — while the *winner's* socket is up, so
+    /// only the child's own exit status can tell the two apart.  Watching it
+    /// also turns a 15-second timeout into an immediate, accurate message, and
+    /// reaps the process either way.
+    fn wait_for_the_daemon(
+        child: &mut std::process::Child,
+        paths: &DaemonPaths,
+    ) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + START_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if !status.success() => {
+                    return Err(format!(
+                        "the daemon we started exited with {} — see {}",
+                        status
+                            .code()
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "a signal".to_string()),
+                        paths.log.display()
+                    ))
+                }
+                // A stack of nothing but one-shot services can be finished
+                // before we look, and that is a start that worked.
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => {}
+                Err(err) => return Err(format!("could not watch the daemon: {err}")),
+            }
+            if client::is_running(&paths.socket) {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                // Reap it so a failed start does not leave a zombie behind.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "the daemon did not come up within {}s — see {}",
+                    START_TIMEOUT.as_secs(),
+                    paths.log.display()
+                ));
+            }
+            std::thread::sleep(START_POLL);
+        }
+    }
+
+    /// What a status snapshot says about one service's readiness.    ///
     /// The same three answers the supervisor's own dependency gating uses under
     /// its *default* condition, so `--wait` returns when a dependent that did
     /// not spell out a condition would have been allowed to start.  A spelled

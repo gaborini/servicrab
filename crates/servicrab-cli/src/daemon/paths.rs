@@ -18,6 +18,10 @@ pub struct DaemonPaths {
     /// The Unix socket clients connect to.
     pub socket: PathBuf,
     /// File holding the daemon's process id while it runs.
+    ///
+    /// Nothing reads the number — every command decides liveness by connecting
+    /// to the socket — but the daemon holds an exclusive `flock` on this file
+    /// for its entire life, and that is what keeps two daemons off one project.
     pub pid: PathBuf,
     /// Where a detached daemon's own output is appended.
     pub log: PathBuf,

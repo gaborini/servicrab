@@ -129,18 +129,6 @@ pub fn is_running(socket: &Path) -> bool {
     matches!(send(socket, &Request::Ping), Ok(Response::Pong { .. }))
 }
 
-/// Poll until the daemon answers, or `timeout` elapses.
-pub fn wait_until_running(socket: &Path, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if is_running(socket) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
-}
-
 /// Poll until the daemon stops answering, or `timeout` elapses.
 pub fn wait_until_stopped(socket: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
