@@ -69,6 +69,7 @@ pub fn to_wire_event(kind: &EventKind) -> Event {
             message: message.clone(),
         },
         EventKind::WatchTruncated { limit } => Event::WatchTruncated { limit: *limit },
+        EventKind::LogLinesDropped { count } => Event::LogLinesDropped { count: *count },
         EventKind::Failed { message } => Event::Failed {
             message: message.clone(),
         },

@@ -4,7 +4,7 @@
 //! without it this command explains how to turn file logging on rather than
 //! silently printing nothing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::Duration;
@@ -32,7 +32,7 @@ pub struct LogsOptions {
 /// Services that set `[services.<name>.logs] enabled = false` are excluded.
 pub fn router_for(cfg: &Config) -> Option<LogRouter> {
     let settings = cfg.project.logs.clone()?;
-    let excluded: Vec<ServiceName> = cfg
+    let excluded: BTreeSet<ServiceName> = cfg
         .services
         .values()
         .filter(|svc| !svc.log_to_file)

@@ -95,6 +95,18 @@ mod tests {
     }
 
     #[test]
+    fn a_dropped_line_notice_survives_a_round_trip() {
+        let response = Response::Event {
+            service: "api".to_string(),
+            event: crate::Event::LogLinesDropped { count: 42 },
+        };
+        let line = encode(&response).unwrap();
+        assert!(line.contains("\"kind\":\"log_lines_dropped\""), "{line}");
+        assert!(line.contains("\"count\":42"), "{line}");
+        assert_eq!(decode::<Response>(&line).unwrap(), response);
+    }
+
+    #[test]
     fn event_payloads_omit_absent_exit_details() {
         let response = Response::Event {
             service: "api".to_string(),

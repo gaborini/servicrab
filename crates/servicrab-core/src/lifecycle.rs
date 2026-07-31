@@ -190,6 +190,12 @@ pub enum ShutdownReason {
     UserInterrupt,
     /// The supervisor itself received SIGTERM.
     Terminated,
+    /// The supervisor's controlling terminal went away (SIGHUP).
+    ///
+    /// Distinct from [`ShutdownReason::Terminated`] because the cause is
+    /// different — a closed terminal rather than a deliberate `kill` — and
+    /// because it maps to a different exit code.
+    HangUp,
     /// The restart limit was exhausted.
     RestartLimit,
     /// Another service in the stack failed and the whole stack is being torn
@@ -207,7 +213,10 @@ impl ShutdownReason {
     pub fn is_user_requested(self) -> bool {
         matches!(
             self,
-            ShutdownReason::UserInterrupt | ShutdownReason::Terminated | ShutdownReason::Requested
+            ShutdownReason::UserInterrupt
+                | ShutdownReason::Terminated
+                | ShutdownReason::HangUp
+                | ShutdownReason::Requested
         )
     }
 }
@@ -217,6 +226,7 @@ impl std::fmt::Display for ShutdownReason {
         match self {
             ShutdownReason::UserInterrupt => write!(f, "interrupted by user"),
             ShutdownReason::Terminated => write!(f, "supervisor terminated"),
+            ShutdownReason::HangUp => write!(f, "controlling terminal closed"),
             ShutdownReason::RestartLimit => write!(f, "restart limit exhausted"),
             ShutdownReason::StackFailure => write!(f, "another service failed"),
             ShutdownReason::Requested => write!(f, "stopped on request"),
@@ -593,7 +603,11 @@ mod tests {
 
     #[test]
     fn user_shutdown_never_restarts() {
-        for reason in [ShutdownReason::UserInterrupt, ShutdownReason::Terminated] {
+        for reason in [
+            ShutdownReason::UserInterrupt,
+            ShutdownReason::Terminated,
+            ShutdownReason::HangUp,
+        ] {
             let mut t = tracker(RestartPolicy::Always);
             assert_eq!(
                 t.decide(outcome(ExitReason::Code(1)), Some(reason)),
@@ -735,6 +749,9 @@ mod tests {
     fn restart_limit_shutdown_is_not_user_requested() {
         assert!(ShutdownReason::UserInterrupt.is_user_requested());
         assert!(ShutdownReason::Terminated.is_user_requested());
+        // A closed terminal is the user going away, not a failure to restart
+        // around: `restart = "always"` must not resurrect the service.
+        assert!(ShutdownReason::HangUp.is_user_requested());
         assert!(!ShutdownReason::RestartLimit.is_user_requested());
     }
 }

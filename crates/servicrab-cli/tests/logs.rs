@@ -431,6 +431,77 @@ command = ["{}"]
 }
 
 #[test]
+fn every_line_reaches_the_file_across_a_graceful_stop() {
+    // The writer batches its flushes, so the interesting case is the tail: the
+    // lines that were still buffered when the stack was asked to stop.  They
+    // have to be on disk by the time the process exits, in order, with nothing
+    // missing in between.
+    // Fewer than the event channel's log-line allowance, so nothing is dropped
+    // and the batched flush is what the test is about; far more than one flush
+    // batch, so the tail really is still buffered when the stop arrives.
+    const LINES: usize = 900;
+
+    let dir = TempDir::new().unwrap();
+    let done = dir.path().join("printed");
+    let chatty = script(
+        dir.path(),
+        "chatty.sh",
+        &format!(
+            "awk 'BEGIN{{for (i = 1; i <= {LINES}; i++) print \"line \" i}}'\necho printed > {}\nsleep 30",
+            done.display()
+        ),
+    );
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[project.logs]
+dir = "logs"
+max_size = "1MB"
+max_files = 1
+[services.api]
+command = ["{}"]
+restart = "never"
+"#,
+            chatty.display()
+        ),
+    );
+
+    let mut stack = spawn(&["up"], &cfg);
+    // Keep reading the terminal output, so the renderer never stalls on a full
+    // pipe: what is being tested here is the batched flush, not the drop policy
+    // that a stalled consumer would trigger.
+    let terminal = stack.stdout.take().expect("stdout");
+    let drain = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut sink = Vec::new();
+        let _ = std::io::BufReader::new(terminal).read_to_end(&mut sink);
+    });
+
+    // The script is done printing, so every line is either in the pipe, in the
+    // queue or already written — a stop from here must lose none of them.
+    wait_for_file(&done);
+    interrupt(&stack);
+    wait_bounded(&mut stack);
+    drain.join().expect("drain thread");
+
+    let written = fs::read_to_string(dir.path().join("logs/api.log")).unwrap();
+    let seen: Vec<&str> = written.lines().collect();
+    let expected: Vec<String> = (1..=LINES).map(|i| format!("line {i}")).collect();
+    assert_eq!(
+        seen.len(),
+        LINES,
+        "lost {} line(s) of output; last written was {:?}",
+        LINES - seen.len().min(LINES),
+        seen.last()
+    );
+    assert_eq!(seen, expected, "output was reordered");
+}
+
+#[test]
 fn run_also_writes_a_log_file_while_still_printing_output() {
     let dir = TempDir::new().unwrap();
     let hello = script(dir.path(), "hello.sh", "echo hello-from-run");

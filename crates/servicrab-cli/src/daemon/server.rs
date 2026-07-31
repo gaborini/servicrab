@@ -12,7 +12,7 @@ use servicrab_core::runtime::stack::{Control, ControlTx, StackOptions, StackSupe
 use servicrab_core::runtime::{control_channel, shutdown_channel, wait_for_shutdown};
 use servicrab_core::{
     event_channel, load, plan_stack, Config, EventKind, EventReceiver, EventSender, LogRouter,
-    ServiceName, ShutdownReason, SignalWatcher, StatusRegistry,
+    LogSink, ServiceName, ShutdownReason, SignalWatcher, StatusRegistry,
 };
 use servicrab_protocol::{decode, encode, Request, Response};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -290,15 +290,21 @@ pub fn serve(
 
 /// Keep the status registry current, copy output to the log files, and hand
 /// every event to whoever is subscribed.
+///
+/// The file work is handed to a blocking task: the collector shares its worker
+/// threads with the supervisor, so a stalled disk here would stall child
+/// `wait()`s, health probes and the control channel too.
 async fn collect(
     mut events: EventReceiver,
     registry: Arc<Mutex<StatusRegistry>>,
-    mut logs: Option<LogRouter>,
+    logs: Option<LogRouter>,
     stream: tokio::sync::broadcast::Sender<servicrab_core::ServiceEvent>,
 ) {
+    let sink = logs.map(LogSink::spawn);
+
     while let Some(event) = events.recv().await {
-        if let (Some(router), EventKind::Log { line, .. }) = (logs.as_mut(), &event.kind) {
-            if let Some(problem) = router.record(&event.service, line) {
+        if let (Some(sink), EventKind::Log { line, .. }) = (sink.as_ref(), &event.kind) {
+            if let Some(problem) = sink.record(&event.service, line) {
                 tracing::warn!("{problem}");
             }
         }
@@ -307,6 +313,13 @@ async fn collect(
         }
         // Nobody subscribed is the normal case, and not an error.
         let _ = stream.send(event);
+    }
+
+    // The daemon is stopping; queued lines still have to reach the disk.
+    if let Some(sink) = sink {
+        if let Some(problem) = sink.shutdown().await {
+            tracing::warn!("{problem}");
+        }
     }
 }
 

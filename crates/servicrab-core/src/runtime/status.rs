@@ -175,6 +175,9 @@ impl StatusRegistry {
                     "watch: more than {limit} files; narrow `paths` or add `ignore` entries"
                 ));
             }
+            EventKind::LogLinesDropped { count } => {
+                entry.message = Some(format!("dropped {count} output line(s)"));
+            }
             // Log lines are far too frequent to keep, and `Exited` is already
             // reflected by the state transition that follows it.
             EventKind::Log { .. } | EventKind::Exited { .. } | EventKind::Stopping { .. } => {}

@@ -25,6 +25,37 @@ use tracing::{debug, info, warn};
 use crate::config::{HealthCheck, HealthProbe, Service, ServiceName, UnhealthyAction};
 use crate::runtime::event::{EventKind, EventSink};
 
+/// Ceiling for the consecutive-failure counter.
+///
+/// A probe that is permanently dead under `on_unhealthy = "ignore"` keeps
+/// ticking for as long as the service runs, and the count stops carrying any
+/// information long before it stops fitting in a `u32`.  The effective ceiling
+/// is never below `retries`, so the "budget exhausted" transition is still
+/// reached.
+const MAX_CONSECUTIVE_FAILURES: u32 = 100_000;
+
+/// While a probe keeps failing, report every this many failures.
+///
+/// The first failure and the one that exhausts the retry budget are always
+/// reported; this bounds how sparse the rest is, so a long outage still leaves a
+/// trace without being a perpetual event source.
+const REPORT_FAILURE_EVERY: u32 = 100;
+
+/// Whether a failure at `consecutive` should be published.
+///
+/// The first failure always is — an operator must see that something broke —
+/// and so is the one that exhausts the retry budget, because that is the
+/// transition to unhealthy.  In between, at most one report per
+/// [`REPORT_FAILURE_EVERY`] failures: a probe that is permanently dead under
+/// `on_unhealthy = "ignore"` would otherwise be a perpetual event source,
+/// published to every `events` subscriber and written into the status registry
+/// on every single tick.
+fn should_report_failure(consecutive: u32, retries: u32, reported_at: u32) -> bool {
+    consecutive == 1
+        || consecutive == retries
+        || consecutive >= reported_at.saturating_add(REPORT_FAILURE_EVERY)
+}
+
 /// What a health monitor reports back to the service runner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HealthSignal {
@@ -197,6 +228,11 @@ impl HealthMonitor {
 
     /// Probe until the monitor is dropped, reporting transitions on the
     /// returned channel.
+    ///
+    /// The channel is unbounded, deliberately: only *transitions* travel on it —
+    /// the first successful probe and each exhaustion of the retry budget — so a
+    /// permanently failing probe adds nothing to it per tick.  Only the log-line
+    /// path is bounded; see [`crate::runtime::event::MAX_QUEUED_LOG_LINES`].
     pub fn spawn(self) -> mpsc::UnboundedReceiver<HealthSignal> {
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move { self.run(tx).await });
@@ -212,6 +248,11 @@ impl HealthMonitor {
         // as soon as the process is up so readiness is not delayed.
         let mut consecutive = 0u32;
         let mut ready = false;
+        // Which failure was last published, so the reports can be thinned out.
+        let mut reported_at = 0u32;
+        // Never below `retries`, so capping the counter cannot swallow the
+        // transition below.
+        let ceiling = MAX_CONSECUTIVE_FAILURES.max(self.check.retries);
 
         loop {
             ticker.tick().await;
@@ -222,6 +263,9 @@ impl HealthMonitor {
             match probe_once(&self.check.probe, &self.ctx, self.check.timeout).await {
                 Ok(()) => {
                     consecutive = 0;
+                    // A recovery makes the next failure a first failure again,
+                    // so it is reported rather than thinned out.
+                    reported_at = 0;
                     if !ready {
                         ready = true;
                         info!(service = %name, probe = %self.check.probe, "service is healthy");
@@ -245,7 +289,11 @@ impl HealthMonitor {
                         continue;
                     }
 
-                    consecutive += 1;
+                    // Saturating and capped: a permanently dead probe under
+                    // `on_unhealthy = "ignore"` keeps ticking forever, and the
+                    // count stops being interesting long before it stops
+                    // fitting.
+                    consecutive = consecutive.saturating_add(1).min(ceiling);
                     warn!(
                         service = %name,
                         %message,
@@ -253,14 +301,20 @@ impl HealthMonitor {
                         retries = self.check.retries,
                         "health probe failed"
                     );
-                    self.events.emit(
-                        &name,
-                        EventKind::HealthProbeFailed {
-                            message: message.clone(),
-                            consecutive,
-                            retries: self.check.retries,
-                        },
-                    );
+                    // Throttled; see `should_report_failure`.  Once the counter
+                    // sits at its ceiling nothing is reported any more, because
+                    // there is nothing new left to say.
+                    if should_report_failure(consecutive, self.check.retries, reported_at) {
+                        reported_at = consecutive;
+                        self.events.emit(
+                            &name,
+                            EventKind::HealthProbeFailed {
+                                message: message.clone(),
+                                consecutive,
+                                retries: self.check.retries,
+                            },
+                        );
+                    }
 
                     // Report the transition once, when the budget is first
                     // exhausted.  Monitoring continues so that a service left
@@ -422,5 +476,60 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("unhealthy HTTP status 503"), "{err}");
+    }
+
+    #[test]
+    fn the_first_failure_is_always_reported() {
+        assert!(should_report_failure(1, 3, 0));
+    }
+
+    #[test]
+    fn exhausting_the_retry_budget_is_reported() {
+        // 2 is neither the first failure nor a multiple of the throttle, but it
+        // is the transition to unhealthy, which nobody may miss.
+        assert!(!should_report_failure(2, 3, 1));
+        assert!(should_report_failure(3, 3, 1));
+    }
+
+    #[test]
+    fn a_permanently_dead_probe_is_reported_sparsely() {
+        // A run of 1 000 failures with `retries = 1`: the first is reported —
+        // it is both the first failure and the transition to unhealthy — and
+        // after that the reports thin out to one per `REPORT_FAILURE_EVERY`.
+        const TICKS: u32 = 1_000;
+        let mut reported = Vec::new();
+        let mut reported_at = 0u32;
+        for consecutive in 1..=TICKS {
+            if should_report_failure(consecutive, 1, reported_at) {
+                reported_at = consecutive;
+                reported.push(consecutive);
+            }
+        }
+        assert_eq!(reported.first(), Some(&1), "the first failure must be seen");
+        assert_eq!(
+            reported.len(),
+            (TICKS / REPORT_FAILURE_EVERY) as usize,
+            "a dead probe must not be a per-tick event source: {reported:?}"
+        );
+    }
+
+    #[test]
+    fn the_failure_counter_stops_at_its_ceiling() {
+        // The ceiling is what keeps `consecutive` from growing without bound on
+        // a probe that never recovers.
+        let ceiling = MAX_CONSECUTIVE_FAILURES.max(3);
+        let mut consecutive = ceiling - 1;
+        for _ in 0..5 {
+            consecutive = consecutive.saturating_add(1).min(ceiling);
+        }
+        assert_eq!(consecutive, ceiling);
+    }
+
+    #[test]
+    fn the_ceiling_never_hides_the_unhealthy_transition() {
+        // A `retries` above the ceiling would otherwise be unreachable, and the
+        // service would never be declared unhealthy at all.
+        let retries = MAX_CONSECUTIVE_FAILURES + 10;
+        assert_eq!(MAX_CONSECUTIVE_FAILURES.max(retries), retries);
     }
 }

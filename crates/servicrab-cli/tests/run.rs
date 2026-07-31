@@ -560,6 +560,56 @@ fn no_orphans_remain_after_a_normal_run() {
 }
 
 #[test]
+fn a_hangup_does_not_leave_the_process_group_behind() {
+    // SIGHUP is what a closing terminal delivers.  Without an explicit handler
+    // its default disposition kills the supervisor outright, and every service
+    // it was supervising keeps running.
+    let dir = TempDir::new().unwrap();
+    let pidfile = dir.path().join("grandchild.pid");
+    let sh = script(
+        dir.path(),
+        "parent.sh",
+        &format!("sleep 30 &\necho $! > {}\nwait", pidfile.display()),
+    );
+    let cfg = config(
+        dir.path(),
+        &format!(
+            "version = 1\n\
+             [project]\nname = \"hangup\"\n\
+             [services.tree]\ncommand = [\"{}\"]\n\
+             restart = \"always\"\nshutdown_timeout = \"1s\"\n",
+            sh.display()
+        ),
+    );
+
+    let mut child = spawn_service_with(&cfg, "tree", Stdio::null(), Stdio::piped());
+    wait_for_file(&pidfile);
+    let grandchild: i32 = fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(is_alive(grandchild), "fixture grandchild should be running");
+
+    kill(Pid::from_raw(child.id() as i32), Signal::SIGHUP).unwrap();
+    let code = wait_bounded(&mut child);
+    let stderr = drain_stderr(&mut child);
+
+    // 129 == 128 + SIGHUP; `restart = "always"` must not resurrect the service
+    // after the terminal went away either.
+    assert_eq!(code, 129, "supervisor said: {stderr}");
+
+    let deadline = Instant::now() + CEILING;
+    while is_alive(grandchild) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !is_alive(grandchild),
+        "grandchild {grandchild} outlived the hung-up supervisor"
+    );
+}
+
+#[test]
 fn missing_executable_reports_a_spawn_failure() {
     let dir = TempDir::new().unwrap();
     let cfg = config(

@@ -13,9 +13,12 @@
 //! its own connection attempts.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use nix::sys::signal::{killpg, Signal};
+use nix::unistd::Pid;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -151,6 +154,12 @@ pub type ControlTx = mpsc::UnboundedSender<Control>;
 pub type ControlRx = mpsc::UnboundedReceiver<Control>;
 
 /// Create a control channel.
+///
+/// Unbounded on purpose: what travels here is one message per operator request
+/// or per watch-triggered restart, so its cardinality is bounded by the number
+/// of services rather than by anything a child process can produce.  Only the
+/// log-line path needs a bound; see
+/// [`crate::runtime::event::MAX_QUEUED_LOG_LINES`].
 pub fn control_channel() -> (ControlTx, ControlRx) {
     mpsc::unbounded_channel()
 }
@@ -160,6 +169,13 @@ struct Slot {
     service: Arc<Service>,
     deps: Vec<DependencyEdge>,
     readiness: Arc<watch::Sender<DependencyStatus>>,
+    /// The process group of the process currently running, or `0`.
+    ///
+    /// Written by the supervision task from the `Started` event and cleared
+    /// when the process ends, so [`stop_all`] can sweep the group of a task it
+    /// has to abort — `abort` alone only reaches the direct child, through
+    /// `kill_on_drop`.
+    pgid: Arc<AtomicI32>,
     /// Present exactly while a supervision task is alive.
     stop: Option<crate::runtime::ShutdownTx>,
     handle: Option<JoinHandle<()>>,
@@ -182,14 +198,23 @@ impl Slot {
     ) {
         // A previous run may have left the status at something a dependent
         // would read as a verdict; it must not act on that stale news.
-        let _ = self.readiness.send(DependencyStatus::new());
+        //
+        // `send_modify` rather than `send`: the value has to be there for a
+        // dependent that subscribes later, even when nobody is watching yet.
+        // `send` returns `Err` *without writing* when there is no receiver, and
+        // a service with no dependents has none until a reload gives it one.
+        self.readiness.send_modify(|status| {
+            *status = DependencyStatus::new();
+        });
 
         let (stop_tx, stop_rx) = shutdown_channel();
         self.stop = Some(stop_tx);
+        self.pgid.store(0, Ordering::Relaxed);
         self.handle = Some(tokio::spawn(supervise_service(
             Arc::clone(&self.service),
             self.deps.clone(),
             Arc::clone(&self.readiness),
+            Arc::clone(&self.pgid),
             stop_rx,
             events,
             options,
@@ -273,6 +298,8 @@ impl<'a> StackSupervisor<'a> {
             output: OutputMode::Capture,
         };
 
+        // Unbounded like the control channel, and for the same reason: exactly
+        // one report per spawned service run.
         let (report_tx, mut report_rx) = mpsc::unbounded_channel::<ServiceReport>();
         let mut state = RunState {
             config: Arc::new(self.config.clone()),
@@ -317,7 +344,17 @@ impl<'a> StackSupervisor<'a> {
                     break;
                 }
                 Some(report) = report_rx.recv() => {
-                    running -= 1;
+                    // Invariant: every report comes from a task that was
+                    // counted when it was spawned, so the counter is never at
+                    // zero here.  Saturate rather than wrap anyway: in a
+                    // release build an undercount would turn into `usize::MAX`
+                    // and `up` would never notice that its stack had finished.
+                    debug_assert!(
+                        running > 0,
+                        "report from {} has no matching spawn",
+                        report.service
+                    );
+                    running = running.saturating_sub(1);
                     let failed = report.result.is_failure();
                     tracing::debug!(service = %report.service, "service finished");
 
@@ -523,7 +560,25 @@ impl<'a> StackSupervisor<'a> {
             let Some(service) = config.services.get(name).cloned() else {
                 continue;
             };
-            state.insert_slot(name, Arc::new(service));
+            let service = Arc::new(service);
+            match state.slots.get_mut(name) {
+                // The slot is still there because an earlier reload dropped it
+                // and its supervision task has not reported back yet.  Revive
+                // that slot rather than replacing it: its `stop` channel and
+                // task handle are the only way the supervisor can still reach
+                // the process that is winding down, and `insert_slot` would
+                // throw both away.
+                Some(slot) => {
+                    debug_assert!(slot.retired, "a live slot for {name} was reported as added");
+                    slot.retired = false;
+                    slot.service = service;
+                    // The replacement is spawned once the old task reports —
+                    // the same hand-off a `restart` uses — so exactly one
+                    // process for this service is ever alive.
+                    slot.restart_when_stopped = slot.stop.is_some();
+                }
+                None => state.insert_slot(name, service),
+            }
         }
 
         for name in &diff.changed {
@@ -548,6 +603,11 @@ impl<'a> StackSupervisor<'a> {
 
         for name in &diff.added {
             if let Some(slot) = state.slots.get_mut(name) {
+                // A revived slot is waiting for its predecessor to report; the
+                // report arm spawns it then.
+                if slot.restart_when_stopped || slot.is_running() {
+                    continue;
+                }
                 slot.spawn(self.events.clone(), run_options, reports.clone());
                 *running += 1;
             }
@@ -577,7 +637,24 @@ impl RunState {
     ///
     /// Dependencies are wired up separately, once every slot exists: a
     /// service must be able to subscribe to slots added after it.
+    ///
+    /// Invariant: this never replaces a slot that still has a supervision task
+    /// behind it.  Overwriting one would discard the `stop` channel and the
+    /// `JoinHandle` that are the supervisor's only hold on a live process
+    /// group, leaving it to outlive the supervisor.  A reload that brings a
+    /// retiring service back revives its slot instead — see
+    /// [`StackSupervisor::reload`].
     fn insert_slot(&mut self, name: &ServiceName, service: Arc<Service>) {
+        debug_assert!(
+            !self
+                .slots
+                .get(name)
+                .is_some_and(|slot| slot.stop.is_some() || slot.handle.is_some()),
+            "insert_slot would overwrite the live slot for {name}"
+        );
+        // The initial receiver is dropped on purpose: a service with no
+        // dependents has no subscriber, and the sender is written with
+        // `send_modify` throughout so the value stays truthful anyway.
         let (state_tx, state_rx) = watch::channel(DependencyStatus::new());
         drop(state_rx);
         self.slots.insert(
@@ -586,6 +663,7 @@ impl RunState {
                 service,
                 deps: Vec::new(),
                 readiness: Arc::new(state_tx),
+                pgid: Arc::new(AtomicI32::new(0)),
                 stop: None,
                 handle: None,
                 restart_when_stopped: false,
@@ -725,7 +803,33 @@ async fn stop_all(
 
         if tokio::time::timeout(grace, &mut handle).await.is_err() {
             tracing::warn!(service = %name, ?grace, "service did not stop in time; detaching");
+            // Invariant: no process group of ours outlives the supervisor.
+            // Aborting the task drops its `ProcessHandle`, and
+            // `kill_on_drop(true)` only reaches the direct child — a grandchild
+            // such as `node` under `npm` would be orphaned.  Sweep the group
+            // first, while there is still a task that knows about it.
+            sweep_group(name, state.slots.get(name));
             handle.abort();
+        }
+    }
+}
+
+/// `SIGKILL` the process group a slot last reported, if it still has one.
+fn sweep_group(name: &ServiceName, slot: Option<&Slot>) {
+    let Some(pgid) = slot.map(|slot| slot.pgid.load(Ordering::Relaxed)) else {
+        return;
+    };
+    // Zero means the service has no process running: either it never started
+    // or its last one has already been reaped, and the kernel is free to hand
+    // that group id to somebody else.
+    if pgid == 0 {
+        return;
+    }
+    match killpg(Pid::from_raw(pgid), Signal::SIGKILL) {
+        Ok(()) => tracing::warn!(service = %name, pgid, "swept the process group before detaching"),
+        Err(errno) if crate::runtime::unix::group_is_gone(errno) => {}
+        Err(errno) => {
+            tracing::warn!(service = %name, pgid, %errno, "could not sweep the process group")
         }
     }
 }
@@ -859,6 +963,7 @@ async fn supervise_service(
     service: Arc<Service>,
     deps: Vec<DependencyEdge>,
     readiness: Arc<watch::Sender<DependencyStatus>>,
+    pgid: Arc<AtomicI32>,
     mut stop: ShutdownRx,
     events: EventSender,
     options: RunOptions,
@@ -894,14 +999,32 @@ async fn supervise_service(
 
     // Relay the runner's events to the stack-wide stream while deriving the
     // readiness signal that dependents are waiting on.
+    //
+    // The readiness value is kept up to date whether or not anybody is
+    // subscribed: a service with no dependents still has to hold a truthful
+    // status, because a reload can add a dependent at any moment and that
+    // dependent reads the current value before it ever sees a change.
     let (tx, mut rx) = event_channel();
     let relay = {
         let global = events.clone();
+        let pgid = Arc::clone(&pgid);
         let mut tracker = ReadinessTracker::new();
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
+                // Publish the process group the supervisor may have to sweep if
+                // it ever has to abort this task, and take it away again as
+                // soon as the process is gone: the kernel is free to reuse the
+                // id once its leader has been reaped.
+                match &event.kind {
+                    EventKind::Started { pgid: group } => pgid.store(*group, Ordering::Relaxed),
+                    EventKind::Exited { .. } | EventKind::Finished { .. } => {
+                        pgid.store(0, Ordering::Relaxed)
+                    }
+                    _ => {}
+                }
                 if let Some(next) = tracker.observe(&event.kind) {
-                    let _ = readiness.send(next);
+                    // `send_modify` rather than `send`, for the reason above.
+                    readiness.send_modify(|status| *status = next);
                 }
                 let _ = global.send(event);
             }
@@ -916,6 +1039,9 @@ async fn supervise_service(
     };
 
     let _ = relay.await;
+    // The process is gone by the time the runner returns; nothing left to
+    // sweep even if this task is aborted from here on.
+    pgid.store(0, Ordering::Relaxed);
 
     let result = match result {
         Ok(outcome) => ServiceResult::Finished(outcome),
@@ -1009,6 +1135,7 @@ async fn wait_for_dependencies(deps: &[DependencyEdge], stop: &mut ShutdownRx) -
 mod tests {
     use super::*;
     use crate::runtime::Selection;
+    use std::os::unix::process::CommandExt;
 
     fn name(raw: &str) -> ServiceName {
         crate::validation::validate_service_name(raw).expect("valid test name")
@@ -1145,7 +1272,10 @@ command = ["sleep", "60"]
     }
 
     #[test]
-    fn a_retired_slot_is_added_again_rather_than_reused() {
+    fn a_retired_slot_is_reported_as_added_again() {
+        // The slot itself is revived rather than replaced (see
+        // `StackSupervisor::reload`), but as far as the diff is concerned the
+        // service is coming back, so it belongs in `added`.
         let mut state = state_for(config(BASE));
         state
             .slots
@@ -1156,6 +1286,24 @@ command = ["sleep", "60"]
         let cfg = config(BASE);
         let plan = crate::runtime::plan_stack(&cfg, Selection::default()).unwrap();
         assert_eq!(state.diff(&cfg, &plan).added, vec![name("worker")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "would overwrite the live slot")]
+    fn inserting_over_a_live_slot_is_a_bug() {
+        // A slot with a `stop` channel is the supervisor's only hold on a live
+        // process group; replacing it would leak that group.  The assertion
+        // makes a future regression fail here rather than in production.
+        let mut state = state_for(config(BASE));
+        let (stop, _rx) = shutdown_channel();
+        state
+            .slots
+            .get_mut(&name("worker"))
+            .expect("slot exists")
+            .stop = Some(stop);
+
+        let service = state.config.services[&name("worker")].clone();
+        state.insert_slot(&name("worker"), Arc::new(service));
     }
 
     #[test]
@@ -1296,6 +1444,116 @@ command = ["sleep", "60"]
             condition,
             status,
         }]
+    }
+
+    #[tokio::test]
+    async fn readiness_is_recorded_even_without_a_subscriber() {
+        // The relay writes the readiness of a service that nobody depends on;
+        // `watch::Sender::send` would refuse to write with no receiver, and a
+        // later `reload` adding a dependent would then read a stale `Pending`.
+        let state = state_for(config(BASE));
+        let readiness = state.slots[&name("api")].readiness.clone();
+        let (tx, mut rx) = event_channel();
+
+        let relay = {
+            let readiness = readiness.clone();
+            let mut tracker = ReadinessTracker::new();
+            tokio::spawn(async move {
+                while let Some(event) = rx.recv().await {
+                    if let Some(next) = tracker.observe(&event.kind) {
+                        readiness.send_modify(|status| *status = next);
+                    }
+                }
+            })
+        };
+
+        assert_eq!(readiness.receiver_count(), 0, "nothing depends on api");
+        for kind in started() {
+            tx.send(ServiceEvent::new(name("api"), kind))
+                .expect("relay alive");
+        }
+        drop(tx);
+        relay.await.expect("relay task");
+
+        assert_eq!(
+            readiness
+                .borrow()
+                .readiness(DependencyCondition::ServiceStarted),
+            Readiness::Ready,
+            "a running service must look ready to a dependent added later"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_detached_service_has_its_process_group_swept() {
+        // Aborting the supervision task drops its `ProcessHandle`, and
+        // `kill_on_drop(true)` only reaches the direct child, so `stop_all`
+        // sweeps the group first.  Here the group is a real process tree the
+        // supervisor never gets to signal, standing in for a task that has
+        // wedged past its grace period.
+        let dir = tempfile::TempDir::new().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let mut state = state_for(config(BASE));
+        let mut leader = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "trap '' TERM INT; sleep 30 & echo $! > {}; wait",
+                pidfile.display()
+            ))
+            .process_group(0)
+            .spawn()
+            .expect("spawned a stand-in process group");
+        let pgid = leader.id() as i32;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let grandchild = loop {
+            if let Ok(pid) = std::fs::read_to_string(&pidfile)
+                .unwrap_or_default()
+                .trim()
+                .parse::<i32>()
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fixture never recorded its grandchild"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        let slot = state.slots.get_mut(&name("api")).expect("slot exists");
+        slot.pgid.store(pgid, Ordering::Relaxed);
+
+        // A task that never finishes: `stop_all` has to give up on it.
+        let (stop, stop_rx) = shutdown_channel();
+        let mut stops = BTreeMap::new();
+        stops.insert(name("api"), stop);
+        let mut handles = BTreeMap::new();
+        handles.insert(
+            name("api"),
+            tokio::spawn(async move {
+                let _rx = stop_rx;
+                std::future::pending::<()>().await;
+            }),
+        );
+
+        // `stop_all` waits out `shutdown_timeout + STOP_GRACE`; with a paused
+        // clock that costs no wall time and stays bounded.
+        tokio::time::pause();
+        stop_all(&state, ShutdownReason::Terminated, &stops, &mut handles).await;
+        tokio::time::resume();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while nix::sys::signal::kill(Pid::from_raw(grandchild), None).is_ok()
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            nix::sys::signal::kill(Pid::from_raw(grandchild), None).is_err(),
+            "grandchild {grandchild} of the detached group {pgid} was orphaned"
+        );
+        let _ = leader.wait();
     }
 
     #[tokio::test]

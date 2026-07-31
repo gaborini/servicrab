@@ -362,6 +362,296 @@ command = ["{}"]
     assert!(stderr.contains("no daemon is running"), "{stderr}");
 }
 
+/// A service that ignores SIGTERM, so its shutdown always runs to the
+/// configured timeout and can be observed while it is still in progress.
+fn stubborn(dir: &Path, name: &str, pids: &Path) -> PathBuf {
+    script(
+        dir,
+        name,
+        &format!(
+            "echo $$ >> {}\ntrap '' TERM\nwhile true; do sleep 0.2; done",
+            pids.display()
+        ),
+    )
+}
+
+fn is_alive(pid: i32) -> bool {
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+}
+
+/// Every pid the stubborn fixture has recorded so far.
+fn recorded_pids(path: &Path) -> Vec<i32> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
+/// Poll until `predicate` holds for the recorded pids, or the ceiling elapses.
+fn wait_for_pids(path: &Path, what: &str, predicate: impl Fn(&[i32]) -> bool) -> Vec<i32> {
+    let deadline = Instant::now() + CEILING;
+    loop {
+        let pids = recorded_pids(path);
+        if predicate(&pids) {
+            return pids;
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for {what}; recorded pids: {pids:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_reload_that_re_adds_a_still_stopping_service_leaves_one_process() {
+    // The dropped slot is still winding down when the second reload brings the
+    // service back.  Replacing that slot would discard the `stop` channel and
+    // the task handle of the process that is on its way out, so the freshly
+    // started one would never be signalled and would outlive the daemon.
+    let dir = TempDir::new().unwrap();
+    let api = resident(dir.path(), "api.sh");
+    let pids = dir.path().join("slow.pids");
+    let slow = stubborn(dir.path(), "slow.sh", &pids);
+
+    let with_slow = format!(
+        r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}"]
+restart = "always"
+[services.slow]
+command = ["{}"]
+restart = "always"
+shutdown_timeout = "4s"
+"#,
+        api.display(),
+        slow.display()
+    );
+    let without_slow = format!(
+        r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}"]
+restart = "always"
+"#,
+        api.display()
+    );
+
+    let cfg = write_config(dir.path(), &with_slow);
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("both services to run", |s| {
+        s.matches("running").count() == 2
+    });
+    let first = wait_for_pids(&pids, "the first process to record itself", |p| {
+        p.len() == 1
+    })[0];
+
+    // Drop the service.  It ignores SIGTERM, so it is still alive — and its
+    // slot still retired — while the next reload is applied.
+    fs::write(&cfg, &without_slow).unwrap();
+    let (code, stdout, stderr) = daemon.reload();
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.contains("1 removed"), "{stdout}");
+    assert!(
+        is_alive(first),
+        "the fixture should still be winding down at this point"
+    );
+
+    // …and put it straight back.
+    fs::write(&cfg, &with_slow).unwrap();
+    let (code, stdout, stderr) = daemon.reload();
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.contains("1 added"), "{stdout}");
+
+    // The replacement runs only once its predecessor is gone: exactly one
+    // process for this service is alive at any time.
+    let all = wait_for_pids(&pids, "the replacement to start", |p| p.len() == 2);
+    let alive: Vec<i32> = all.iter().copied().filter(|pid| is_alive(*pid)).collect();
+    assert_eq!(
+        alive.len(),
+        1,
+        "expected exactly one live process, recorded {all:?}, alive {alive:?}"
+    );
+    daemon.wait_for_status("the replacement to be reported running", |s| {
+        s.matches("running").count() == 2
+    });
+
+    // And the supervisor can still reach it: nothing survives `down`.
+    let (code, stdout, stderr) = cli(&["down"], &cfg);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    let deadline = Instant::now() + CEILING;
+    loop {
+        let survivors: Vec<i32> = all.iter().copied().filter(|pid| is_alive(*pid)).collect();
+        if survivors.is_empty() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("processes {survivors:?} outlived the daemon");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_retired_service_does_not_leave_its_process_group_behind() {
+    // A service dropped by a reload is still winding down when the daemon is
+    // told to stop, and it is no longer in the config, so `stop_all` treats it
+    // specially.  Whichever way it ends — signalled, escalated or detached —
+    // its whole process group has to go, not just the direct child.
+    let dir = TempDir::new().unwrap();
+    let api = resident(dir.path(), "api.sh");
+    let grandchild_pid = dir.path().join("grandchild.pid");
+    let deaf = script(
+        dir.path(),
+        "deaf.sh",
+        &format!(
+            "trap '' TERM\n\
+             (trap '' TERM; echo $$ > {}; while true; do sleep 0.2; done) &\n\
+             while true; do sleep 0.2; done",
+            grandchild_pid.display()
+        ),
+    );
+
+    let with_deaf = format!(
+        r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}"]
+restart = "always"
+[services.deaf]
+command = ["{}"]
+restart = "always"
+shutdown_timeout = "50s"
+"#,
+        api.display(),
+        deaf.display()
+    );
+    let cfg = write_config(dir.path(), &with_deaf);
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("both services to run", |s| {
+        s.matches("running").count() == 2
+    });
+    let deadline = Instant::now() + CEILING;
+    while !grandchild_pid.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let grandchild: i32 = fs::read_to_string(&grandchild_pid)
+        .expect("the fixture should have recorded its grandchild")
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(is_alive(grandchild), "fixture grandchild should be running");
+
+    // Retire the service.  It ignores SIGTERM, so it is still in its 50s
+    // shutdown when the daemon is told to stop.
+    fs::write(
+        &cfg,
+        format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}"]
+restart = "always"
+"#,
+            api.display()
+        ),
+    )
+    .unwrap();
+    let (code, stdout, stderr) = daemon.reload();
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.contains("1 removed"), "{stdout}");
+
+    let (code, stdout, stderr) = cli(&["down"], &cfg);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+
+    let deadline = Instant::now() + CEILING;
+    while is_alive(grandchild) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !is_alive(grandchild),
+        "grandchild {grandchild} outlived the supervisor"
+    );
+}
+
+#[test]
+fn a_reload_that_adds_a_dependency_does_not_block_the_dependent() {
+    // A service with no dependents has no readiness subscriber, so its status
+    // is only recorded if the supervisor writes it unconditionally.  A reload
+    // that gives it a dependent makes that dependent read the recorded value
+    // first: a stale `pending` there blocks the dependent forever.
+    let dir = TempDir::new().unwrap();
+    let api = resident(dir.path(), "api.sh");
+    let db = resident(dir.path(), "db.sh");
+    let independent = format!(
+        r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}"]
+restart = "always"
+[services.db]
+command = ["{}"]
+restart = "always"
+"#,
+        api.display(),
+        db.display()
+    );
+    let cfg = write_config(dir.path(), &independent);
+
+    let daemon = Daemon::start(&cfg);
+    daemon.wait_for_status("both services to run", |s| {
+        s.matches("running").count() == 2
+    });
+    let api_pid = daemon.pid_of("api");
+
+    // `db` has been up for a while by now, so the only record of its readiness
+    // is the one the supervisor kept while nobody was watching.
+    fs::write(
+        &cfg,
+        format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}"]
+restart = "always"
+depends_on = ["db"]
+[services.db]
+command = ["{}"]
+restart = "always"
+"#,
+            api.display(),
+            db.display()
+        ),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = daemon.reload();
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.contains("1 changed"), "{stdout}");
+
+    // The dependent has to come back up: `db` is running, so its dependency is
+    // satisfied the moment it is consulted.
+    let fresh = daemon.wait_for_pid_change("api", api_pid);
+    assert_ne!(fresh, api_pid);
+    daemon.wait_for_status("both services to run again", |s| {
+        s.matches("running").count() == 2
+    });
+}
+
 #[test]
 fn a_reloaded_service_can_be_controlled_by_name() {
     let dir = TempDir::new().unwrap();
