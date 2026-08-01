@@ -55,6 +55,17 @@ pub(crate) fn setup(config: Option<&Path>) -> Result<(Config, PathBuf, DaemonPat
     }
 
     let paths = DaemonPaths::for_config(&path);
+    // Nothing here can work if the socket path cannot be bound, and every
+    // command would otherwise report it differently and unhelpfully: the daemon
+    // as `ENAMETOOLONG` from `bind`, every client as `SUN_LEN` from `connect`.
+    // Said once, with the reason each candidate directory was refused.
+    if !paths.socket_advice().is_empty() {
+        return Err(format!(
+            "the socket for {} cannot be created{}",
+            cfg.project.name,
+            paths.socket_advice()
+        ));
+    }
     Ok((cfg, path, paths))
 }
 

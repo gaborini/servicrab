@@ -170,13 +170,27 @@ fn normalize(path: &Path) -> PathBuf {
 /// the rejections explain what to fix, which is the difference between
 /// "servicrab is broken" and "your `$TMPDIR` is group-readable".
 fn choose_socket(socket: PathBuf, dir: &Path) -> (PathBuf, Vec<String>) {
+    choose_socket_among(socket, dir, candidates())
+}
+
+/// [`choose_socket`] with the candidates handed in, so a test can describe a
+/// system rather than become one.
+///
+/// The alternative is setting `$TMPDIR`, which is process-global and read by
+/// every temporary-directory helper in the suite, including the ones other
+/// modules' tests are using at the same time.
+fn choose_socket_among(
+    socket: PathBuf,
+    dir: &Path,
+    candidates: Vec<(String, Option<PathBuf>)>,
+) -> (PathBuf, Vec<String>) {
     if socket.as_os_str().len() <= MAX_SOCKET_PATH {
         return (socket, Vec::new());
     }
 
     let name = format!("servicrab-{}.sock", project_slug(dir));
     let mut rejections = Vec::new();
-    for (label, value) in candidates() {
+    for (label, value) in candidates {
         let Some(value) = value else {
             rejections.push(format!("{label} is not set"));
             continue;
@@ -294,37 +308,39 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// The socket location reads the environment, which is process-global, so
+    /// The socket location reads `$XDG_RUNTIME_DIR`, which is process-global, so
     /// the tests that set it must not run beside each other.
+    ///
+    /// `$TMPDIR` is deliberately *not* set by any test: every temporary
+    /// directory helper in the suite reads it, including other modules' tests
+    /// running at the same time, so the temp candidate is injected through
+    /// [`choose_socket_among`] instead.
     static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Set `$XDG_RUNTIME_DIR` and `$TMPDIR` for the duration of `body`.
-    ///
-    /// `$TMPDIR` too, because [`std::env::temp_dir`] reads it: leaving the real
-    /// one in place would make the second candidate whatever the machine
-    /// running the tests happens to have, and these tests are about the
-    /// predicate, not about this machine.
-    fn with_env<T>(runtime: Option<&Path>, temp: Option<&Path>, body: impl FnOnce() -> T) -> T {
+    /// Set `$XDG_RUNTIME_DIR` for the duration of `body`.
+    fn with_runtime_dir<T>(value: Option<&Path>, body: impl FnOnce() -> T) -> T {
         let _guard = ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous = [
-            ("XDG_RUNTIME_DIR", std::env::var_os("XDG_RUNTIME_DIR")),
-            ("TMPDIR", std::env::var_os("TMPDIR")),
-        ];
-        // Safety: the mutex above is what keeps this off other threads.
-        for (name, value) in [("XDG_RUNTIME_DIR", runtime), ("TMPDIR", temp)] {
-            match value {
-                Some(path) => unsafe { std::env::set_var(name, path) },
-                None => unsafe { std::env::remove_var(name) },
-            }
+        let previous = std::env::var_os("XDG_RUNTIME_DIR");
+        match value {
+            // Safety: the mutex above is what keeps this off other threads.
+            Some(path) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", path) },
+            None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
         }
         let out = body();
-        for (name, value) in previous {
-            match value {
-                Some(old) => unsafe { std::env::set_var(name, old) },
-                None => unsafe { std::env::remove_var(name) },
-            }
+        match previous {
+            Some(old) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", old) },
+            None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
         }
         out
+    }
+
+    /// The candidate list a system with no `$XDG_RUNTIME_DIR` and `temp` as its
+    /// temporary directory would offer — macOS, in other words.
+    fn only_a_temp_dir(temp: &Path) -> Vec<(String, Option<PathBuf>)> {
+        vec![
+            ("$XDG_RUNTIME_DIR".to_string(), None),
+            ("the temp directory".to_string(), Some(temp.to_path_buf())),
+        ]
     }
 
     /// A short, already-canonical directory to build test directories under.
@@ -364,13 +380,6 @@ mod tests {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode))
             .expect("set the mode");
         dir
-    }
-
-    /// Set `$XDG_RUNTIME_DIR` for the duration of `body`, with a private temp
-    /// directory behind it so it is never the reason a test passes.
-    fn with_runtime_dir<T>(value: Option<&Path>, body: impl FnOnce() -> T) -> T {
-        let private = a_dir_with_mode(0o700);
-        with_env(value, Some(private.path()), body)
     }
 
     /// A directory nested deeply enough that the socket path inside it cannot
@@ -481,10 +490,18 @@ mod tests {
     fn with_nowhere_private_to_go_the_socket_stays_in_the_project() {
         let shared = a_dir_with_mode(0o777);
         let (_root, config) = a_project_too_deep_for_a_socket();
+        let long = with_runtime_dir(None, || DaemonPaths::for_config(&config));
 
-        let paths = with_env(None, Some(shared.path()), || {
-            DaemonPaths::for_config(&config)
-        });
+        let (socket, socket_rejections) = choose_socket_among(
+            long.dir.join("daemon.sock"),
+            &long.dir,
+            only_a_temp_dir(shared.path()),
+        );
+        let paths = DaemonPaths {
+            socket,
+            socket_rejections,
+            ..long
+        };
 
         assert!(paths.socket.starts_with(&paths.dir), "{paths:?}");
         assert!(
@@ -623,22 +640,24 @@ mod tests {
     fn a_private_temp_directory_carries_the_socket_when_the_runtime_dir_is_unset() {
         let temp = a_dir_with_mode(0o700);
         let (_root, config) = a_project_too_deep_for_a_socket();
+        let long = with_runtime_dir(None, || DaemonPaths::for_config(&config));
 
-        let paths = with_env(None, Some(temp.path()), || DaemonPaths::for_config(&config));
+        let (socket, rejections) = choose_socket_among(
+            long.dir.join("daemon.sock"),
+            &long.dir,
+            only_a_temp_dir(temp.path()),
+        );
 
         assert!(
-            paths
-                .socket
-                .starts_with(temp.path().canonicalize().expect("canonicalize")),
+            socket.starts_with(temp.path().canonicalize().expect("canonicalize")),
             "{} is not in the temp directory",
-            paths.socket.display()
+            socket.display()
         );
-        assert!(paths.socket_rejections.is_empty(), "{paths:?}");
-        assert!(!paths.socket_is_in_place());
+        assert!(rejections.is_empty(), "{rejections:?}");
         // Only the socket moves.
-        assert!(paths.pid.starts_with(&paths.dir));
-        assert!(paths.log.starts_with(&paths.dir));
-        assert!(paths.stopped.starts_with(&paths.dir));
+        assert!(long.pid.starts_with(&long.dir));
+        assert!(long.log.starts_with(&long.dir));
+        assert!(long.stopped.starts_with(&long.dir));
     }
 
     /// `$XDG_RUNTIME_DIR` is tried first, so a system that provides one keeps
@@ -648,28 +667,51 @@ mod tests {
         let runtime = a_runtime_dir();
         let temp = a_dir_with_mode(0o700);
         let (_root, config) = a_project_too_deep_for_a_socket();
+        let long = with_runtime_dir(None, || DaemonPaths::for_config(&config));
 
-        let paths = with_env(Some(runtime.path()), Some(temp.path()), || {
-            DaemonPaths::for_config(&config)
-        });
+        let (socket, _) = choose_socket_among(
+            long.dir.join("daemon.sock"),
+            &long.dir,
+            vec![
+                (
+                    "$XDG_RUNTIME_DIR".to_string(),
+                    Some(runtime.path().to_path_buf()),
+                ),
+                (
+                    "the temp directory".to_string(),
+                    Some(temp.path().to_path_buf()),
+                ),
+            ],
+        );
 
-        assert!(paths.socket.starts_with(runtime.path()), "{paths:?}");
+        assert!(socket.starts_with(runtime.path()), "{}", socket.display());
     }
 
     /// A relative `$XDG_RUNTIME_DIR` would resolve against whatever directory
-    /// each command started in, so one project would get several sockets.
+    /// each command started in, so one project would get several sockets, so it
+    /// is skipped and the next candidate takes it.
     #[test]
     fn a_relative_runtime_dir_is_ignored() {
         let temp = a_dir_with_mode(0o700);
         let (_root, config) = a_project_too_deep_for_a_socket();
+        let long = with_runtime_dir(None, || DaemonPaths::for_config(&config));
 
-        let paths = with_env(Some(Path::new("relative/run")), Some(temp.path()), || {
-            DaemonPaths::for_config(&config)
-        });
+        let (socket, _) = choose_socket_among(
+            long.dir.join("daemon.sock"),
+            &long.dir,
+            vec![
+                (
+                    "$XDG_RUNTIME_DIR".to_string(),
+                    Some(PathBuf::from("relative/run")),
+                ),
+                (
+                    "the temp directory".to_string(),
+                    Some(temp.path().to_path_buf()),
+                ),
+            ],
+        );
 
-        assert!(paths
-            .socket
-            .starts_with(temp.path().canonicalize().expect("canonicalize")));
+        assert!(socket.starts_with(temp.path().canonicalize().expect("canonicalize")));
     }
 
     #[test]

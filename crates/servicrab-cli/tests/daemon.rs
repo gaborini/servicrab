@@ -542,8 +542,11 @@ fn shell_quote(path: &Path) -> String {
 #[test]
 fn a_deeply_nested_project_puts_its_socket_in_the_runtime_dir() {
     let dir = TempDir::new().unwrap();
-    // Short enough to hold a socket, which is what a real `/run/user/1000` is.
+    // Short enough to hold a socket, and 0700, which is what a real
+    // `/run/user/1000` is — `TempDir` makes 0755 directories, and the daemon
+    // refuses to put a socket in one.
     let runtime = TempDir::new_in("/tmp").unwrap();
+    fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
 
     let deep = dir.path().join("nested".repeat(12)).join("more".repeat(12));
     fs::create_dir_all(&deep).unwrap();
@@ -603,6 +606,55 @@ restart = "always"
     assert!(
         !deep.join(".servicrab/daemon.sock").exists(),
         "the socket should have moved out of the project"
+    );
+}
+
+/// A `$XDG_RUNTIME_DIR` other users can reach is refused and the daemon does
+/// not start, saying which candidate it turned down and why.
+///
+/// This is the whole point of the predicate: the socket has to be somewhere
+/// nobody else can pre-create a name, and a startup failure that explains
+/// itself is better than a spoofable socket.  The temp directory is pointed at
+/// a loosened directory too, so nothing accidentally saves the day.
+#[test]
+fn a_socket_is_never_put_in_a_directory_other_users_can_reach() {
+    let dir = TempDir::new().unwrap();
+    let shared = TempDir::new_in("/tmp").unwrap();
+    fs::set_permissions(shared.path(), fs::Permissions::from_mode(0o777)).unwrap();
+
+    let deep = dir.path().join("nested".repeat(12)).join("more".repeat(12));
+    fs::create_dir_all(&deep).unwrap();
+    let svc = resident(dir.path(), "api.sh");
+    let cfg = config(
+        &deep,
+        &format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}"]
+restart = "always"
+"#,
+            svc.display()
+        ),
+    );
+
+    let shared_path = shared.path().to_str().unwrap();
+    let env = [("XDG_RUNTIME_DIR", shared_path), ("TMPDIR", shared_path)];
+    let (code, stdout, stderr) = cli_with_env(&["start"], &cfg, &env);
+
+    assert_ne!(code, 0, "start should have refused: {stdout}{stderr}");
+    let told = format!("{stdout}{stderr}");
+    // The operator has to be able to fix this, so the message names the
+    // directory and says what is wrong with it.
+    assert!(told.contains(shared_path), "{told}");
+    assert!(told.contains("0777"), "{told}");
+    assert!(told.contains("no group or other permissions"), "{told}");
+    assert_eq!(
+        fs::read_dir(shared.path()).unwrap().count(),
+        0,
+        "nothing may be created in a directory we refused"
     );
 }
 
