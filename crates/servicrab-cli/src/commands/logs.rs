@@ -229,7 +229,7 @@ impl Printer {
         Self {
             colors,
             width,
-            color: style::color_enabled(),
+            color: style::color_enabled_for(style::Stream::Stdout),
             // A single service needs no prefix to tell its lines apart.
             no_prefix: no_prefix || services.len() < 2,
         }

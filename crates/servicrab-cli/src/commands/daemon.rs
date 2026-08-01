@@ -78,7 +78,7 @@ mod imp {
     use servicrab_protocol::{Request, Response, ServiceInfo};
 
     use crate::daemon::{client, server};
-    use crate::style::{self, BOLD, DIM, GREEN, RED, RESET, YELLOW};
+    use crate::style::{self, Stream, BOLD, DIM, GREEN, RED, RESET, YELLOW};
 
     /// Run the daemon in the foreground (this is the process `start` spawns).
     pub fn daemon(
@@ -178,7 +178,7 @@ mod imp {
 
         wait_for_the_daemon(&mut child, &paths)?;
 
-        let color = style::color_enabled();
+        let color = style::color_enabled_for(Stream::Stdout);
         println!(
             "{} daemon started for {} ({} service(s))",
             style::paint(color, GREEN, "✓"),
@@ -333,7 +333,8 @@ mod imp {
     ) -> Result<i32, String> {
         let timeout = timeout.unwrap_or(WAIT_TIMEOUT);
         let deadline = std::time::Instant::now() + timeout;
-        let color = style::color_enabled();
+        let color_out = style::color_enabled_for(Stream::Stdout);
+        let color_err = style::color_enabled_for(Stream::Stderr);
 
         loop {
             let services = match client::send(socket, &Request::Status) {
@@ -364,7 +365,7 @@ mod imp {
 
             if !gone.is_empty() {
                 for (name, why) in &gone {
-                    eprintln!("{} {name}: {why}", style::paint(color, RED, "✗"));
+                    eprintln!("{} {name}: {why}", style::paint(color_err, RED, "✗"));
                 }
                 return Ok(1);
             }
@@ -372,7 +373,7 @@ mod imp {
             if waiting.is_empty() {
                 println!(
                     "{} {} service(s) ready",
-                    style::paint(color, GREEN, "✓"),
+                    style::paint(color_out, GREEN, "✓"),
                     watched.len()
                 );
                 return Ok(0);
@@ -381,14 +382,14 @@ mod imp {
             if std::time::Instant::now() >= deadline {
                 eprintln!(
                     "{} timed out after {}: still waiting for {}",
-                    style::paint(color, RED, "✗"),
+                    style::paint(color_err, RED, "✗"),
                     humantime::format_duration(timeout),
                     waiting.join(", ")
                 );
                 eprintln!(
                     "{}",
                     style::paint(
-                        color,
+                        color_err,
                         DIM,
                         "  the daemon is still running — see `servicrab status` and `servicrab logs`"
                     )
@@ -433,22 +434,23 @@ mod imp {
         let (cfg, config_path, paths) = setup(config)?;
         expect_a_daemon(&cfg, &paths)?;
 
-        let color = style::color_enabled();
+        let color_out = style::color_enabled_for(Stream::Stdout);
+        let color_err = style::color_enabled_for(Stream::Stderr);
         match client::send(&paths.socket, &Request::Reload) {
             Ok(Response::Ok { message }) => {
                 println!(
                     "{} {}",
-                    style::paint(color, GREEN, "✓"),
+                    style::paint(color_out, GREEN, "✓"),
                     message.unwrap_or_else(|| "reloaded".to_string())
                 );
                 println!(
                     "{}",
-                    style::paint(color, DIM, &format!("  from {}", config_path.display()))
+                    style::paint(color_out, DIM, &format!("  from {}", config_path.display()))
                 );
                 Ok(0)
             }
             Ok(Response::Error { message }) => {
-                eprintln!("{} {message}", style::paint(color, RED, "✗"));
+                eprintln!("{} {message}", style::paint(color_err, RED, "✗"));
                 Ok(1)
             }
             Ok(other) => Err(format!("unexpected response from the daemon: {other:?}")),
@@ -465,17 +467,18 @@ mod imp {
         let (cfg, _, paths) = setup(config)?;
         expect_a_daemon(&cfg, &paths)?;
 
-        let color = style::color_enabled();
+        let color_out = style::color_enabled_for(Stream::Stdout);
+        let color_err = style::color_enabled_for(Stream::Stderr);
         let mut failed = false;
         for name in services {
             match client::send(&paths.socket, &build(name.clone())) {
                 Ok(Response::Ok { message }) => println!(
                     "{} {}",
-                    style::paint(color, GREEN, "✓"),
+                    style::paint(color_out, GREEN, "✓"),
                     message.unwrap_or_else(|| format!("{name} done"))
                 ),
                 Ok(Response::Error { message }) => {
-                    eprintln!("{} {message}", style::paint(color, RED, "✗"));
+                    eprintln!("{} {message}", style::paint(color_err, RED, "✗"));
                     failed = true;
                 }
                 Ok(other) => return Err(format!("unexpected response from the daemon: {other:?}")),
@@ -507,7 +510,7 @@ mod imp {
                         println!(
                             "{}",
                             style::paint(
-                                style::color_enabled(),
+                                style::color_enabled_for(Stream::Stdout),
                                 DIM,
                                 &format!(
                                     "  its socket would be {} (the project's path is too long to hold one)",
@@ -564,7 +567,7 @@ mod imp {
             ));
         }
 
-        let color = style::color_enabled();
+        let color = style::color_enabled_for(Stream::Stdout);
         println!(
             "{} stopped {}",
             style::paint(color, GREEN, "✓"),
@@ -574,7 +577,7 @@ mod imp {
     }
 
     fn print_table(services: &[ServiceInfo]) {
-        let color = style::color_enabled();
+        let color = style::color_enabled_for(Stream::Stdout);
         let width = services
             .iter()
             .map(|s| s.name.len())

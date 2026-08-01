@@ -219,13 +219,19 @@ async fn render(mut events: EventReceiver, printer: Arc<Printer>, logs: Option<L
 struct Printer {
     colors: BTreeMap<ServiceName, &'static str>,
     width: usize,
-    color: bool,
+    /// Whether the stdout half of the output is coloured.  Both halves are
+    /// asked separately, because a stack whose stdout is redirected into a file
+    /// still has a terminal on stderr to draw progress on.
+    color_out: bool,
+    /// Whether the stderr half of the output is coloured.
+    color_err: bool,
     options: UpOptions,
 }
 
 impl Printer {
     fn new(plan: &[ServiceName], options: UpOptions) -> Self {
-        let color = style::color_enabled();
+        let color_out = style::color_enabled_for(style::Stream::Stdout);
+        let color_err = style::color_enabled_for(style::Stream::Stderr);
         let width = plan.iter().map(|n| n.as_str().len()).max().unwrap_or(0);
         let colors = plan
             .iter()
@@ -235,7 +241,8 @@ impl Printer {
         Self {
             colors,
             width,
-            color,
+            color_out,
+            color_err,
             options,
         }
     }
@@ -252,7 +259,7 @@ impl Printer {
         };
         eprintln!(
             "{} {} → {}",
-            style::paint(self.color, BOLD, command),
+            style::paint(self.color_err, BOLD, command),
             config.project.name,
             names.join(", ")
         );
@@ -266,7 +273,7 @@ impl Printer {
         eprintln!(
             "{}",
             style::paint(
-                self.color,
+                self.color_err,
                 DIM,
                 &format!("watching for changes: {}", names.join(", "))
             )
@@ -274,21 +281,21 @@ impl Printer {
     }
 
     /// `api    | ` (or an empty string when prefixes are disabled).
-    fn prefix(&self, service: &ServiceName) -> String {
+    fn prefix(&self, service: &ServiceName, color: bool) -> String {
         if self.options.no_prefix {
             return String::new();
         }
-        let color = self.colors.get(service).copied().unwrap_or(RESET);
+        let tint = self.colors.get(service).copied().unwrap_or(RESET);
         let label = format!("{:width$}", service.as_str(), width = self.width);
-        format!("{} {} ", style::paint(self.color, color, &label), "|")
+        format!("{} {} ", style::paint(color, tint, &label), "|")
     }
 
-    fn timestamp(&self) -> String {
+    fn timestamp(&self, color: bool) -> String {
         if !self.options.timestamps {
             return String::new();
         }
         let now = style::utc_hms(std::time::SystemTime::now());
-        format!("{} ", style::paint(self.color, DIM, &now))
+        format!("{} ", style::paint(color, DIM, &now))
     }
 
     fn event(&self, service: &ServiceName, kind: &EventKind) {
@@ -380,14 +387,25 @@ impl Printer {
     }
 
     fn log(&self, service: &ServiceName, stream: Stream, line: &str) {
-        let text = format!("{}{}{}", self.timestamp(), self.prefix(service), line);
         match stream {
             Stream::Stdout => {
+                let text = format!(
+                    "{}{}{}",
+                    self.timestamp(self.color_out),
+                    self.prefix(service, self.color_out),
+                    line
+                );
                 let mut out = std::io::stdout().lock();
                 let _ = writeln!(out, "{text}");
                 let _ = out.flush();
             }
             Stream::Stderr => {
+                let text = format!(
+                    "{}{}{}",
+                    self.timestamp(self.color_err),
+                    self.prefix(service, self.color_err),
+                    line
+                );
                 let mut err = std::io::stderr().lock();
                 let _ = writeln!(err, "{text}");
                 let _ = err.flush();
@@ -400,9 +418,9 @@ impl Printer {
         let _ = writeln!(
             err,
             "{}{}{}",
-            self.timestamp(),
-            self.prefix(service),
-            style::paint(self.color, DIM, &format!("{symbol} {message}"))
+            self.timestamp(self.color_err),
+            self.prefix(service, self.color_err),
+            style::paint(self.color_err, DIM, &format!("{symbol} {message}"))
         );
         let _ = err.flush();
     }
@@ -421,7 +439,7 @@ impl Printer {
         if outcome.is_success() {
             eprintln!(
                 "{}",
-                style::paint(self.color, DIM, "all services stopped cleanly")
+                style::paint(self.color_err, DIM, "all services stopped cleanly")
             );
             return;
         }
@@ -481,7 +499,7 @@ mod tests {
     fn prefixes_are_padded_to_the_longest_name() {
         let plan = vec![service("api"), service("database")];
         let printer = Printer::new(&plan, UpOptions::default());
-        let prefix = printer.prefix(&plan[0]);
+        let prefix = printer.prefix(&plan[0], false);
         assert!(
             prefix.starts_with("api     "),
             "unexpected prefix {prefix:?}"
@@ -499,14 +517,22 @@ mod tests {
                 ..UpOptions::default()
             },
         );
-        assert_eq!(printer.prefix(&plan[0]), "");
+        assert_eq!(printer.prefix(&plan[0], false), "");
+    }
+
+    #[test]
+    fn a_prefix_is_only_coloured_for_the_stream_that_allows_it() {
+        let plan = vec![service("api")];
+        let printer = Printer::new(&plan, UpOptions::default());
+        assert!(printer.prefix(&plan[0], true).contains("\x1b["));
+        assert!(!printer.prefix(&plan[0], false).contains("\x1b["));
     }
 
     #[test]
     fn timestamps_are_only_added_when_requested() {
         let plan = vec![service("api")];
         let plain = Printer::new(&plan, UpOptions::default());
-        assert_eq!(plain.timestamp(), "");
+        assert_eq!(plain.timestamp(false), "");
 
         let stamped = Printer::new(
             &plan,
@@ -515,7 +541,7 @@ mod tests {
                 ..UpOptions::default()
             },
         );
-        let stamp = stamped.timestamp();
+        let stamp = stamped.timestamp(false);
         assert_eq!(stamp.trim().len(), 8, "expected HH:MM:SS, got {stamp:?}");
     }
 }
