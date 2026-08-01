@@ -212,10 +212,12 @@ mod imp {
     /// Wait for the spawned daemon to answer, or to tell us why it will not.
     ///
     /// Two starts can race here, and only one of them gets the project lock.
-    /// The loser exits straight away — while the *winner's* socket is up, so
-    /// only the child's own exit status can tell the two apart.  Watching it
-    /// also turns a 15-second timeout into an immediate, accurate message, and
-    /// reaps the process either way.
+    /// The loser exits straight away — while the *winner's* socket is up, so a
+    /// live socket alone proves nothing about the child we spawned.  The lock
+    /// holder records its pid before it binds, so the pidfile is what identifies
+    /// whose daemon is answering; the child's exit status then turns a
+    /// 15-second timeout into an immediate, accurate message, and reaps the
+    /// process either way.
     fn wait_for_the_daemon(
         child: &mut std::process::Child,
         paths: &DaemonPaths,
@@ -239,7 +241,7 @@ mod imp {
                 Ok(None) => {}
                 Err(err) => return Err(format!("could not watch the daemon: {err}")),
             }
-            if client::is_running(&paths.socket) {
+            if daemon_is_ours(child, paths) && client::is_running(&paths.socket) {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
@@ -254,6 +256,18 @@ mod imp {
             }
             std::thread::sleep(START_POLL);
         }
+    }
+
+    /// Whether the daemon holding this project's lock is the child we spawned.
+    ///
+    /// The pid in the file is written under the lock and before the socket is
+    /// bound, so a socket that answers while this says "not ours" belongs to a
+    /// daemon somebody else started.
+    fn daemon_is_ours(child: &std::process::Child, paths: &DaemonPaths) -> bool {
+        std::fs::read_to_string(&paths.pid)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+            .is_some_and(|pid| pid == child.id())
     }
 
     /// What a status snapshot says about one service's readiness.    ///
