@@ -111,6 +111,13 @@ pub fn arrived() -> Option<ShutdownReason> {
 mod tests {
     use super::*;
 
+    /// `EARLY` is process-global, so the tests that write it cannot run
+    /// concurrently: cargo runs them on threads of one process, and without this
+    /// they race — measured at 6 failures in 150 runs before it was added.
+    /// A plain mutex rather than `--test-threads=1`, which would slow every other
+    /// test in the binary down to serial.
+    static EARLY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The claim has to survive being made twice: `serve` runs once per process,
     /// but the unit tests share one.
     #[test]
@@ -128,6 +135,7 @@ mod tests {
     /// process would be killed by the default disposition.
     #[test]
     fn a_signal_in_the_window_is_recorded_rather_than_fatal() {
+        let _guard = EARLY_LOCK.lock().expect("lock");
         claim().expect("claim");
         EARLY.store(0, Ordering::SeqCst);
         assert_eq!(arrived(), None, "nothing has been signalled yet");
@@ -140,6 +148,7 @@ mod tests {
 
     #[test]
     fn each_claimed_signal_maps_to_its_shutdown_reason() {
+        let _guard = EARLY_LOCK.lock().expect("lock");
         for (signal, expected) in [
             (Signal::SIGINT, ShutdownReason::UserInterrupt),
             (Signal::SIGTERM, ShutdownReason::Terminated),
