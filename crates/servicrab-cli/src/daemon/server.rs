@@ -239,6 +239,13 @@ pub fn serve(
 ) -> Result<i32, String> {
     let plan = plan_stack(cfg, options.selection()).map_err(|e| e.to_string())?;
 
+    // Before anything of ours exists on disk or on the network.  SIGTERM,
+    // SIGINT and SIGHUP are fatal by default, and the real watcher cannot be
+    // installed until the runtime is built — which is after the socket is
+    // bound.  Claiming them here means a signal in that window is remembered
+    // instead of killing the process and stranding the socket file.
+    super::signals::claim()?;
+
     paths.ensure_dir()?;
     // One daemon per project, decided by the kernel rather than by a check
     // that another start could slip past.  The lock is held for the whole run.
@@ -295,7 +302,8 @@ pub fn serve(
     let _ = std::fs::remove_file(&paths.socket);
     // Bound before the runtime exists: the umask that keeps the socket private
     // is process-global, so no other thread may be creating files while it is
-    // in effect.
+    // in effect.  The signals were claimed above, so the socket cannot outlive
+    // a SIGTERM that lands between here and the real watcher.
     let bound = bind_socket(&paths.socket)?;
 
     let registry = Arc::new(Mutex::new(StatusRegistry::new(plan.iter().map(|name| {
@@ -329,6 +337,19 @@ pub fn serve(
         // over the socket.
         let (stop_tx, mut stop_rx) = shutdown_channel();
         let signals = SignalWatcher::install(&project).map_err(|e| e.to_string())?;
+        // Every signal is now accounted for: anything from before the watcher
+        // existed was recorded by the early handler, anything after it is the
+        // watcher's.  Feeding an early one into the same channel means the
+        // supervisor sees a shutdown request before it starts a single service,
+        // so nothing is spawned only to be stopped again.
+        if let Some(reason) = super::signals::arrived() {
+            tracing::info!(
+                project = %project,
+                %reason,
+                "a shutdown arrived while the daemon was still starting up"
+            );
+            let _ = stop_tx.send(Some(reason));
+        }
         let mut signal_rx = signals.subscribe();
         let signal_stop = stop_tx.clone();
         let signal_task = tokio::spawn(async move {

@@ -15,5 +15,7 @@ pub mod lock;
 pub mod peer;
 #[cfg(unix)]
 pub mod server;
+#[cfg(unix)]
+pub mod signals;
 
 pub use paths::DaemonPaths;
