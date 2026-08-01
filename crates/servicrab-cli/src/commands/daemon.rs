@@ -122,11 +122,17 @@ mod imp {
         // authoritative — another `start` may be between this check and its
         // daemon's lock — so the daemon takes the pidfile lock and this code
         // reports whatever it says.
-        if client::is_running(&paths.socket) {
-            return Err(format!(
+        match client::check_running(&paths.socket) {
+            Ok(()) => {
+                return Err(format!(
                 "a daemon is already running for {} — use `servicrab status` or `servicrab down`",
                 cfg.project.name
-            ));
+            ))
+            }
+            // A daemon that refuses us is still a daemon, and spawning another
+            // one over its socket would fail in a much less obvious way.
+            Err(client::ClientError::Failed(why)) => return Err(why),
+            Err(client::ClientError::NotRunning) => {}
         }
         paths.ensure_dir()?;
 
@@ -385,6 +391,24 @@ mod imp {
         control(config, services, |name| Request::StopService { name })
     }
 
+    /// Refuse to go on unless a daemon we may talk to is there.
+    ///
+    /// "Is one running" and "will it talk to us" are different questions, and
+    /// the second one has an answer worth repeating: a daemon belonging to
+    /// another user refuses the connection and says so, and reporting that as
+    /// "no daemon is running" would send the operator looking for one that is
+    /// already there.
+    fn expect_a_daemon(cfg: &Config, paths: &DaemonPaths) -> Result<(), String> {
+        match client::check_running(&paths.socket) {
+            Ok(()) => Ok(()),
+            Err(client::ClientError::NotRunning) => Err(format!(
+                "no daemon is running for {} — start one with `servicrab start`",
+                cfg.project.name
+            )),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
     /// Restart individual services.
     pub fn restart(config: Option<&Path>, services: &[String]) -> Result<i32, String> {
         control(config, services, |name| Request::RestartService { name })
@@ -393,12 +417,7 @@ mod imp {
     /// Ask the daemon to re-read the configuration file.
     pub fn reload(config: Option<&Path>) -> Result<i32, String> {
         let (cfg, config_path, paths) = setup(config)?;
-        if !client::is_running(&paths.socket) {
-            return Err(format!(
-                "no daemon is running for {} — start one with `servicrab start`",
-                cfg.project.name
-            ));
-        }
+        expect_a_daemon(&cfg, &paths)?;
 
         let color = style::color_enabled();
         match client::send(&paths.socket, &Request::Reload) {
@@ -430,12 +449,7 @@ mod imp {
         build: impl Fn(String) -> Request,
     ) -> Result<i32, String> {
         let (cfg, _, paths) = setup(config)?;
-        if !client::is_running(&paths.socket) {
-            return Err(format!(
-                "no daemon is running for {} — start one with `servicrab start`",
-                cfg.project.name
-            ));
-        }
+        expect_a_daemon(&cfg, &paths)?;
 
         let color = style::color_enabled();
         let mut failed = false;

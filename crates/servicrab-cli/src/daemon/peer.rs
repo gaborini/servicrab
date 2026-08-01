@@ -8,6 +8,10 @@
 //!
 //! Asking the kernel who connected costs nothing and does not depend on any
 //! filesystem keeping its promises.
+//!
+//! Root is not granted an exception: it does not need one — it can read the
+//! pidfile, signal the daemon, or become the user — and every accepted uid is
+//! one more principal with full authority over the stack.
 
 use std::os::unix::io::AsFd;
 
@@ -36,13 +40,22 @@ pub fn peer_uid(stream: &impl AsFd) -> Result<u32, String> {
     }
 }
 
-/// Whether the peer is the user this daemon runs as.
+/// What a peer we will not serve is told, naming both uids.
 ///
-/// Root is not granted an exception: it does not need one — it can read the
-/// pidfile, signal the daemon, or become the user — and every accepted uid is
-/// one more principal with full authority over the stack.
-pub fn is_the_same_user(stream: &impl AsFd) -> Result<bool, String> {
-    peer_uid(stream).map(|uid| uid == nix::unistd::getuid().as_raw())
+/// Refusing in silence is what the first version did, and every client reported
+/// it as "the daemon closed the connection without answering" — which is true
+/// and gives an operator no way to guess that a uid mismatch was the cause.
+/// `sudo servicrab status` against a user's daemon is a mistake the generated
+/// systemd unit's `User=` field invites, so it has to explain itself.
+///
+/// Neither number is a secret: a peer knows its own uid, and the daemon's is
+/// readable from the socket's owner.  Nothing else appears here — no path, no
+/// pid, no service name — because nothing else is already known.
+pub fn wrong_user_message(ours: u32, theirs: u32) -> String {
+    format!(
+        "this daemon runs as uid {ours}; you are uid {theirs} — \
+         servicrab only answers the user that started it"
+    )
 }
 
 #[cfg(test)]
@@ -62,8 +75,42 @@ mod tests {
             peer_uid(&server).expect("peer uid"),
             nix::unistd::getuid().as_raw()
         );
-        assert!(is_the_same_user(&server).expect("same user"));
         // Both ends can ask, and both see the same process.
-        assert!(is_the_same_user(&client).expect("same user"));
+        assert_eq!(
+            peer_uid(&client).expect("peer uid"),
+            nix::unistd::getuid().as_raw()
+        );
+    }
+
+    /// A cross-uid connection needs two users, which a test suite does not
+    /// have, so the message is checked on its own; the daemon's use of it and
+    /// the client's pass-through are covered in the integration tests.
+    #[test]
+    fn the_refusal_names_both_uids() {
+        let message = wrong_user_message(501, 0);
+
+        assert!(message.contains("uid 501"), "{message}");
+        assert!(message.contains("uid 0"), "{message}");
+        // Which is which has to be unambiguous, or the operator cannot tell
+        // whose daemon they have reached.
+        assert!(
+            message.starts_with("this daemon runs as uid 501;"),
+            "{message}"
+        );
+        assert!(message.contains("you are uid 0"), "{message}");
+    }
+
+    /// The refusal is sent to somebody we have just decided not to trust, so it
+    /// must say nothing beyond the two uids they could already look up.
+    #[test]
+    fn the_refusal_says_nothing_else() {
+        let message = wrong_user_message(501, 0);
+
+        assert!(!message.contains('/'), "no paths: {message}");
+        assert!(
+            !message.to_ascii_lowercase().contains("pid"),
+            "no pids: {message}"
+        );
+        assert!(!message.contains("servicrab.toml"), "no config: {message}");
     }
 }

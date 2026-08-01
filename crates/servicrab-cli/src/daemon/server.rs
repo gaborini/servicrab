@@ -33,8 +33,8 @@ const COLLECTOR_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// The largest request the daemon will assemble, in bytes.
 ///
 /// Every real request is a short JSON object; the longest is a `subscribe` with
-/// a service list, which [`servicrab_protocol::MAX_SUBSCRIBE_SERVICES`] bounds
-/// separately.  64 KiB is far more than any of them needs and small enough that
+/// a service list, which the protocol crate bounds separately at 256 names.
+/// 64 KiB is far more than any of them needs and small enough that
 /// [`MAX_CONNECTIONS`] of them cannot exhaust memory.
 const MAX_FRAME: usize = 64 * 1024;
 
@@ -61,6 +61,14 @@ const MAX_MALFORMED: u32 = 3;
 /// `EMFILE` and `ENFILE` are not transient, and retrying straight away spun
 /// this loop at 100% CPU.
 const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How long a refusal may take to write before the connection is dropped.
+///
+/// One short line into an empty socket buffer never blocks, so this only fires
+/// for a peer that connected in order to be refused and then never read.  Short
+/// on purpose: waiting on such a peer would hold a slot in [`MAX_CONNECTIONS`],
+/// which is the limit the refusal path must not become a lever against.
+const REFUSAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Options for the daemon body.
 #[derive(Debug, Clone, Default)]
@@ -288,12 +296,7 @@ pub fn serve(
     // Bound before the runtime exists: the umask that keeps the socket private
     // is process-global, so no other thread may be creating files while it is
     // in effect.
-    let bound = bind_socket(&paths.socket).map_err(|problem| {
-        // A path too long to bind is the one failure whose cause is not in the
-        // message: it means every private directory we could have moved the
-        // socket to was refused, and only the rejections say which and why.
-        format!("{problem}{}", paths.socket_advice())
-    })?;
+    let bound = bind_socket(&paths.socket)?;
 
     let registry = Arc::new(Mutex::new(StatusRegistry::new(plan.iter().map(|name| {
         let has_health = cfg
@@ -431,7 +434,7 @@ async fn accept_loop(listener: UnixListener, session: Arc<Session>) {
     let live = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
 
     loop {
-        let stream = match listener.accept().await {
+        let mut stream = match listener.accept().await {
             Ok((stream, _)) => stream,
             Err(err) => {
                 // Running out of file descriptors is not transient, and
@@ -443,22 +446,6 @@ async fn accept_loop(listener: UnixListener, session: Arc<Session>) {
                 continue;
             }
         };
-        // The socket's mode is the first line of defence, not the only one that
-        // should exist: a project on a filesystem that ignores Unix modes, or a
-        // directory an operator loosened, would otherwise hand the whole stack
-        // to a stranger.  Asking the kernel does not depend on any of that.
-        match super::peer::is_the_same_user(&stream) {
-            Ok(true) => {}
-            Ok(false) => {
-                let peer = super::peer::peer_uid(&stream).unwrap_or_default();
-                tracing::warn!(uid = peer, "refused a connection from another user");
-                continue;
-            }
-            Err(problem) => {
-                tracing::warn!("{problem}; refusing the connection");
-                continue;
-            }
-        }
         // One task per connection with no cap is a way to be talked out of
         // every file descriptor in the process.  Refusing the newest connection
         // keeps the ones already being served, and the client sees a closed
@@ -473,12 +460,68 @@ async fn accept_loop(listener: UnixListener, session: Arc<Session>) {
 
         let session = Arc::clone(&session);
         // One task per client keeps a stuck reader from blocking everybody
-        // else.
+        // else.  The peer check belongs in here rather than in the accept loop:
+        // saying why we are refusing means writing to the socket, and a peer
+        // that never reads must not be able to stall every other client.
         tokio::spawn(async move {
-            handle_client(stream, session).await;
+            if admit(&mut stream).await {
+                handle_client(stream, session).await;
+            }
             drop(permit);
         });
     }
+}
+
+/// Decide whether a connection may be served, and tell it if not.
+///
+/// The socket's mode is the first line of defence, not the only one that should
+/// exist: a project on a filesystem that ignores Unix modes, or a directory an
+/// operator loosened, would otherwise hand the whole stack to a stranger.
+/// Asking the kernel does not depend on any of that.
+///
+/// A refusal used to be a silent close, which every client reported as "the
+/// daemon closed the connection without answering" — true, and no help at all
+/// in guessing that a uid mismatch was the cause.  Since the generated systemd
+/// unit carries a `User=`, `sudo servicrab status` against a user's daemon is a
+/// mistake people will make.
+///
+/// Naming both uids leaks nothing: a peer already knows its own, and the
+/// daemon's is readable from the socket's owner.  Nothing else is said — no
+/// path, no pid, no service name.
+async fn admit(stream: &mut UnixStream) -> bool {
+    let ours = nix::unistd::getuid().as_raw();
+    match super::peer::peer_uid(stream) {
+        Ok(uid) if uid == ours => true,
+        Ok(uid) => {
+            tracing::warn!(uid, "refused a connection from another user");
+            refuse(stream, &super::peer::wrong_user_message(ours, uid)).await;
+            false
+        }
+        Err(problem) => {
+            tracing::warn!("{problem}; refusing the connection");
+            refuse(stream, "this daemon could not confirm who is connecting").await;
+            false
+        }
+    }
+}
+
+/// Send one error line and let the connection drop.
+///
+/// A refused peer has to stay cheaper than an accepted one, or the refusal
+/// becomes the cheapest way to occupy the connection cap: nothing is read, so
+/// there is no frame to bound and no line to mis-parse, and the write is
+/// bounded in time in case the peer never reads it.
+async fn refuse(stream: &mut UnixStream, message: &str) {
+    let Ok(line) = encode(&Response::Error {
+        message: message.to_string(),
+    }) else {
+        return;
+    };
+    let _ = tokio::time::timeout(REFUSAL_TIMEOUT, async {
+        let _ = stream.write_all(line.as_bytes()).await;
+        let _ = stream.flush().await;
+    })
+    .await;
 }
 
 /// Read one request line, bounded in both size and time.

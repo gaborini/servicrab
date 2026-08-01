@@ -507,6 +507,75 @@ fn the_daemon_reads_the_credentials_of_whoever_connects() {
     assert_eq!(code, 0, "{stdout}");
 }
 
+/// A refused peer is told which uid owns the daemon and which one it is.
+///
+/// A genuine cross-uid connection needs two users, which this suite does not
+/// have, so the daemon's own decision is covered by the unit test on the
+/// message and the one on `peer_uid`; what is exercised here is the rest of the
+/// journey — that a refusal written on the socket reaches the operator instead
+/// of being flattened into "the daemon closed the connection" or, worse, into
+/// "no daemon is running", which would send them looking for one to start.
+#[test]
+fn a_refused_client_is_told_which_uid_owns_the_daemon() {
+    let dir = TempDir::new().unwrap();
+    let svc = resident(dir.path(), "api.sh");
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}"]
+"#,
+            svc.display()
+        ),
+    );
+
+    // Stand in for a daemon owned by uid 501 that has just refused uid 0.
+    fs::create_dir_all(dir.path().join(".servicrab")).unwrap();
+    let socket = dir.path().join(".servicrab/daemon.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let refusing = std::thread::spawn(move || {
+        use std::io::Write;
+
+        // Every command in the test below opens its own connection.
+        for stream in listener.incoming().take(3) {
+            let Ok(mut stream) = stream else { break };
+            let _ = stream.write_all(
+                b"{\"type\":\"error\",\"message\":\"this daemon runs as uid 501; \
+                  you are uid 0 - servicrab only answers the user that started it\"}\n",
+            );
+            let _ = stream.flush();
+        }
+    });
+
+    for command in [vec!["status"], vec!["stop", "api"], vec!["reload"]] {
+        let (code, stdout, stderr) = cli(&command, &cfg);
+        let told = format!("{stdout}{stderr}");
+
+        assert_ne!(
+            code,
+            0,
+            "`{}` should have failed: {told}",
+            command.join(" ")
+        );
+        assert!(
+            told.contains("uid 501") && told.contains("uid 0"),
+            "`{}` hid the refusal: {told}",
+            command.join(" ")
+        );
+        assert!(
+            !told.contains("no daemon is running"),
+            "`{}` reported an absent daemon: {told}",
+            command.join(" ")
+        );
+    }
+
+    drop(refusing);
+}
+
 /// The uid the kernel reports for the other end of `stream`.
 fn peer_uid(stream: &std::os::unix::net::UnixStream) -> u32 {
     use nix::sys::socket::getsockopt;
