@@ -9,6 +9,8 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use servicrab_core::runtime::stack::{
     control_channel, ServiceResult, StackOptions, StackSupervisor,
@@ -27,6 +29,22 @@ const EXIT_SIGINT: i32 = 130;
 const EXIT_SIGTERM: i32 = 143;
 /// Exit code used when the controlling terminal went away (`128 + SIGHUP`).
 const EXIT_SIGHUP: i32 = 129;
+
+/// How long the shutdown waits for the renderer to draw what is still queued.
+///
+/// Writing to the operator's stdout and stderr blocks while the other end is
+/// not keeping up, and while the stack is running that is exactly right: a
+/// terminal read slowly should slow the drawing down, not lose lines.  Once the
+/// stack has stopped, though, the only thing left to do is draw — and if
+/// nothing is reading at all, the write never returns.  Waiting for the
+/// renderer then means never exiting: the services are already stopped, the
+/// exit code is already decided, and the operator's Ctrl+C has to be worth
+/// something anyway.
+///
+/// Overrunning this costs the tail of the terminal output.  It does not cost
+/// the log files: lines reach `LogSink` before they are drawn, and its writer
+/// is a separate task that flushes whenever it catches up.
+const RENDER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Command-line options for `up`.
 #[derive(Debug, Clone, Copy, Default)]
@@ -84,7 +102,7 @@ pub fn run(
         ));
     }
 
-    let printer = Printer::new(&plan, options);
+    let printer = Arc::new(Printer::new(&plan, options));
     printer.banner(&cfg, &plan);
     printer.watching(&watched);
 
@@ -101,34 +119,55 @@ pub fn run(
         .build()
         .map_err(|e| format!("failed to start the async runtime: {e}"))?;
 
-    let outcome = runtime.block_on(async move {
-        let signals = SignalWatcher::install(cfg.project.name.as_str())?;
-        let mut shutdown = signals.subscribe();
+    let outcome = runtime.block_on({
+        let printer = Arc::clone(&printer);
+        async move {
+            let signals = SignalWatcher::install(cfg.project.name.as_str())?;
+            let mut shutdown = signals.subscribe();
 
-        let (events_tx, events_rx) = event_channel();
-        let renderer = tokio::spawn(render(events_rx, printer, logs));
+            let (events_tx, events_rx) = event_channel();
+            let renderer = tokio::spawn(render(events_rx, printer, logs));
 
-        let (control_tx, control_rx) = control_channel();
-        let watchers = spawn_watchers(&cfg, &plan, &control_tx, &events_tx);
-        drop(control_tx);
+            let (control_tx, control_rx) = control_channel();
+            let watchers = spawn_watchers(&cfg, &plan, &control_tx, &events_tx);
+            drop(control_tx);
 
-        let supervisor =
-            StackSupervisor::new(&cfg, plan, stack_options, events_tx).with_control(control_rx);
-        let outcome = supervisor.run(&mut shutdown).await;
+            let supervisor =
+                StackSupervisor::new(&cfg, plan, stack_options, events_tx).with_control(control_rx);
+            let outcome = supervisor.run(&mut shutdown).await;
 
-        for watcher in watchers {
-            watcher.abort();
+            for watcher in watchers {
+                watcher.abort();
+            }
+
+            // The supervisor owned the last sender, so the renderer stops as
+            // soon as it has drained the queue — unless the far end of stdout or
+            // stderr has stopped reading, in which case it is parked in a write
+            // that will never return.  The stack is already stopped by now, so
+            // the wait for the drawing to finish is bounded and the exit does
+            // not depend on anyone consuming the output.
+            let drawn = tokio::time::timeout(RENDER_DRAIN_TIMEOUT, renderer).await;
+            if let Ok(joined) = &drawn {
+                // A renderer that panicked is a bug worth surfacing; one that
+                // could not finish drawing is not.
+                assert!(joined.is_ok(), "renderer task");
+            }
+
+            Ok::<_, servicrab_core::RuntimeError>((outcome, drawn.is_ok()))
         }
-
-        // The supervisor owned the last sender, so the renderer stops as soon
-        // as it has drained the queue.
-        let printer = renderer.await.expect("renderer task");
-        printer.summary(&outcome);
-
-        Ok::<_, servicrab_core::RuntimeError>(outcome)
     });
 
-    let outcome = outcome.map_err(|e| e.to_string())?;
+    let (outcome, drawn) = outcome.map_err(|e| e.to_string())?;
+    if drawn {
+        printer.summary(&outcome);
+    }
+    // A renderer still parked in a write cannot be joined — a blocking write is
+    // not an await point, so the task can be neither aborted nor waited out —
+    // and dropping the runtime would wait for that thread.  Nothing is left to
+    // schedule that anybody is reading, so let the process exit collect it.
+    if !drawn {
+        runtime.shutdown_background();
+    }
 
     if !outcome.is_success() {
         return Ok(1);
@@ -148,7 +187,12 @@ pub fn run(
 /// The file work happens on a blocking task behind [`LogSink`], so a slow disk
 /// delays the log rather than the async worker that is also driving child
 /// `wait()`s, health probes and the control channel.
-async fn render(mut events: EventReceiver, printer: Printer, logs: Option<LogRouter>) -> Printer {
+///
+/// Drawing itself is synchronous and *does* block when the operator's terminal
+/// is not keeping up, which is the right back-pressure while services are
+/// running.  It is the caller's job to make sure the shutdown does not depend on
+/// this task finishing; see the drain timeout in [`run`].
+async fn render(mut events: EventReceiver, printer: Arc<Printer>, logs: Option<LogRouter>) {
     let sink = logs.map(LogSink::spawn);
 
     while let Some(event) = events.recv().await {
@@ -161,13 +205,14 @@ async fn render(mut events: EventReceiver, printer: Printer, logs: Option<LogRou
     }
 
     // The stack has stopped; wait for the queued lines to reach the disk before
-    // the process goes away, so a graceful stop never loses output.
+    // the process goes away, so a graceful stop never loses output.  This comes
+    // first because it is the durable half: the terminal is best-effort, the log
+    // file is not.
     if let Some(sink) = sink {
         if let Some(problem) = sink.shutdown().await {
             printer.warn(&problem);
         }
     }
-    printer
 }
 
 /// Renders runtime events for a terminal.

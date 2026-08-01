@@ -528,6 +528,93 @@ restart = "never"
 
 // ── ordering, dependencies, shutdown ───────────────────────────────────────
 
+/// Ctrl+C has to work even when the operator's own output has backed up.
+///
+/// The renderer writes to stdout and stderr synchronously, and those writes
+/// block while the far end is not keeping up — which is the right thing to do
+/// to a slow terminal.  But a consumer that has stopped reading altogether (a
+/// parent that captured both pipes and reads them only after the child exits is
+/// the classic way to arrange this) leaves the renderer parked in a write that
+/// never returns.  The supervisor used to wait for that renderer before exiting,
+/// so `up` never exited at all: not in ten seconds, not in two minutes.
+///
+/// The verdict is the observable one an operator cares about: the service is
+/// gone and the process is gone, with the Ctrl+C exit code.
+#[test]
+fn a_ctrl_c_is_honoured_while_the_output_nobody_reads_is_backed_up() {
+    // Comfortably more than a pipe buffer holds once the renderer has prefixed
+    // it, so the renderer is certain to be parked in a write by the time the
+    // signal arrives.
+    const LINES: usize = 1_500;
+    const WIDTH: usize = 200;
+
+    let dir = TempDir::new().unwrap();
+    let printed = dir.path().join("printed");
+    let pidfile = dir.path().join("service.pid");
+    script(
+        dir.path(),
+        "noisy.sh",
+        &format!(
+            "echo $$ > {}\n\
+             awk 'BEGIN{{for (i = 1; i <= {LINES}; i++) printf \"warn %d {}\\n\", i}}' 1>&2\n\
+             echo done > {}\n\
+             sleep 30",
+            pidfile.display(),
+            "-".repeat(WIDTH),
+            printed.display()
+        ),
+    );
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+
+[project]
+name = "demo"
+
+[services.api]
+command = ["{0}"]
+restart = "never"
+"#,
+            dir.path().join("noisy.sh").display()
+        ),
+    );
+
+    // Both pipes are captured and neither is ever read, so every write the
+    // renderer makes past the first pipeful blocks for good.
+    let mut child = Command::new(binary())
+        .arg("up")
+        .arg("--config")
+        .arg(&cfg)
+        .env_remove("RUST_LOG")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn servicrab up");
+
+    wait_for_file(&pidfile);
+    let service = read_pid(&pidfile);
+    // Every line has been handed over, so the renderer has as much to write as
+    // it is ever going to get.
+    wait_for_file(&printed);
+
+    kill(Pid::from_raw(child.id() as i32), Signal::SIGINT).unwrap();
+    let code = wait_bounded(&mut child);
+
+    assert_eq!(
+        code, 130,
+        "a Ctrl+C that is honoured exits 130, whatever the output is doing"
+    );
+    // Nothing may be left behind, which is the promise the process groups exist
+    // for; the pid is the service's shell, which leads its own group.
+    assert!(
+        !is_alive(service),
+        "the service ({service}) outlived the supervisor"
+    );
+}
+
 /// The verdict comes from the supervisor's own event stream, not from what the
 /// two service scripts manage to write to a shared file.
 ///
