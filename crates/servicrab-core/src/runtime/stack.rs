@@ -114,11 +114,89 @@ impl StackOutcome {
     }
 }
 
+/// What a [`Control`] command did.
+///
+/// The supervisor used to answer with a sentence — `"started"`, `"already
+/// stopped"`, `"1 added, 0 changed, 2 removed"` — and everything above it, up to
+/// and including the daemon's socket clients, read that prose as an API.  The
+/// sentence is still available through [`Display`](std::fmt::Display), for
+/// exactly one purpose: showing it to a person.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ControlOutcome {
+    /// A service that was not running was spawned.
+    Started,
+    /// A running service was stopped and spawned again.
+    Restarted,
+    /// A running service was stopped.
+    Stopped,
+    /// Nothing was done: the service was not running to begin with.
+    AlreadyStopped,
+    /// A new configuration was applied to the running stack.
+    Reloaded {
+        /// Services started because the new configuration declares them.
+        added: usize,
+        /// Services restarted because their definition changed.
+        changed: usize,
+        /// Services stopped because the new configuration drops them.
+        removed: usize,
+    },
+}
+
+impl std::fmt::Display for ControlOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ControlOutcome::Started => f.write_str("started"),
+            ControlOutcome::Restarted => f.write_str("restarted"),
+            ControlOutcome::Stopped => f.write_str("stopped"),
+            ControlOutcome::AlreadyStopped => f.write_str("already stopped"),
+            ControlOutcome::Reloaded {
+                added: 0,
+                changed: 0,
+                removed: 0,
+            } => f.write_str("no changes"),
+            ControlOutcome::Reloaded {
+                added,
+                changed,
+                removed,
+            } => write!(f, "{added} added, {changed} changed, {removed} removed"),
+        }
+    }
+}
+
+/// Why a [`Control`] command was refused.
+///
+/// Refusals are the half a client has to branch on — retry, report, give up —
+/// so each reason is its own variant rather than a message to match against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ControlRefusal {
+    /// The stack does not supervise a service by that name.
+    UnknownService(ServiceName),
+    /// Another command for that service has not finished yet.
+    Busy(ServiceName),
+    /// The service is running already, so there was nothing to start.
+    AlreadyRunning(ServiceName),
+}
+
+impl std::fmt::Display for ControlRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ControlRefusal::UnknownService(service) => {
+                write!(f, "{service} is not part of the running stack")
+            }
+            ControlRefusal::Busy(service) => {
+                write!(f, "{service} is busy with another command")
+            }
+            ControlRefusal::AlreadyRunning(service) => write!(f, "{service} is already running"),
+        }
+    }
+}
+
 /// Acknowledgement channel for a [`Control`] command.
 ///
-/// The message describes what happened ("started", "restarted", …); an error
-/// explains why the command was refused.
-pub type Ack = tokio::sync::oneshot::Sender<Result<String, String>>;
+/// Answered with what the command did, or with why it was refused.
+pub type Ack = tokio::sync::oneshot::Sender<Result<ControlOutcome, ControlRefusal>>;
 
 /// A command an operator sends to a running stack.
 #[derive(Debug)]
@@ -238,7 +316,7 @@ impl Slot {
     }
 
     /// Answer the client waiting on this slot, if there is one.
-    fn answer(&mut self, result: Result<String, String>) {
+    fn answer(&mut self, result: Result<ControlOutcome, ControlRefusal>) {
         if let Some(ack) = self.pending.take() {
             let _ = ack.send(result);
         }
@@ -374,15 +452,15 @@ impl<'a> StackSupervisor<'a> {
                         slot.stop = None;
                         slot.handle = None;
                         if slot.retired {
-                            slot.answer(Ok("stopped".to_string()));
+                            slot.answer(Ok(ControlOutcome::Stopped));
                             retire = true;
                         } else if slot.restart_when_stopped {
                             slot.restart_when_stopped = false;
                             slot.spawn(self.events.clone(), run_options, report_tx.clone());
                             running += 1;
-                            slot.answer(Ok("restarted".to_string()));
+                            slot.answer(Ok(ControlOutcome::Restarted));
                         } else {
-                            slot.answer(Ok("stopped".to_string()));
+                            slot.answer(Ok(ControlOutcome::Stopped));
                         }
                     }
                     if retire {
@@ -473,7 +551,7 @@ impl<'a> StackSupervisor<'a> {
 
         let Some(slot) = state.slots.get_mut(&service) else {
             let ack = into_ack(command);
-            let _ = ack.send(Err(format!("{service} is not part of the running stack")));
+            let _ = ack.send(Err(ControlRefusal::UnknownService(service)));
             return;
         };
 
@@ -481,25 +559,23 @@ impl<'a> StackSupervisor<'a> {
         // make "stop then restart" ambiguous.
         if slot.pending.is_some() {
             let ack = into_ack(command);
-            let _ = ack.send(Err(format!(
-                "{service} is already busy with another command"
-            )));
+            let _ = ack.send(Err(ControlRefusal::Busy(service)));
             return;
         }
 
         match command {
             Control::Start { ack, .. } => {
                 if slot.is_running() {
-                    let _ = ack.send(Err(format!("{service} is already running")));
+                    let _ = ack.send(Err(ControlRefusal::AlreadyRunning(service)));
                     return;
                 }
                 slot.spawn(self.events.clone(), run_options, reports.clone());
                 *running += 1;
-                let _ = ack.send(Ok("started".to_string()));
+                let _ = ack.send(Ok(ControlOutcome::Started));
             }
             Control::Stop { ack, .. } => {
                 let Some(stop) = slot.stop.clone() else {
-                    let _ = ack.send(Ok("already stopped".to_string()));
+                    let _ = ack.send(Ok(ControlOutcome::AlreadyStopped));
                     return;
                 };
                 slot.pending = Some(ack);
@@ -509,7 +585,7 @@ impl<'a> StackSupervisor<'a> {
                 let Some(stop) = slot.stop.clone() else {
                     slot.spawn(self.events.clone(), run_options, reports.clone());
                     *running += 1;
-                    let _ = ack.send(Ok("started".to_string()));
+                    let _ = ack.send(Ok(ControlOutcome::Started));
                     return;
                 };
                 slot.restart_when_stopped = true;
@@ -534,7 +610,7 @@ impl<'a> StackSupervisor<'a> {
         plan: Vec<ServiceName>,
         run_options: RunOptions,
         reports: &mpsc::UnboundedSender<ServiceReport>,
-    ) -> Result<String, String> {
+    ) -> Result<ControlOutcome, ControlRefusal> {
         // Applying a difference on top of a half-finished command would make
         // the outcome depend on the order the two complete in.
         if let Some(busy) = state
@@ -543,7 +619,7 @@ impl<'a> StackSupervisor<'a> {
             .find(|(_, slot)| slot.pending.is_some())
             .map(|(name, _)| name.clone())
         {
-            return Err(format!("{busy} is busy with another command"));
+            return Err(ControlRefusal::Busy(busy));
         }
 
         let diff = state.diff(&config, &plan);
@@ -624,15 +700,11 @@ impl<'a> StackSupervisor<'a> {
             }
         }
 
-        if diff.is_empty() {
-            return Ok("no changes".to_string());
-        }
-        Ok(format!(
-            "{} added, {} changed, {} removed",
-            diff.added.len(),
-            diff.changed.len(),
-            diff.removed.len()
-        ))
+        Ok(ControlOutcome::Reloaded {
+            added: diff.added.len(),
+            changed: diff.changed.len(),
+            removed: diff.removed.len(),
+        })
     }
 }
 
@@ -771,12 +843,6 @@ struct ConfigDiff {
     added: Vec<ServiceName>,
     changed: Vec<ServiceName>,
     removed: Vec<ServiceName>,
-}
-
-impl ConfigDiff {
-    fn is_empty(&self) -> bool {
-        self.added.is_empty() && self.changed.is_empty() && self.removed.is_empty()
-    }
 }
 
 /// Stop the stack in reverse dependency order, waiting for each service
@@ -1172,6 +1238,50 @@ mod tests {
         crate::validation::validate_service_name(raw).expect("valid test name")
     }
 
+    /// The prose is what an operator reads, and the CLI still prints it, so it
+    /// has to stay what it was before the outcome became a type.
+    #[test]
+    fn an_outcome_still_reads_as_the_sentence_it_replaced() {
+        assert_eq!(ControlOutcome::Started.to_string(), "started");
+        assert_eq!(ControlOutcome::Restarted.to_string(), "restarted");
+        assert_eq!(ControlOutcome::Stopped.to_string(), "stopped");
+        assert_eq!(ControlOutcome::AlreadyStopped.to_string(), "already stopped");
+        assert_eq!(
+            ControlOutcome::Reloaded {
+                added: 0,
+                changed: 0,
+                removed: 0
+            }
+            .to_string(),
+            "no changes"
+        );
+        assert_eq!(
+            ControlOutcome::Reloaded {
+                added: 1,
+                changed: 2,
+                removed: 3
+            }
+            .to_string(),
+            "1 added, 2 changed, 3 removed"
+        );
+    }
+
+    #[test]
+    fn a_refusal_still_reads_as_the_sentence_it_replaced() {
+        assert_eq!(
+            ControlRefusal::UnknownService(name("api")).to_string(),
+            "api is not part of the running stack"
+        );
+        assert_eq!(
+            ControlRefusal::Busy(name("api")).to_string(),
+            "api is busy with another command"
+        );
+        assert_eq!(
+            ControlRefusal::AlreadyRunning(name("api")).to_string(),
+            "api is already running"
+        );
+    }
+
     /// Build a validated config from TOML, as if it had been read from disk.
     fn config(toml: &str) -> Config {
         let raw: crate::raw::RawConfig = toml::from_str(toml).expect("valid test toml");
@@ -1220,7 +1330,7 @@ command = ["sleep", "60"]
         let plan = crate::runtime::plan_stack(&cfg, Selection::default()).unwrap();
 
         let diff = state.diff(&cfg, &plan);
-        assert!(diff.is_empty(), "{diff:?}");
+        assert_eq!(diff, ConfigDiff::default(), "{diff:?}");
     }
 
     #[test]
