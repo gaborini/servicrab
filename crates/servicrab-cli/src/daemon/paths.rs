@@ -258,8 +258,6 @@ fn candidates() -> Vec<(String, Option<PathBuf>)> {
 ///   a group is enough to enumerate the sockets, and connecting is the only
 ///   capability an attacker needs.
 fn is_private_dir(path: &Path) -> Result<PathBuf, String> {
-    use std::os::unix::fs::MetadataExt;
-
     if !path.is_absolute() {
         return Err("is not an absolute path".to_string());
     }
@@ -270,6 +268,20 @@ fn is_private_dir(path: &Path) -> Result<PathBuf, String> {
     if !meta.is_dir() {
         return Err("is not a directory".to_string());
     }
+    belongs_to_us_alone(&meta)?;
+    Ok(resolved)
+}
+
+/// The ownership and mode half of [`is_private_dir`], which only Unix can
+/// answer.
+///
+/// Split out rather than inlined because `uid` and `mode` come from
+/// `MetadataExt`, which does not exist off Unix — and this file, unlike the rest
+/// of [`super`], is compiled everywhere so that the commands can name their
+/// paths while refusing to run.
+#[cfg(unix)]
+fn belongs_to_us_alone(meta: &std::fs::Metadata) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
 
     let us = nix::unistd::getuid().as_raw();
     if meta.uid() != us {
@@ -285,7 +297,17 @@ fn is_private_dir(path: &Path) -> Result<PathBuf, String> {
              it must have no group or other permissions at all"
         ));
     }
-    Ok(resolved)
+    Ok(())
+}
+
+/// Refuse every candidate on a platform with no Unix sockets to put in one.
+///
+/// Nothing here is reachable: a daemon needs a socket, and the modules that bind
+/// one are `cfg(unix)`.  Answering "no" rather than "yes" keeps that true if it
+/// ever stops being — a directory we cannot inspect is not one we should trust.
+#[cfg(not(unix))]
+fn belongs_to_us_alone(_meta: &std::fs::Metadata) -> Result<(), String> {
+    Err("cannot be shown to be private to you on this platform".to_string())
 }
 
 /// A short, stable, filesystem-safe name for the project at `dir`.
@@ -303,7 +325,14 @@ fn project_slug(dir: &Path) -> String {
     format!("{hash:016x}")
 }
 
-#[cfg(test)]
+/// Unix-only, like the daemon these paths are for.
+///
+/// A few of these cases — path normalisation, the project slug — would pass
+/// anywhere, but the rest set modes and compare uids, and splitting the module
+/// in two to run three of them on a platform that cannot open a socket buys
+/// nothing. The non-Unix build's promise is that it compiles and refuses
+/// clearly, and [`super::super::commands`] is where that is checked.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use tempfile::TempDir;
