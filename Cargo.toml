@@ -44,8 +44,9 @@ toml = "1"
 # Duration parsing
 humantime = "2"
 
-# Unix process/signal APIs (used only by the Unix runtime module)
-nix = { version = "0.31", features = ["signal", "process"] }
+# Unix process/signal APIs (used only by the Unix runtime module).  `fs` is
+# there for the `flock` that gives one project one daemon.
+nix = { version = "0.31", features = ["signal", "process", "fs", "socket", "user"] }
 
 # Logging / tracing
 tracing = "0.1"

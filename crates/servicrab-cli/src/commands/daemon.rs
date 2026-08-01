@@ -13,6 +13,8 @@ use crate::daemon::{stopped, DaemonPaths};
 
 /// How long to wait for a freshly spawned daemon to answer.
 const START_TIMEOUT: Duration = Duration::from_secs(15);
+/// How often to check on a daemon that has not answered yet.
+const START_POLL: Duration = Duration::from_millis(50);
 /// How long to wait for a stopping daemon to disappear.
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long `--wait` waits for readiness when `--timeout` is not given.
@@ -53,6 +55,17 @@ pub(crate) fn setup(config: Option<&Path>) -> Result<(Config, PathBuf, DaemonPat
     }
 
     let paths = DaemonPaths::for_config(&path);
+    // Nothing here can work if the socket path cannot be bound, and every
+    // command would otherwise report it differently and unhelpfully: the daemon
+    // as `ENAMETOOLONG` from `bind`, every client as `SUN_LEN` from `connect`.
+    // Said once, with the reason each candidate directory was refused.
+    if !paths.socket_advice().is_empty() {
+        return Err(format!(
+            "the socket for {} cannot be created{}",
+            cfg.project.name,
+            paths.socket_advice()
+        ));
+    }
     Ok((cfg, path, paths))
 }
 
@@ -105,11 +118,21 @@ mod imp {
 
         let (cfg, config_path, paths) = setup(config)?;
 
-        if client::is_running(&paths.socket) {
-            return Err(format!(
+        // An advisory fast path for a friendly message.  It cannot be
+        // authoritative — another `start` may be between this check and its
+        // daemon's lock — so the daemon takes the pidfile lock and this code
+        // reports whatever it says.
+        match client::check_running(&paths.socket) {
+            Ok(()) => {
+                return Err(format!(
                 "a daemon is already running for {} — use `servicrab status` or `servicrab down`",
                 cfg.project.name
-            ));
+            ))
+            }
+            // A daemon that refuses us is still a daemon, and spawning another
+            // one over its socket would fail in a much less obvious way.
+            Err(client::ClientError::Failed(why)) => return Err(why),
+            Err(client::ClientError::NotRunning) => {}
         }
         paths.ensure_dir()?;
 
@@ -153,16 +176,7 @@ mod imp {
             .spawn()
             .map_err(|e| format!("could not start the daemon: {e}"))?;
 
-        if !client::wait_until_running(&paths.socket, START_TIMEOUT) {
-            // Reap it so a failed start does not leave a zombie behind.
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!(
-                "the daemon did not come up within {}s — see {}",
-                START_TIMEOUT.as_secs(),
-                paths.log.display()
-            ));
-        }
+        wait_for_the_daemon(&mut child, &paths)?;
 
         let color = style::color_enabled();
         println!(
@@ -195,8 +209,54 @@ mod imp {
         Ok(0)
     }
 
-    /// What a status snapshot says about one service's readiness.
+    /// Wait for the spawned daemon to answer, or to tell us why it will not.
     ///
+    /// Two starts can race here, and only one of them gets the project lock.
+    /// The loser exits straight away — while the *winner's* socket is up, so
+    /// only the child's own exit status can tell the two apart.  Watching it
+    /// also turns a 15-second timeout into an immediate, accurate message, and
+    /// reaps the process either way.
+    fn wait_for_the_daemon(
+        child: &mut std::process::Child,
+        paths: &DaemonPaths,
+    ) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + START_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if !status.success() => {
+                    return Err(format!(
+                        "the daemon we started exited with {} — see {}",
+                        status
+                            .code()
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "a signal".to_string()),
+                        paths.log.display()
+                    ))
+                }
+                // A stack of nothing but one-shot services can be finished
+                // before we look, and that is a start that worked.
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => {}
+                Err(err) => return Err(format!("could not watch the daemon: {err}")),
+            }
+            if client::is_running(&paths.socket) {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                // Reap it so a failed start does not leave a zombie behind.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "the daemon did not come up within {}s — see {}",
+                    START_TIMEOUT.as_secs(),
+                    paths.log.display()
+                ));
+            }
+            std::thread::sleep(START_POLL);
+        }
+    }
+
+    /// What a status snapshot says about one service's readiness.    ///
     /// The same three answers the supervisor's own dependency gating uses under
     /// its *default* condition, so `--wait` returns when a dependent that did
     /// not spell out a condition would have been allowed to start.  A spelled
@@ -331,6 +391,24 @@ mod imp {
         control(config, services, |name| Request::StopService { name })
     }
 
+    /// Refuse to go on unless a daemon we may talk to is there.
+    ///
+    /// "Is one running" and "will it talk to us" are different questions, and
+    /// the second one has an answer worth repeating: a daemon belonging to
+    /// another user refuses the connection and says so, and reporting that as
+    /// "no daemon is running" would send the operator looking for one that is
+    /// already there.
+    fn expect_a_daemon(cfg: &Config, paths: &DaemonPaths) -> Result<(), String> {
+        match client::check_running(&paths.socket) {
+            Ok(()) => Ok(()),
+            Err(client::ClientError::NotRunning) => Err(format!(
+                "no daemon is running for {} — start one with `servicrab start`",
+                cfg.project.name
+            )),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
     /// Restart individual services.
     pub fn restart(config: Option<&Path>, services: &[String]) -> Result<i32, String> {
         control(config, services, |name| Request::RestartService { name })
@@ -339,12 +417,7 @@ mod imp {
     /// Ask the daemon to re-read the configuration file.
     pub fn reload(config: Option<&Path>) -> Result<i32, String> {
         let (cfg, config_path, paths) = setup(config)?;
-        if !client::is_running(&paths.socket) {
-            return Err(format!(
-                "no daemon is running for {} — start one with `servicrab start`",
-                cfg.project.name
-            ));
-        }
+        expect_a_daemon(&cfg, &paths)?;
 
         let color = style::color_enabled();
         match client::send(&paths.socket, &Request::Reload) {
@@ -376,12 +449,7 @@ mod imp {
         build: impl Fn(String) -> Request,
     ) -> Result<i32, String> {
         let (cfg, _, paths) = setup(config)?;
-        if !client::is_running(&paths.socket) {
-            return Err(format!(
-                "no daemon is running for {} — start one with `servicrab start`",
-                cfg.project.name
-            ));
-        }
+        expect_a_daemon(&cfg, &paths)?;
 
         let color = style::color_enabled();
         let mut failed = false;
@@ -417,6 +485,23 @@ mod imp {
                         "no daemon is running for {} — start one with `servicrab start`",
                         cfg.project.name
                     );
+                    // Nothing else would lead them to a relocated socket, and
+                    // "not running" is exactly the moment someone starts
+                    // looking for one.  Said only when it is somewhere
+                    // surprising, so the ordinary output does not change.
+                    if !paths.socket_is_in_place() {
+                        println!(
+                            "{}",
+                            style::paint(
+                                style::color_enabled(),
+                                DIM,
+                                &format!(
+                                    "  its socket would be {} (the project's path is too long to hold one)",
+                                    paths.socket.display()
+                                )
+                            )
+                        );
+                    }
                 }
                 return Ok(1);
             }

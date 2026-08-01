@@ -46,7 +46,7 @@ mod imp {
         }
 
         let request = Request::Subscribe {
-            services: services.to_vec(),
+            services: services.iter().cloned().collect(),
             logs: !options.no_logs,
         };
 
