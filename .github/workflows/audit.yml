@@ -7,17 +7,30 @@ name: Audit
 # This is deliberately a separate workflow from CI.  Advisories are published
 # on the RustSec calendar, not ours: a new one should not fail an unrelated
 # documentation pull request, and it should be found even in a week when nobody
-# opens one.  Hence the schedule, plus a run whenever the dependency set or the
-# policy itself changes.
+# opens one.  Hence the schedule, plus a run on every push to `main` and on
+# every release tag.
 on:
   push:
     branches: ["main"]
-    paths:
-      - "**/Cargo.toml"
-      - "Cargo.lock"
-      - "deny.toml"
-      - ".github/workflows/audit.yml"
+    tags: ["v*"]
+    # No `paths` filter on push any more, and the `paths` key is what forced the
+    # shape: it applies to the whole event, so a filtered branch and an
+    # unfiltered tag cannot coexist in one `push` entry — and two `push` entries
+    # are not an option either, the second silently replaces the first.
+    #
+    # Dropping it on push is right on its own merits.  The filter meant a commit
+    # that only changed Rust code never re-audited, and a release tag never
+    # audited at all.  A tag is the one moment the answer has to be current: the
+    # advisory that matters is the one standing when the artefacts are built, not
+    # the one standing when Cargo.lock was last edited.  On `main` the cost is a
+    # few extra minutes per push, against an audit that is actually up to date.
+    #
+    # This stays out of the release workflow's dependency chain on purpose — an
+    # advisory published this morning is worth reporting, not worth failing a tag
+    # that is already pushed.
   pull_request:
+    # The filter stays here, where the reasoning in the header still holds: a
+    # newly published advisory should not fail an unrelated pull request.
     paths:
       - "**/Cargo.toml"
       - "Cargo.lock"

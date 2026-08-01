@@ -18,9 +18,168 @@ env:
 permissions:
   contents: read
 
+# CI cancels superseded runs; a release must not.  There is no such thing as a
+# release run made irrelevant by a later one, hence `cancel-in-progress: false`
+# — cancelling one halfway would leave a release created and half its assets
+# uploaded.
+#
+# The group is the workflow, not the tag, so releases serialise completely.
+# Two runs for the *same* tag (a push and a dispatch of it, or a re-run) would
+# otherwise both reach `gh release create` and one would fail on a release that
+# already exists.  Two runs for *different* tags would instead race over which
+# one ends up marked latest, and the answer would depend on which finished
+# last.  Releases are rare enough that queueing costs nothing.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 jobs:
+  # Every job used to work the version out for itself, from two different
+  # expressions: the build job read `$GITHUB_REF_NAME` while the release job read
+  # `inputs.tag || github.ref_name`.  Those agree on a tag push and disagree on a
+  # `workflow_dispatch` run, where `$GITHUB_REF_NAME` is the *branch* — so a
+  # dispatched release attached `servicrab-main-<target>.tar.gz` tarballs to a
+  # `v<version>` release, assets that do not carry the version they ship.  The
+  # tag and the version are resolved once, here, and every job downstream reads
+  # them from this job's outputs rather than from the event.
+  meta:
+    name: Resolve the tag and gate on the manifest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      # Reading CI's verdict for the tagged commit needs the runs API.
+      actions: read
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve the tag and check it against the manifest
+        id: resolve
+        env:
+          # The expression the release job already used, and the only one that is
+          # correct for both triggers.
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+
+          # The header of this file states that the tag matches the workspace
+          # version, and until now nothing enforced it: a `v1.0.0` tag on a
+          # commit whose manifest still said `0.3.0` built and shipped in
+          # silence, and the mismatch only surfaced at `cargo publish`.
+          #
+          # A tag that is not `v<semver>` at all means the workflow was
+          # dispatched with something that is not a release tag — a branch name,
+          # most likely, which is exactly how the asset-naming bug above got in.
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::'${TAG}' is not a release tag; expected v<major>.<minor>.<patch>[-prerelease]."
+            exit 1
+          fi
+
+          # Read from [workspace.package] only, so a `version` key in another
+          # table cannot answer for the workspace.  No toolchain is installed in
+          # this job on purpose: the gate has to fail within seconds, before four
+          # runners spend half an hour building something to be thrown away.
+          manifest=$(awk -F'"' '
+            /^\[/ { in_wp = ($0 == "[workspace.package]"); next }
+            in_wp && /^version[[:space:]]*=/ { print $2; exit }
+          ' Cargo.toml)
+          if [ -z "$manifest" ]; then
+            echo "::error::could not read version from [workspace.package] in Cargo.toml."
+            exit 1
+          fi
+          if [ "$version" != "$manifest" ]; then
+            echo "::error::tag ${TAG} claims version ${version}, but [workspace.package] in Cargo.toml says ${manifest}; the tag and the manifest have to agree before a release is cut."
+            exit 1
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+          # The trigger is `tags: ["v*"]`, so a `v1.0.0-rc1` tag runs this
+          # workflow just like a final one — and `gh release create` passed
+          # neither `--prerelease` nor `--latest=false`, so the release candidate
+          # would have become the "latest" release.  The install snippet in the
+          # README resolves `releases/latest`, so everyone following the
+          # documented install would have been handed a release candidate.
+          #
+          # Anything after the patch level is a prerelease, which is the semver
+          # rule and matches the `v<semver>` shape checked above.
+          case "$version" in
+            *-*) prerelease=true ;;
+            *)   prerelease=false ;;
+          esac
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+
+          echo "Releasing ${TAG}; the workspace version is ${manifest}; prerelease=${prerelease}."
+
+      # Nothing in this pipeline used to run a test: it built, asked the binary
+      # for its version, and published.  Pushing a tag on a red commit shipped
+      # it.
+      #
+      # Of the two ways to close that, this one demands CI's verdict for the
+      # exact commit the tag points at, rather than re-running the suite here.
+      # CI is five jobs — fmt, clippy and the suite on Linux and macOS, the MSRV
+      # check, the Windows stubs and `cargo package` — and re-running a subset of
+      # that in the release path would be a weaker check wearing the same badge.
+      # It is also the procedure the release notes already describe: push, wait
+      # for CI, then tag.  This step only makes the machine insist on it.
+      #
+      # The cost is that the verdict is only as good as CI's coverage of that
+      # tree, which is the same trust the branch protection on `main` already
+      # rests on.  A tag on a commit CI never saw is refused outright.
+      - name: Require CI to be green for the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+
+          # A tag pushed straight after the commit races CI rather than
+          # following it, and that is a wait, not a failure.  Bounded, so a
+          # never-scheduled run still ends the job instead of hanging on it.
+          deadline=$(( $(date +%s) + 900 ))
+          while :; do
+            runs=$(gh api \
+              "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${sha}&per_page=100" \
+              --jq '[.workflow_runs[] | {status, conclusion}]')
+            total=$(printf '%s' "$runs" | jq 'length')
+            green=$(printf '%s' "$runs" | jq '[.[] | select(.conclusion == "success")] | length')
+            # A re-run that failed counts: "green once, red later" is red.
+            red=$(printf '%s' "$runs" | jq '[.[] | select(.status == "completed" and .conclusion != "success")] | length')
+            pending=$(printf '%s' "$runs" | jq '[.[] | select(.status != "completed")] | length')
+
+            if [ "$red" -gt 0 ]; then
+              echo "::error::CI completed without succeeding for ${sha}, the commit ${TAG} points at; a tag is not a way to ship a red commit."
+              exit 1
+            fi
+            if [ "$green" -gt 0 ] && [ "$pending" -eq 0 ]; then
+              echo "CI is green for ${sha} (${green} run(s))."
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              if [ "$total" -eq 0 ]; then
+                echo "::error::no CI run exists for ${sha}. Push the commit and let CI finish before tagging it."
+              else
+                echo "::error::CI for ${sha} was still running when the wait ran out; ${pending} run(s) unfinished."
+              fi
+              exit 1
+            fi
+            echo "Waiting for CI on ${sha}: ${total} run(s), ${green} green, ${pending} unfinished."
+            sleep 30
+          done
+
   build:
     name: ${{ matrix.target }}
+    needs: meta
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -39,7 +198,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          # The resolved tag, not the event ref: on a dispatch run `github.ref`
+          # is the branch, and building a "release" from a moving branch is how
+          # a tag ends up shipping something it never pointed at.
+          ref: ${{ needs.meta.outputs.tag }}
 
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -58,10 +220,11 @@ jobs:
 
       - name: Package
         id: package
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          name="servicrab-${version}-${{ matrix.target }}"
+          name="servicrab-${VERSION}-${{ matrix.target }}"
           mkdir -p "dist/${name}"
           cp "target/${{ matrix.target }}/release/servicrab" "dist/${name}/"
           cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE "dist/${name}/"
@@ -73,7 +236,20 @@ jobs:
       - name: Smoke-test the binary
         # Cross-built macOS x86_64 cannot run on an arm runner.
         if: matrix.target != 'x86_64-apple-darwin'
-        run: ./target/${{ matrix.target }}/release/servicrab --version
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          reported=$(./target/${{ matrix.target }}/release/servicrab --version)
+          echo "$reported"
+          # The manifest gate in `meta` reads a text file; this reads the binary
+          # that is actually being shipped, so a stale build directory or a
+          # patch-level override somewhere in the tree cannot slip a differently
+          # versioned executable into a tarball named after the tag.
+          if [ "$reported" != "servicrab ${VERSION}" ]; then
+            echo "::error::the built binary reports '${reported}', but the tag says version ${VERSION}."
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v7
         with:
@@ -85,27 +261,75 @@ jobs:
 
   release:
     name: Publish the GitHub release
-    needs: build
+    needs: [meta, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Provenance is signed with a short-lived Sigstore certificate obtained
+      # against an OIDC token, and the attestation is then persisted against the
+      # repository — one permission for each half.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          # The resolved tag, not the event ref: on a dispatch run `github.ref`
+          # is the branch, and building a "release" from a moving branch is how
+          # a tag ends up shipping something it never pointed at.
+          ref: ${{ needs.meta.outputs.tag }}
 
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
+      # A per-target `.sha256` produced in the same job as its tarball proves
+      # nothing to a downloader: whatever could alter the tarball could rewrite
+      # the digest beside it.  Two things are added here, and neither is GPG or
+      # cosign, which would mean a key for the maintainer to hold and rotate.
+      #
+      # The aggregate file is the ergonomic half.  One `SHA256SUMS` verifies
+      # every asset in a single `shasum -a 256 -c`, and it is what a downloader
+      # who only wants to check a mirror actually reaches for.  The per-target
+      # files stay: they were published before, and dropping them would break
+      # anyone already fetching one.
+      - name: Aggregate the checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          # Sorted by filename so the file is stable across runs regardless of
+          # the order the four build jobs happened to finish in.
+          cat ./*.tar.gz.sha256 | sort -k2 > SHA256SUMS
+          # The digests were computed on four different runners; recompute them
+          # here to prove the artefact round-trip did not damage anything.
+          shasum -a 256 -c SHA256SUMS
+          echo "--- SHA256SUMS"
+          cat SHA256SUMS
+
+      # The trustworthy half.  The attestation binds each tarball's digest to
+      # this workflow, this repository and this commit, signed by Sigstore with a
+      # certificate GitHub issues to the run and which nobody here can reuse.
+      # `gh attestation verify` checks it without the verifier having to trust
+      # any file we publish alongside the artefact — which is exactly what the
+      # `.sha256` files cannot offer.
+      - name: Attest the release artefacts
+        uses: actions/attest-build-provenance@v4
+        with:
+          # Each tarball is its own subject, so `gh attestation verify
+          # servicrab-<version>-<target>.tar.gz --repo gaborini/servicrab`
+          # answers for the file a user actually downloaded, with no indirection
+          # through a checksum list.
+          subject-path: dist/*.tar.gz
+
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
         run: |
           set -euo pipefail
-          notes=$(awk -v tag="${TAG#v}" '
+          notes=$(awk -v tag="${VERSION}" '
             $0 ~ "^## \\[" tag "\\]" { printing = 1; next }
             printing && /^## \[/ { exit }
             printing { print }
@@ -113,6 +337,26 @@ jobs:
           if [ -z "${notes//[[:space:]]/}" ]; then
             notes="See CHANGELOG.md."
           fi
+
+          # `--latest` is stated in both directions rather than left to gh, which
+          # decides it "automatically based on date and version": a release cut
+          # today for an older maintenance branch would otherwise claim to be the
+          # latest.  On a prerelease, `--latest=false` is what actually keeps the
+          # README's `releases/latest` install pointing at the last final
+          # release; `--prerelease` alone only labels it in the UI.
+          flags=()
+          if [ "$PRERELEASE" = "true" ]; then
+            flags+=(--prerelease --latest=false)
+          else
+            flags+=(--latest)
+          fi
+
+          # --verify-tag: the tag has to already exist.  Without it a typo in a
+          # dispatched tag name makes gh create that tag itself, off the default
+          # branch — a release whose assets came from one commit and whose tag
+          # names another.
           gh release create "$TAG" dist/* \
+            --verify-tag \
             --title "$TAG" \
-            --notes "$notes"
+            --notes "$notes" \
+            "${flags[@]}"
