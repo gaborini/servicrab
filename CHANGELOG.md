@@ -9,12 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `--color=auto|always|never`, and `--no-color` as a shorthand for
+  `--color=never`. Both are global, so they can go anywhere on the command line.
+  `CLICOLOR_FORCE` is honoured too, for colouring a stream that is a pipe. The
+  order of precedence, from strongest: `--color`, `NO_COLOR`, `CLICOLOR_FORCE`,
+  `TERM=dumb`, and finally whether the stream is a terminal.
+
 - A `Dependabot auto-merge` workflow. `main` now requires a pull request with
   green checks and one approving review, which a bot cannot collect, so the
   weekly dependency bumps are approved and queued for auto-merge from CI
   instead. Major-version updates are left for a human, including a grouped
   update that contains one — the checks are a real review for a patch bump, and
   not much of one for a breaking change.
+
+### Fixed
+
+- Colour is decided from the stream being written to, rather than from stdout
+  for everything. Most of what Servicrab renders — the `up` and `watch` banner
+  and status lines, `events`, the `start --wait` progress — goes to stderr, so
+  `servicrab up 2> stack.err` used to write ANSI escapes into the file, and
+  `servicrab up | cat` used to drop the colour that stderr's terminal justified.
+  Each stream is now asked about itself, and a run can legitimately colour one
+  and not the other.
+
+- `servicrab man` and `servicrab completions <SHELL>` no longer fail when the
+  reader goes away. `servicrab man | head` reported a broken pipe as an error
+  and exited 1; `servicrab completions bash | head` panicked inside the
+  generator, which writes to the stream directly. Both now treat it as the
+  reader having seen enough, and exit 0.
+
+- `servicrab logs` with an empty log directory says so and exits 0. A stack that
+  has not run yet is a state of the world, not a command that failed.
+
+- `servicrab status` and `servicrab down` print their "no daemon is running"
+  message to stderr. It is a diagnostic, so `servicrab status > snapshot` now
+  leaves the file empty rather than putting prose where a table belongs. Exit
+  codes are unchanged (1 for `status`, 0 for `down`), and `status --json` still
+  writes its object to stdout.
+
+- `servicrab logs --follow` no longer prints lines twice. It sampled the file
+  length, read to whatever the end was by then — which could be past that
+  sample — and then rewound to the stale sample, so everything appended in
+  between came out again on the next pass. The offset is now the position the
+  read actually reached.
+
+- `servicrab logs --follow` no longer prints half of a line and then the whole
+  of it. A file that ends mid-line is what a service being written to looks
+  like; the fragment is now held back until its newline arrives. Without
+  `--follow` there is no next pass, so the fragment is still shown.
+
+- `servicrab logs` tolerates output that is not UTF-8. One stray byte — a binary
+  blob, another encoding, a multi-byte character caught mid-write — used to fail
+  the whole command, and cut a `--follow` silently short at that line.
+  Undecodable bytes are replaced and the rest of the log is readable.
 
 ## [0.3.0] - 2026-07-30
 
