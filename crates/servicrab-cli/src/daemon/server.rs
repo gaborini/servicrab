@@ -8,13 +8,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use servicrab_core::runtime::stack::{Control, ControlTx, StackOptions, StackSupervisor};
+use servicrab_core::runtime::stack::{
+    Control, ControlOutcome, ControlRefusal, ControlTx, StackOptions, StackSupervisor,
+};
 use servicrab_core::runtime::{control_channel, shutdown_channel, wait_for_shutdown};
 use servicrab_core::{
     event_channel, load, plan_stack, Config, EventKind, EventReceiver, EventSender, LogRouter,
     LogSink, ServiceName, ShutdownReason, SignalWatcher, StatusRegistry,
 };
-use servicrab_protocol::{decode, encode, Request, Response};
+use servicrab_protocol::{decode, encode, ErrorCode, Request, Response};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
@@ -556,9 +558,7 @@ async fn admit(stream: &mut UnixStream) -> bool {
 /// there is no frame to bound and no line to mis-parse, and the write is
 /// bounded in time in case the peer never reads it.
 async fn refuse(stream: &mut UnixStream, message: &str) {
-    let Ok(line) = encode(&Response::Error {
-        message: message.to_string(),
-    }) else {
+    let Ok(line) = encode(&Response::error(ErrorCode::Failed, message)) else {
         return;
     };
     let _ = tokio::time::timeout(REFUSAL_TIMEOUT, async {
@@ -636,9 +636,10 @@ async fn handle_client(stream: UnixStream, session: Arc<Session>) {
                 );
                 let _ = write(
                     &mut write_half,
-                    &Response::Error {
-                        message: format!("a request may not exceed {MAX_FRAME} bytes"),
-                    },
+                    &Response::error(
+                        ErrorCode::Failed,
+                        format!("a request may not exceed {MAX_FRAME} bytes"),
+                    ),
                 )
                 .await;
                 return;
@@ -692,7 +693,14 @@ async fn handle_client(stream: UnixStream, session: Arc<Session>) {
         if let Request::Subscribe { services, logs } = request {
             let filter = Filter::new(services, logs);
             let receiver = session.stream.subscribe();
-            if write(&mut write_half, &Response::Ok { message: None }).await {
+            // The handshake is where a subscriber learns which contract the
+            // events that follow are written to.
+            let hello = Response::Ok {
+                message: None,
+                changes: None,
+                schema_version: Some(servicrab_protocol::SCHEMA_VERSION),
+            };
+            if write(&mut write_half, &hello).await {
                 stream_events(receiver, filter, write_half).await;
             }
             return;
@@ -717,13 +725,7 @@ async fn strike(
     message: &str,
 ) -> bool {
     *strikes += 1;
-    let alive = write(
-        sink,
-        &Response::Error {
-            message: message.to_string(),
-        },
-    )
-    .await;
+    let alive = write(sink, &Response::error(ErrorCode::Failed, message)).await;
     if !alive {
         return false;
     }
@@ -807,9 +809,7 @@ async fn respond(request: Request, session: &Session) -> Response {
         },
         Request::Status => {
             let Ok(registry) = session.registry.lock() else {
-                return Response::Error {
-                    message: "the status registry is poisoned".to_string(),
-                };
+                return Response::error(ErrorCode::Failed, "the status registry is poisoned");
             };
             Response::Status {
                 services: registry.snapshot().iter().map(to_wire_status).collect(),
@@ -817,9 +817,7 @@ async fn respond(request: Request, session: &Session) -> Response {
         }
         Request::Shutdown => {
             let _ = session.stop.send(Some(ShutdownReason::Terminated));
-            Response::Ok {
-                message: Some("stopping the stack".to_string()),
-            }
+            Response::message("stopping the stack")
         }
         Request::StartService { name } => {
             let response = command(session, &name, |service, ack| Control::Start {
@@ -859,9 +857,10 @@ async fn respond(request: Request, session: &Session) -> Response {
         Request::Reload => reload(session).await,
         // `Request` is `#[non_exhaustive]`, so an older daemon can still be
         // asked something it does not know about.
-        _ => Response::Error {
-            message: "this daemon does not support that request".to_string(),
-        },
+        _ => Response::error(
+            ErrorCode::Unsupported,
+            "this daemon does not support that request",
+        ),
     }
 }
 
@@ -877,14 +876,16 @@ async fn reload(session: &Session) -> Response {
     let (cfg, warnings) = match load(&session.config_path) {
         Ok(loaded) => loaded,
         Err(errors) => {
-            let details: Vec<String> = errors.iter().map(|e| format!("  • {e}")).collect();
+            // One entry per error, rather than one string with newlines and
+            // bullets in it that every caller would have to take apart again.
             return Response::Error {
+                code: ErrorCode::ValidationFailed,
                 message: format!(
-                    "{} has {} error(s); the stack was left untouched:\n{}",
+                    "{} has {} error(s); the stack was left untouched",
                     session.config_path.display(),
                     errors.len(),
-                    details.join("\n")
                 ),
+                errors: errors.iter().map(ToString::to_string).collect(),
             };
         }
     };
@@ -899,9 +900,10 @@ async fn reload(session: &Session) -> Response {
     let plan = match plan_stack(&cfg, selection) {
         Ok(plan) => plan,
         Err(err) => {
-            return Response::Error {
-                message: format!("{err}; the stack was left untouched"),
-            }
+            return Response::error(
+                ErrorCode::ValidationFailed,
+                format!("{err}; the stack was left untouched"),
+            )
         }
     };
 
@@ -918,28 +920,64 @@ async fn reload(session: &Session) -> Response {
     };
     if session.control.send(command).is_err() {
         restore_registry(session, &cfg, &previous);
-        return Response::Error {
-            message: "the supervisor is no longer accepting commands".to_string(),
-        };
+        return Response::error(
+            ErrorCode::Failed,
+            "the supervisor is no longer accepting commands",
+        );
     }
 
     match ack_rx.await {
-        Ok(Ok(message)) => {
+        Ok(Ok(outcome)) => {
             session.respawn_watchers(&cfg, &plan);
             Response::Ok {
-                message: Some(format!("reloaded {}: {message}", session.project)),
+                message: Some(format!("reloaded {}: {outcome}", session.project)),
+                changes: Some(reload_changes(outcome)),
+                schema_version: None,
             }
         }
-        Ok(Err(message)) => {
+        Ok(Err(refusal)) => {
             restore_registry(session, &cfg, &previous);
-            Response::Error { message }
+            Response::error(refusal_code(&refusal), refusal.to_string())
         }
         Err(_) => {
             restore_registry(session, &cfg, &previous);
-            Response::Error {
-                message: "the stack stopped before the reload completed".to_string(),
-            }
+            Response::error(
+                ErrorCode::Failed,
+                "the stack stopped before the reload completed",
+            )
         }
+    }
+}
+
+/// The three counts a reload reports, taken from what the supervisor did.
+///
+/// A `ControlOutcome` that is not a reload cannot reach here — `Control::Reload`
+/// is answered with `Reloaded` and nothing else — and reporting zeroes is a
+/// truthful answer to "what changed" for any outcome that carries no counts.
+fn reload_changes(outcome: ControlOutcome) -> servicrab_protocol::ReloadChanges {
+    match outcome {
+        ControlOutcome::Reloaded {
+            added,
+            changed,
+            removed,
+        } => servicrab_protocol::ReloadChanges {
+            added,
+            changed,
+            removed,
+        },
+        _ => servicrab_protocol::ReloadChanges::default(),
+    }
+}
+
+/// The wire code for a refusal the supervisor sent back.
+fn refusal_code(refusal: &ControlRefusal) -> ErrorCode {
+    match refusal {
+        ControlRefusal::UnknownService(_) => ErrorCode::UnknownService,
+        ControlRefusal::Busy(_) => ErrorCode::Busy,
+        ControlRefusal::AlreadyRunning(_) => ErrorCode::AlreadyRunning,
+        // A refusal a newer core knows about and this code does not is still a
+        // refusal, and saying only that is better than mislabelling it.
+        _ => ErrorCode::Failed,
     }
 }
 
@@ -972,8 +1010,9 @@ async fn command(
 ) -> Response {
     let names = session.known_names();
     let Some(service) = names.iter().find(|known| known.as_str() == name) else {
-        return Response::Error {
-            message: format!(
+        return Response::error(
+            ErrorCode::UnknownService,
+            format!(
                 "unknown service {name:?}; this daemon supervises: {}",
                 names
                     .iter()
@@ -981,7 +1020,7 @@ async fn command(
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-        };
+        );
     };
 
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
@@ -990,19 +1029,19 @@ async fn command(
         .send(build(service.clone(), ack_tx))
         .is_err()
     {
-        return Response::Error {
-            message: "the supervisor is no longer accepting commands".to_string(),
-        };
+        return Response::error(
+            ErrorCode::Failed,
+            "the supervisor is no longer accepting commands",
+        );
     }
 
     match ack_rx.await {
-        Ok(Ok(message)) => Response::Ok {
-            message: Some(format!("{name} {message}")),
-        },
-        Ok(Err(message)) => Response::Error { message },
+        Ok(Ok(outcome)) => Response::message(format!("{name} {outcome}")),
+        Ok(Err(refusal)) => Response::error(refusal_code(&refusal), refusal.to_string()),
         // The ack channel is dropped when the stack shuts down mid-command.
-        Err(_) => Response::Error {
-            message: "the stack stopped before the command completed".to_string(),
-        },
+        Err(_) => Response::error(
+            ErrorCode::Failed,
+            "the stack stopped before the command completed",
+        ),
     }
 }

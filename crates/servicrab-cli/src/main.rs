@@ -3,7 +3,8 @@
 //! ## Subcommands
 //!
 //! - `servicrab init [--path PATH] [--force]` — create example config
-//! - `servicrab check [--config PATH]` — validate config, print summary
+//! - `servicrab check [--config PATH] [--json]` — validate config, print
+//!   summary
 //! - `servicrab list [--config PATH] [--json]` — list services
 //! - `servicrab run <SERVICE> [--config PATH] [--no-restart]` — run one
 //!   service in the foreground (Linux/macOS)
@@ -50,6 +51,7 @@ use tracing_subscriber::EnvFilter;
 
 mod commands;
 mod daemon;
+mod output;
 mod style;
 mod wire;
 
@@ -92,6 +94,11 @@ enum Commands {
         /// servicrab.toml by walking up from the current directory.
         #[arg(long, short = 'c')]
         config: Option<std::path::PathBuf>,
+
+        /// Print machine-readable JSON instead of the human-readable report.
+        /// Validation errors become a JSON list.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// List all services defined in a servicrab.toml.
@@ -457,20 +464,24 @@ fn main() {
         .init();
 
     // Commands return the process exit code to use; `0` means success.
-    let result = match cli.command {
-        Commands::Init { path, force } => commands::init::run(&path, force).map(|()| 0),
-        Commands::Check { config } => commands::check::run(config.as_deref()).map(|()| 0),
+    let result: Result<i32, output::CliError> = match cli.command {
+        Commands::Init { path, force } => commands::init::run(&path, force)
+            .map(|()| 0)
+            .map_err(Into::into),
+        Commands::Check { config, json } => {
+            commands::check::run(config.as_deref(), json).map(|()| 0)
+        }
         Commands::List { config, json } => commands::list::run(config.as_deref(), json).map(|()| 0),
         Commands::Run {
             service,
             config,
             no_restart,
-        } => commands::run::run(&service, config.as_deref(), no_restart),
+        } => commands::run::run(&service, config.as_deref(), no_restart).map_err(Into::into),
         Commands::Exec {
             service,
             config,
             command,
-        } => commands::exec::run(&service, &command, config.as_deref()),
+        } => commands::exec::run(&service, &command, config.as_deref()).map_err(Into::into),
         Commands::Up {
             services,
             config,
@@ -583,9 +594,14 @@ fn main() {
                 user,
                 profiles,
             },
-        ),
-        Commands::Completions { shell } => commands::completions::run::<Cli>(shell).map(|()| 0),
-        Commands::Man { output } => commands::man::run::<Cli>(output.as_deref()).map(|()| 0),
+        )
+        .map_err(Into::into),
+        Commands::Completions { shell } => commands::completions::run::<Cli>(shell)
+            .map(|()| 0)
+            .map_err(Into::into),
+        Commands::Man { output } => commands::man::run::<Cli>(output.as_deref())
+            .map(|()| 0)
+            .map_err(Into::into),
         Commands::Logs {
             services,
             config,
@@ -601,15 +617,20 @@ fn main() {
                 no_prefix,
             },
         )
-        .map(|()| 0),
+        .map(|()| 0)
+        .map_err(Into::into),
     };
 
     match result {
         Ok(0) => {}
         Ok(code) => std::process::exit(code),
+        // Every error leaves by this one door: stderr, an `error: ` prefix, and
+        // the exit status the error itself carries.  Under `--json` the same
+        // error is a JSON object, still on stderr, so a caller parsing stdout
+        // sees only the document it asked for.
         Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
+            e.report();
+            std::process::exit(e.exit_code());
         }
     }
 }

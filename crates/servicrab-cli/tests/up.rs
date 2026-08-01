@@ -1105,10 +1105,17 @@ command = ["{}"]
     let (code, stdout, stderr) = up(&cfg, &["--json"]);
     assert_eq!(code, 0, "{stdout}{stderr}");
 
-    let events: Vec<serde_json::Value> = stdout
+    let lines: Vec<serde_json::Value> = stdout
         .lines()
         .map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("{line:?}: {e}")))
         .collect();
+
+    // The stream opens with the same handshake line the daemon answers a
+    // `subscribe` with, so a reader can treat all three streams identically.
+    let (header, events) = lines.split_first().expect("a handshake line");
+    assert_eq!(header["type"], "ok", "{stdout}");
+    assert_eq!(header["schema_version"], 1, "{stdout}");
+
     assert!(!events.is_empty(), "no events on stdout");
     assert!(events.iter().all(|e| e["type"] == "event"));
     assert!(events.iter().all(|e| e["service"] == "hello"));

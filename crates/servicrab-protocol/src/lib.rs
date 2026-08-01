@@ -19,6 +19,6 @@ pub mod response;
 pub use frame::{decode, encode, FrameError};
 pub use request::Request;
 pub use response::{
-    Event, Health, ReloadChanges, Response, ServiceInfo, ServiceState, Stream, ErrorCode,
+    ErrorCode, Event, Health, ReloadChanges, Response, ServiceInfo, ServiceState, Stream,
     SCHEMA_VERSION,
 };

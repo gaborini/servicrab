@@ -1245,7 +1245,10 @@ mod tests {
         assert_eq!(ControlOutcome::Started.to_string(), "started");
         assert_eq!(ControlOutcome::Restarted.to_string(), "restarted");
         assert_eq!(ControlOutcome::Stopped.to_string(), "stopped");
-        assert_eq!(ControlOutcome::AlreadyStopped.to_string(), "already stopped");
+        assert_eq!(
+            ControlOutcome::AlreadyStopped.to_string(),
+            "already stopped"
+        );
         assert_eq!(
             ControlOutcome::Reloaded {
                 added: 0,

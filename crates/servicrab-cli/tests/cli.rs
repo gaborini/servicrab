@@ -235,8 +235,13 @@ fn list_json_output() {
     let text = String::from_utf8(output).unwrap();
     let json: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
 
-    // Should be an array of service objects.
-    let arr = json.as_array().expect("JSON should be an array");
+    // An envelope with the services inside it, so there is somewhere to put
+    // the schema version.
+    assert_eq!(json["schema_version"], 1, "{json:#}");
+    assert_eq!(json["project"], "test-project", "{json:#}");
+    let arr = json["services"]
+        .as_array()
+        .expect("the services are still an array");
     assert!(!arr.is_empty());
 
     let first = &arr[0];
@@ -275,7 +280,7 @@ fn list_handles_a_command_with_multi_byte_characters() {
     let json: serde_json::Value =
         serde_json::from_str(&String::from_utf8(output).unwrap()).expect("valid JSON");
     assert_eq!(
-        json[0]["command"],
+        json["services"][0]["command"],
         serde_json::json!(["echo", "x€€€€€€€€€"])
     );
 }
@@ -367,10 +372,11 @@ profiles = ["dev", "test"]
 
     let json: serde_json::Value =
         serde_json::from_str(&String::from_utf8(output).unwrap()).expect("valid JSON");
-    assert_eq!(json[0]["name"], "api");
-    assert_eq!(json[0]["profiles"], serde_json::json!([]), "{json:#}");
+    let services = &json["services"];
+    assert_eq!(services[0]["name"], "api");
+    assert_eq!(services[0]["profiles"], serde_json::json!([]), "{json:#}");
     assert_eq!(
-        json[1]["profiles"],
+        services[1]["profiles"],
         serde_json::json!(["dev", "test"]),
         "{json:#}"
     );
@@ -477,7 +483,7 @@ fn values_are_taken_from_the_environment() {
     let json: serde_json::Value =
         serde_json::from_str(&String::from_utf8(output).unwrap()).expect("valid JSON");
     assert_eq!(
-        json[0]["command"],
+        json["services"][0]["command"],
         serde_json::json!(["echo", "--port=3000"]),
         "{json:#}"
     );
@@ -529,7 +535,7 @@ tcp = "127.0.0.1:1"
 
     let json: serde_json::Value =
         serde_json::from_str(&String::from_utf8(output).unwrap()).expect("valid JSON");
-    let api = json
+    let api = json["services"]
         .as_array()
         .unwrap()
         .iter()

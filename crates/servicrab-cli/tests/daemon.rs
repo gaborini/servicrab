@@ -202,9 +202,9 @@ restart = "always"
     assert!(!dir.path().join(".servicrab/daemon.sock").exists());
     assert!(!dir.path().join(".servicrab/daemon.pid").exists());
 
-    let (code, stdout, _) = cli(&["status"], &cfg);
-    assert_eq!(code, 1);
-    assert!(stdout.contains("no daemon is running"), "{stdout}");
+    let (code, _, stderr) = cli(&["status"], &cfg);
+    assert_eq!(code, 3);
+    assert!(stderr.contains("no daemon is running"), "{stderr}");
 }
 
 // ── start --wait ───────────────────────────────────────────────────────────
@@ -961,17 +961,20 @@ command = ["{}"]
         ),
     );
 
-    let (code, stdout, _) = cli(&["status"], &cfg);
-    assert_eq!(code, 1);
-    assert!(stdout.contains("servicrab start"), "{stdout}");
+    // Its own exit code, so a script can tell "nothing is running" from a real
+    // failure without reading the message.
+    let (code, _, stderr) = cli(&["status"], &cfg);
+    assert_eq!(code, 3, "{stderr}");
+    assert!(stderr.contains("servicrab start"), "{stderr}");
 
     let (code, stdout, _) = cli(&["status", "--json"], &cfg);
-    assert_eq!(code, 1);
-    assert!(stdout.contains("\"running\":false"), "{stdout}");
+    assert_eq!(code, 3);
+    assert!(stdout.contains("\"running\": false"), "{stdout}");
 
-    // Stopping something that is not running is not a failure.
+    // Stopping something that is not running is still not a failure — it just
+    // says there was nothing to do.
     let (code, stdout, _) = cli(&["down"], &cfg);
-    assert_eq!(code, 0);
+    assert_eq!(code, 3);
     assert!(stdout.contains("no daemon is running"), "{stdout}");
 }
 
@@ -1166,7 +1169,7 @@ fn per_service_commands_need_a_daemon() {
     let cfg = one_service(dir.path());
 
     let (code, _, stderr) = cli(&["stop", "api"], &cfg);
-    assert_eq!(code, 1);
+    assert_eq!(code, 3);
     assert!(stderr.contains("no daemon is running"), "{stderr}");
 }
 
