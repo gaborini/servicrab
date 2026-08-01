@@ -102,6 +102,31 @@ pub enum Request {
 }
 
 impl Request {
+    /// The `type` tags this build understands, in the order the README
+    /// documents them.
+    ///
+    /// It exists because the tag is the one thing a refusal cannot recover from
+    /// the decoded value: `#[serde(other)]` needs a unit variant, so
+    /// [`Request::Unknown`] carries nothing.  Quoting the tag back tells a
+    /// client author about their typo; listing these tells them what to write
+    /// instead, which is what serde's own `expected one of …` used to do for
+    /// free before an unrecognised request stopped being an error.
+    ///
+    /// A list beside an enum is a list that can go stale, so it is not trusted
+    /// on its word: `every_supported_tag_decodes_to_a_real_request` proves each
+    /// entry still names a variant, and `every_variant_is_listed_as_supported`
+    /// fails to compile if a variant is added without being named here.
+    pub const SUPPORTED: &'static [&'static str] = &[
+        "ping",
+        "status",
+        "shutdown",
+        "start_service",
+        "stop_service",
+        "restart_service",
+        "reload",
+        "subscribe",
+    ];
+
     /// A ping that says which wire format this build speaks.
     ///
     /// Every caller wants the same thing, and one that spelled the field out
@@ -150,6 +175,79 @@ mod tests {
             panic!("expected a subscribe");
         };
         assert_eq!(services.len(), 2);
+    }
+
+    /// Half of what keeps [`Request::SUPPORTED`] honest: every entry still has
+    /// to name a variant this build handles, so a renamed or removed request
+    /// cannot leave a tag behind that the daemon then advertises.
+    #[test]
+    fn every_supported_tag_decodes_to_a_real_request() {
+        for tag in Request::SUPPORTED {
+            // Every request is either bare or takes a `name`; handing over one
+            // that is not wanted is ignored, which keeps this table-driven.
+            let line = format!("{{\"type\":\"{tag}\",\"name\":\"api\"}}");
+
+            let request: Request = serde_json::from_str(&line)
+                .unwrap_or_else(|e| panic!("{tag:?} is listed as supported but {e}"));
+
+            assert_ne!(
+                request,
+                Request::Unknown,
+                "{tag:?} is listed as supported but decodes to the fallback"
+            );
+        }
+    }
+
+    /// The other half, and the one that cannot be forgotten: this match has no
+    /// wildcard, so adding a variant to [`Request`] stops the crate compiling
+    /// until it is named — and the arm you are made to write is right next to
+    /// the assertion that it belongs in [`Request::SUPPORTED`].
+    ///
+    /// `#[non_exhaustive]` is what would otherwise make this impossible, and it
+    /// does not apply inside the crate that declares the enum.
+    #[test]
+    fn every_variant_is_listed_as_supported() {
+        fn tag_of(request: &Request) -> Option<&'static str> {
+            match request {
+                Request::Ping { .. } => Some("ping"),
+                Request::Status => Some("status"),
+                Request::Shutdown => Some("shutdown"),
+                Request::StartService { .. } => Some("start_service"),
+                Request::StopService { .. } => Some("stop_service"),
+                Request::RestartService { .. } => Some("restart_service"),
+                Request::Reload => Some("reload"),
+                Request::Subscribe { .. } => Some("subscribe"),
+                // The fallback is not a request anyone may send, so it is the
+                // one variant that must never be advertised.
+                Request::Unknown => None,
+            }
+        }
+
+        let every_variant = [
+            Request::ping(),
+            Request::Status,
+            Request::Shutdown,
+            Request::StartService {
+                name: "api".to_string(),
+            },
+            Request::StopService {
+                name: "api".to_string(),
+            },
+            Request::RestartService {
+                name: "api".to_string(),
+            },
+            Request::Reload,
+            Request::Subscribe {
+                services: BTreeSet::new(),
+                logs: true,
+            },
+            Request::Unknown,
+        ];
+
+        let advertised: Vec<&str> = every_variant.iter().filter_map(tag_of).collect();
+
+        assert_eq!(advertised, Request::SUPPORTED);
+        assert!(!Request::SUPPORTED.contains(&crate::UNKNOWN));
     }
 
     /// The list arrives from the socket before anything has vouched for it, and

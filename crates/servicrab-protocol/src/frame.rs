@@ -28,6 +28,37 @@ pub fn decode<T: DeserializeOwned>(line: &str) -> Result<T, FrameError> {
     Ok(serde_json::from_str(line.trim_end_matches(['\r', '\n']))?)
 }
 
+/// How much of a `type` tag [`tag`] will hand back.
+///
+/// Every tag either side of this protocol will ever use is a word.  The bound
+/// exists because the caller of `tag` is quoting an unrecognised one back to
+/// whoever sent it, and a line may be tens of kilobytes: without it, a peer
+/// could make a refusal carry its own payload back out again.
+///
+/// Public because it is the promise `tag` makes about its result, and a caller
+/// sizing a message around that result needs the number rather than a guess.
+pub const MAX_TAG: usize = 48;
+
+/// The `type` a line claims to be, when that is all a caller needs from it.
+///
+/// [`decode`] answers what a line *means*, and for a message from a later
+/// release the answer is an `Unknown` fallback — which by construction cannot
+/// carry the tag, because `#[serde(other)]` only applies to a unit variant.  So
+/// the tag has to come back out of the line, and this is the one place that
+/// knows how: the same trimming rule as `decode`, `type` because that is the
+/// discriminant both directions are tagged by, and a string because a tag that
+/// is not one could never have named a variant.
+///
+/// Truncated to [`MAX_TAG`] characters — characters rather than bytes, so a
+/// multi-byte tag is cut where it can still be printed.  `None` for a line that
+/// is not a JSON object, or has no string `type`.
+pub fn tag(line: &str) -> Option<String> {
+    let value: serde_json::Value =
+        serde_json::from_str(line.trim_end_matches(['\r', '\n'])).ok()?;
+    let named = value.get("type")?.as_str()?;
+    Some(named.chars().take(MAX_TAG).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +164,55 @@ mod tests {
         let line = encode(&response).unwrap();
         assert!(line.contains("\"type\":\"lagged\""));
         assert_eq!(decode::<Response>(&line).unwrap(), response);
+    }
+
+    /// The tag has to come back out of the line because the decoded value
+    /// cannot carry it: `#[serde(other)]` only applies to a unit variant, so
+    /// `Request::Unknown` is all the daemon has to go on when it wants to quote
+    /// an unrecognised request back to whoever sent it.
+    #[test]
+    fn the_type_of_a_line_can_be_recovered_after_it_decodes_to_the_fallback() {
+        assert_eq!(
+            tag("{\"type\":\"strat\",\"name\":\"api\"}"),
+            Some("strat".into())
+        );
+        // The same trimming rule as `decode`, or a tag would come back with the
+        // newline still attached to it.
+        assert_eq!(tag("{\"type\":\"drain\"}\r\n"), Some("drain".into()));
+        assert_eq!(tag("{\"type\":\"ping\"}"), Some("ping".into()));
+    }
+
+    /// A caller quotes the tag back to the peer that sent it, so a line with
+    /// nothing usable in it has to be answerable without one.
+    #[test]
+    fn a_line_with_no_usable_type_has_no_tag() {
+        for line in [
+            "not json",
+            "[1,2,3]",
+            "{}",
+            "{\"type\":7}",
+            "{\"type\":null}",
+            "{\"kind\":\"log\"}",
+        ] {
+            assert_eq!(tag(line), None, "{line:?}");
+        }
+    }
+
+    /// The refusal that quotes a tag is written back down the same socket the
+    /// tag arrived on, and a line may be tens of kilobytes.  Without a bound, a
+    /// peer could use the refusal to carry its own payload back out again.
+    #[test]
+    fn an_absurd_tag_is_truncated_rather_than_quoted_in_full() {
+        let huge = "x".repeat(4096);
+        let line = format!("{{\"type\":\"{huge}\"}}");
+
+        let recovered = tag(&line).expect("a long tag is still a tag");
+
+        assert_eq!(recovered.len(), MAX_TAG);
+        // Cut by characters, not bytes, so a multi-byte tag stays printable.
+        let wide = "\u{1f980}".repeat(200);
+        let recovered = tag(&format!("{{\"type\":\"{wide}\"}}")).expect("a wide tag");
+        assert_eq!(recovered.chars().count(), MAX_TAG);
     }
 
     #[test]

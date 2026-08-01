@@ -256,17 +256,75 @@ impl Drop for RealDaemon {
 /// The daemon's own end of the same problem: a request it has no name for used
 /// to come back as `malformed message: unknown variant …`, which reads as "your
 /// client is broken" when the truth is "this daemon is older than your client".
+///
+/// The refusal has to name the request, and that is not a nicety.  Deciding an
+/// unknown request is no longer a decode error is also deciding to throw away
+/// what serde said about it — `unknown variant "strat", expected one of …`,
+/// which told a client author their typo *and* the complete valid set.  A
+/// genuinely newer client knows what it asked for; a typo or a half-written
+/// client is the common case and does not.
 #[test]
 fn a_request_from_the_future_is_refused_by_name() {
     let daemon = RealDaemon::start();
 
     let reply = ask(&daemon.socket(), "{\"type\":\"drain\",\"grace_ms\":500}\n");
 
-    assert!(reply.contains("does not support that request"), "{reply}");
+    assert!(reply.contains("does not support"), "{reply}");
+    assert!(
+        reply.contains("drain"),
+        "the refusal did not say which request it was refusing: {reply}"
+    );
+    // And what to write instead, which is the other half of what serde used to
+    // give a client author for free.
+    for supported in ["ping", "status", "restart_service", "subscribe"] {
+        assert!(reply.contains(supported), "{supported} unlisted: {reply}");
+    }
     // Being unable to act on it is not a reason to stop serving.
     assert!(
         ask(&daemon.socket(), "{\"type\":\"ping\"}\n").contains("pong"),
         "the daemon stopped answering"
+    );
+}
+
+/// A typo is the case this wording is really for, so it is worth pinning
+/// separately from the request-from-the-future one: `strat` is a plausible slip
+/// for `status`, and the reply has to be enough to spot it without reading the
+/// source.
+#[test]
+fn a_misspelled_request_is_quoted_back_with_the_alternatives() {
+    let daemon = RealDaemon::start();
+
+    let reply = ask(&daemon.socket(), "{\"type\":\"strat\"}\n");
+
+    assert!(reply.contains("strat"), "{reply}");
+    assert!(reply.contains("status"), "{reply}");
+    // The reply is JSON, so a quoted tag has to survive being embedded in it.
+    let parsed: serde_json::Value = serde_json::from_str(reply.trim()).expect("a JSON reply");
+    assert_eq!(parsed["type"], "error");
+    assert!(
+        parsed["message"]
+            .as_str()
+            .expect("a message")
+            .contains("strat"),
+        "{reply}"
+    );
+}
+
+/// A refusal is written back down the socket the request arrived on, so the tag
+/// it quotes cannot be unbounded: that would make the refusal a way to have the
+/// daemon echo a payload of the peer's choosing.
+#[test]
+fn an_absurd_request_tag_does_not_come_back_in_full() {
+    let daemon = RealDaemon::start();
+    let huge = "z".repeat(4096);
+
+    let reply = ask(&daemon.socket(), &format!("{{\"type\":\"{huge}\"}}\n"));
+
+    assert!(reply.contains("does not support"), "{reply}");
+    assert!(
+        reply.len() < 500,
+        "the refusal carried the tag back at length ({} bytes)",
+        reply.len()
     );
 }
 

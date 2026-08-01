@@ -38,9 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail the whole reply.
 
   A request a daemon does not recognise now gets `this daemon does not support
-  that request` rather than `malformed message: unknown variant …`, which read
-  as "your client is broken" when the truth was "this daemon is older than your
-  client".
+  the request "strat"; it supports: ping, status, …` rather than `malformed
+  message: unknown variant …`, which read as "your client is broken" when the
+  truth was "this daemon is older than your client". The name and the list are
+  both there deliberately: deciding an unknown request is no longer a decode
+  error also throws away what serde said about it, and a typo in a hand-rolled
+  client is a far more common reason to see this message than a genuinely newer
+  client is.
 
 - A config written for a later schema reported one of its own keys as a typo
   instead of naming the version. The version check ran after the field-level

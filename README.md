@@ -1001,6 +1001,14 @@ Write your own client the same way: ignore a `type` or `kind` you do not
 recognise rather than treating it as an error, and do not give a field the value
 `unknown` — it is reserved for exactly this.
 
+A request the daemon does not recognise is named back to you, with the set it
+does accept, so a typo in a hand-rolled client is one round trip to diagnose:
+
+```console
+$ echo '{"type":"strat"}' | nc -U .servicrab/daemon.sock
+{"type":"error","message":"this daemon does not support the request \"strat\"; it supports: ping, status, shutdown, start_service, stop_service, restart_service, reload, subscribe"}
+```
+
 ### Live event streaming
 
 `subscribe` is the one request that turns a connection one-way: the daemon
