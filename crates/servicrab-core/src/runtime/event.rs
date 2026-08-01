@@ -164,9 +164,21 @@ pub const MAX_QUEUED_LOG_LINES: usize = 1024;
 
 /// Report dropped lines at least this often while the flood continues.
 ///
-/// A drop is normally reported as soon as a line gets through again; this is the
+/// A drop is normally reported as soon as the flood lets up; this is the
 /// backstop for a service that never stops flooding.
 const REPORT_DROPS_EVERY: u64 = 1024;
+
+/// How much of the allowance has to be free again before the flood counts as
+/// over.
+///
+/// A single line getting through is *not* a let-up: it frees exactly one slot,
+/// which a flood refills immediately, so treating it as one reports the loss
+/// once per **delivered** line.  That turns a bounded stream of log lines into
+/// an unbounded stream of reports — and the reports travel as ordinary events,
+/// which are deliberately never dropped, so the bound this whole mechanism
+/// exists to enforce is undone by the announcement of it.  Requiring half the
+/// allowance back is a let-up the consumer had to earn.
+const FLOOD_OVER_BELOW: usize = MAX_QUEUED_LOG_LINES / 2;
 
 /// The log-line allowance shared by one channel's senders and its receiver.
 #[derive(Debug, Default)]
@@ -212,8 +224,12 @@ impl EventSender {
             return Ok(());
         }
 
-        // The flood let up, so say how much of it went missing.
-        if self.budget.dropped.load(Ordering::Acquire) > 0 {
+        // The flood really let up — the consumer has won back a good part of
+        // the allowance, not just the one slot this line is about to take — so
+        // say how much went missing.  Reporting on the strength of a single
+        // free slot would emit one report per delivered line for as long as the
+        // flood lasts; see `FLOOD_OVER_BELOW`.
+        if queued < FLOOD_OVER_BELOW && self.budget.dropped.load(Ordering::Acquire) > 0 {
             self.report_drops(&event.service);
         }
 
@@ -438,6 +454,91 @@ mod tests {
         }
         assert_eq!(lines, MAX_QUEUED_LOG_LINES);
         assert_eq!(reported, 1, "the earlier drop should be reported once");
+    }
+
+    #[test]
+    fn a_sustained_flood_is_not_reported_once_per_delivered_line() {
+        // A consumer that is making slow progress frees one slot at a time, and
+        // the flood refills it at once.  Reporting the loss on the strength of a
+        // single delivered line therefore emits one `LogLinesDropped` per
+        // delivered line — and those reports are ordinary events, which are
+        // never dropped, so the flood escapes its own bound through them.  In
+        // `up` that meant thousands of report lines on a stderr nobody had
+        // asked for, enough to fill the pipe and wedge the renderer in a
+        // blocking write for good.
+        let (tx, mut rx) = event_channel();
+        let api = name("api");
+        let send = |i: usize| {
+            tx.send(ServiceEvent::new(api.clone(), log(&format!("line {i}"))))
+                .expect("the channel is alive")
+        };
+
+        // Fill the allowance, so from here on every send is a drop.
+        for i in 0..MAX_QUEUED_LOG_LINES {
+            send(i);
+        }
+
+        // One line out, two lines in, over and over: the queue never recovers,
+        // which is what a sustained flood past a slow consumer looks like.
+        const ROUNDS: usize = 4 * REPORT_DROPS_EVERY as usize;
+        let mut delivered = 0usize;
+        let mut reports = 0usize;
+        for i in 0..ROUNDS {
+            match rx.try_recv().expect("something is queued").kind {
+                EventKind::Log { .. } => delivered += 1,
+                EventKind::LogLinesDropped { .. } => reports += 1,
+                other => panic!("unexpected event {other:?}"),
+            }
+            send(MAX_QUEUED_LOG_LINES + 2 * i);
+            send(MAX_QUEUED_LOG_LINES + 2 * i + 1);
+        }
+
+        assert!(delivered > 0, "the consumer has to be making progress");
+        // The backstop is what reports during a flood, so the count is set by
+        // how much was dropped and not by how much got through.
+        let backstop = ROUNDS * 2 / REPORT_DROPS_EVERY as usize;
+        assert!(
+            reports <= backstop + 1,
+            "expected about {backstop} report(s) from the backstop, got {reports} \
+             after delivering {delivered} line(s): the loss is being reported per \
+             delivered line, which is not bounded by anything"
+        );
+        // Silence would be the other way to fail this: the operator still has
+        // to learn that output is going missing.
+        assert!(reports > 0, "a flood this long has to be reported at all");
+    }
+
+    #[test]
+    fn a_real_let_up_reports_the_loss_without_waiting_for_the_backstop() {
+        // The other half of the contract: once the consumer has genuinely
+        // caught up, the operator hears about the loss straight away rather
+        // than only after the next `REPORT_DROPS_EVERY` lines go missing.
+        let (tx, mut rx) = event_channel();
+        let api = name("api");
+        let send = |line: &str| {
+            tx.send(ServiceEvent::new(api.clone(), log(line)))
+                .expect("the channel is alive")
+        };
+
+        for i in 0..MAX_QUEUED_LOG_LINES {
+            send(&format!("line {i}"));
+        }
+        // One drop only — far too few for the backstop, which needs
+        // `REPORT_DROPS_EVERY` of them, so what reports here can only be the
+        // let-up.
+        send("dropped");
+
+        // The consumer catches up completely.
+        while rx.try_recv().is_ok() {}
+        send("after the let-up");
+
+        let reported: u64 = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event.kind {
+                EventKind::LogLinesDropped { count } => Some(count),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(reported, 1, "the drop should be reported once, promptly");
     }
 
     #[test]
