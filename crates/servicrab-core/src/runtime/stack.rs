@@ -35,6 +35,17 @@ use crate::runtime::{
 /// supervisor stops waiting for its task and detaches it.
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
+/// How long a service's event relay may take to drain after its runner returned.
+///
+/// The relay ends when the last sender on the per-service event channel is
+/// dropped.  By that point the process is gone and the runner has let go of its
+/// sink, so the normal case is immediate; this only bounds the wait when a task
+/// that captured a clone of the sink is still winding down — an output reader
+/// that had to be aborted, or a health monitor between ticks.  Generous enough
+/// that a machine under load does not lose events, short enough that no
+/// operator command waits on it.
+const RELAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Options for a stack run.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StackOptions {
@@ -1038,7 +1049,27 @@ async fn supervise_service(
         // the relay task.
     };
 
-    let _ = relay.await;
+    // Waiting for the relay to drain is what keeps a service's last events in
+    // front of its report, so a dependent never sees the report first.  It is
+    // bounded, because the relay only ends when the last sender for this
+    // service's channel is gone and not every holder of one is under this
+    // task's control: an aborted output reader is dropped promptly, but a
+    // health monitor runs detached and only notices on its next tick, which is
+    // as far away as the configured interval.
+    //
+    // Losing the tail of one service's events is a cosmetic problem.  Never
+    // sending the report is not: the supervisor would keep the slot busy, the
+    // operator's `stop` would wait for an ack that cannot come, and `up` would
+    // never learn that its stack had finished.
+    if tokio::time::timeout(RELAY_DRAIN_TIMEOUT, relay)
+        .await
+        .is_err()
+    {
+        tracing::debug!(
+            service = %name,
+            "the event relay outlived its drain timeout; reporting the run anyway"
+        );
+    }
     // The process is gone by the time the runner returns; nothing left to
     // sweep even if this task is aborted from here on.
     pgid.store(0, Ordering::Relaxed);

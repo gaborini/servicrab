@@ -431,15 +431,33 @@ impl<'a> ServiceRunner<'a> {
 
     /// Wait for the output readers to finish, but never block shutdown on a
     /// descendant that inherited the pipe and refuses to close it.
+    ///
+    /// A reader that overruns the timeout is **aborted**, not merely dropped.
+    /// Dropping a [`JoinHandle`] detaches its task, and a detached reader keeps
+    /// the clone of the event sink it captured — which keeps the per-service
+    /// event channel open, which keeps the relay task that forwards from it
+    /// alive, which means the supervision task never gets past awaiting the
+    /// relay and never sends its report.  The operator's `stop` then waits for
+    /// an ack that nothing can ever send: the command times out and the slot
+    /// stays busy, while the service itself has already exited cleanly.
+    ///
+    /// Trailing output can be lost when this fires.  That is the trade this
+    /// timeout was always making; what it must not also trade away is the
+    /// supervisor's ability to report that the service stopped.
     async fn drain_readers(readers: Vec<JoinHandle<()>>) {
         for reader in readers {
+            // Taken before the handle is moved into the timeout, which is what
+            // consumes it.
+            let abort = reader.abort_handle();
             if tokio::time::timeout(READER_DRAIN_TIMEOUT, reader)
                 .await
                 .is_err()
             {
-                // The timeout dropped the JoinHandle, which detaches the task;
-                // it ends as soon as the pipe closes.
-                tracing::debug!("output reader did not finish within the drain timeout");
+                abort.abort();
+                tracing::debug!(
+                    "output reader did not finish within the drain timeout; \
+                     dropping the rest of its output"
+                );
             }
         }
     }
@@ -853,5 +871,41 @@ mod tests {
             exit_reason(std::process::ExitStatus::from_raw(9)),
             ExitReason::Signal(9)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_output_reader_is_aborted_so_the_event_channel_can_close() {
+        // A reader that overruns its drain timeout used to be detached rather
+        // than aborted, and a detached reader keeps the clone of the event sink
+        // it captured.  That one live sender keeps the service's event channel
+        // open forever, which strands the relay task that forwards from it, and
+        // the supervision task waiting on that relay never sends its report —
+        // so an operator's `stop` waits for an ack that nobody can send.
+        let (tx, mut rx) = crate::runtime::event_channel();
+        let service = sh_service("stuck", "exit 0");
+        let runner = ServiceRunner::new(
+            &service,
+            RunOptions::default().with_output(OutputMode::Capture),
+        )
+        .with_events(EventSink::new(tx));
+
+        // The writing half stands in for a descendant that inherited the
+        // child's stdout and survived the group sweep: the reader can never
+        // reach end-of-file on its own.
+        let (writer, pipe) = tokio::io::duplex(64);
+        let reader = runner.spawn_reader(pipe, Stream::Stdout);
+
+        ServiceRunner::drain_readers(vec![reader]).await;
+        // What the supervision task does once its runner has returned.
+        drop(runner);
+
+        let drained = tokio::time::timeout(Duration::from_secs(30), rx.recv()).await;
+        assert_eq!(
+            drained,
+            Ok(None),
+            "the event channel must close once the runner is done, even with a \
+             reader stuck on a pipe that never reaches end-of-file"
+        );
+        drop(writer);
     }
 }
