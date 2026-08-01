@@ -1732,6 +1732,91 @@ fn pid_of(daemon: &Daemon) -> i64 {
     parsed["services"][0]["pid"].as_i64().unwrap_or(0)
 }
 
+/// A SIGTERM that arrives while the daemon is still starting up has to be
+/// honoured rather than being fatal.
+///
+/// **What this proves.** The daemon publishes its socket (`bind_socket`) before
+/// the async runtime exists, because the umask that keeps the socket private is
+/// process-global; the real signal watcher cannot be installed until after the
+/// runtime is built.  Everything in between used to run with the *default*
+/// disposition for SIGTERM, so a signal there killed the process outright — no
+/// graceful shutdown, and the socket file left on disk for the next `start` to
+/// misread.
+///
+/// The test does not try to hit that window at one exact instant, which is what
+/// makes [`a_foreground_daemon_stops_on_sigterm`] only see it about once in
+/// sixty runs.  It waits for the pidfile — the daemon's *first* artefact, created
+/// before the socket is bound — and then keeps signalling until the process is
+/// gone, so signals are delivered continuously across the whole of startup,
+/// including the window.  Reverted against the fix it fails every time.
+///
+/// **What it does not prove.** There is still an irreducible window before the
+/// daemon claims the signals at all: process start, argument parsing, reading the
+/// configuration.  A signal there is still fatal — deliberately, because nothing
+/// of ours exists on disk yet and `start` reports its child's exit status.  The
+/// test also says nothing about SIGKILL, which no handler can catch; the pidfile
+/// `flock` is what covers that.
+#[test]
+fn a_daemon_signalled_during_startup_shuts_down_cleanly() {
+    let dir = TempDir::new().unwrap();
+    let svc = resident(dir.path(), "api.sh");
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[services.api]
+command = ["{}"]
+restart = "always"
+"#,
+            svc.display()
+        ),
+    );
+
+    let mut child = Command::new(binary())
+        .arg("daemon")
+        .arg("--config")
+        .arg(&cfg)
+        .env_remove("RUST_LOG")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn the daemon");
+    let pid = Pid::from_raw(child.id() as i32);
+
+    // The pidfile is created by `ProjectLock::acquire`, which runs before the
+    // socket is bound, so this is the earliest moment the daemon is observable
+    // from outside.
+    let pidfile = dir.path().join(".servicrab/daemon.pid");
+    let deadline = Instant::now() + CEILING;
+    while !pidfile.exists() {
+        assert!(Instant::now() < deadline, "the pidfile never appeared");
+    }
+
+    // Signalling once could still land after the watcher is installed and prove
+    // nothing.  Signalling until the process is gone covers every instant of
+    // startup, so the unprotected window cannot be missed.  A repeat is not a
+    // second *request*: the daemon already treats extra signals as "stop
+    // waiting", which a graceful shutdown of a trapping service does not need.
+    let deadline = Instant::now() + CEILING;
+    while child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the daemon never exited");
+        let _ = kill(pid, Signal::SIGTERM);
+    }
+
+    assert_eq!(
+        child.wait().unwrap().code(),
+        Some(0),
+        "a signal during startup must not kill the daemon outright"
+    );
+    let socket = dir.path().join(".servicrab/daemon.sock");
+    assert!(!socket.exists(), "the socket outlived the daemon");
+    assert!(!pidfile.exists(), "the pidfile outlived the daemon");
+}
+
 #[test]
 fn a_foreground_daemon_stops_on_sigterm() {
     let dir = TempDir::new().unwrap();
