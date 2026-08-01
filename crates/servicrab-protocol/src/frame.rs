@@ -46,6 +46,7 @@ mod tests {
         let response = Response::Pong {
             project: "demo".to_string(),
             pid: 42,
+            version: Some(crate::PROTOCOL_VERSION),
         };
         let line = encode(&response).unwrap();
         assert_eq!(decode::<Response>(&line).unwrap(), response);
@@ -54,7 +55,10 @@ mod tests {
     #[test]
     fn carriage_returns_are_tolerated() {
         let line = "{\"type\":\"ping\"}\r\n";
-        assert_eq!(decode::<Request>(line).unwrap(), Request::Ping);
+        assert_eq!(
+            decode::<Request>(line).unwrap(),
+            Request::Ping { version: None }
+        );
     }
 
     #[test]
@@ -134,6 +138,154 @@ mod tests {
     #[test]
     fn garbage_is_reported_not_panicked_on() {
         assert!(decode::<Request>("not json").is_err());
-        assert!(decode::<Request>("{\"type\":\"fly\"}").is_err());
+        assert!(decode::<Request>("[1,2,3]").is_err());
+        assert!(decode::<Request>("{}").is_err());
+    }
+
+    /// The one that used to assert the opposite.
+    ///
+    /// `#[non_exhaustive]` is a promise to downstream *crates*, and serde's
+    /// internally tagged representation rejects an unrecognised tag outright, so
+    /// a newer client's request used to come back as `malformed message: unknown
+    /// variant …` — and the daemon's own "an older daemon can still be asked
+    /// something it does not know" arm was unreachable from a socket.
+    #[test]
+    fn an_unknown_request_decodes_instead_of_failing() {
+        assert_eq!(
+            decode::<Request>("{\"type\":\"fly\"}").unwrap(),
+            Request::Unknown
+        );
+        // Whatever it carried, too: a future request will not be a bare tag.
+        assert_eq!(
+            decode::<Request>("{\"type\":\"fly\",\"altitude\":9000}").unwrap(),
+            Request::Unknown
+        );
+    }
+
+    /// A `ping` is the one exchange both sides can rely on across versions, so
+    /// it is where the version goes — and it has to survive both directions of
+    /// skew, because 0.3 sends no number and will be answered by daemons that
+    /// do.
+    #[test]
+    fn a_version_travels_with_a_ping_but_is_not_required() {
+        let line = encode(&Request::ping()).unwrap();
+        assert!(line.contains("\"version\":1"), "{line}");
+
+        assert_eq!(
+            decode::<Request>("{\"type\":\"ping\"}").unwrap(),
+            Request::Ping { version: None },
+            "a 0.3 client sends no version and must still be understood"
+        );
+        assert_eq!(
+            decode::<Request>("{\"type\":\"ping\",\"version\":7}").unwrap(),
+            Request::Ping { version: Some(7) },
+            "a newer client's version must arrive intact, not be rounded down"
+        );
+    }
+
+    /// The same for the answer: a 0.3 daemon's `pong` has no version, and a
+    /// client that treated silence as a mismatch would refuse to talk to one.
+    #[test]
+    fn a_pong_without_a_version_is_still_a_pong() {
+        let reply =
+            decode::<Response>("{\"type\":\"pong\",\"project\":\"demo\",\"pid\":7}").unwrap();
+
+        assert_eq!(
+            reply,
+            Response::Pong {
+                project: "demo".to_string(),
+                pid: 7,
+                version: None,
+            }
+        );
+    }
+
+    /// The defect this exists to prevent: one line a client cannot name used to
+    /// end the whole event stream, so a single new event kind in 1.1 would have
+    /// killed `servicrab events` on every 1.0 client, mid-run.
+    #[test]
+    fn an_unknown_event_kind_decodes_instead_of_ending_the_stream() {
+        let line = r#"{"type":"event","service":"api","event":{"kind":"teleported","to":"mars"}}"#;
+
+        let response =
+            decode::<Response>(line).expect("an unknown event kind is not a broken line");
+
+        assert_eq!(
+            response,
+            Response::Event {
+                service: "api".to_string(),
+                event: crate::Event::Unknown,
+            },
+            "the service still has to survive, or a client cannot even say who the event was about"
+        );
+    }
+
+    #[test]
+    fn an_unknown_response_type_decodes_instead_of_ending_the_stream() {
+        assert_eq!(
+            decode::<Response>("{\"type\":\"weather\",\"outlook\":\"grim\"}").unwrap(),
+            Response::Unknown
+        );
+    }
+
+    /// A status snapshot is a `pong`'s worth of forward compatibility spread
+    /// over every service: one state or health verdict this build cannot name
+    /// used to fail the whole `Response::Status`, so `status`, `start --wait`
+    /// and `down` all reported a parse error rather than what they were told.
+    #[test]
+    fn an_unknown_state_or_health_leaves_the_rest_of_a_status_readable() {
+        let line = r#"{"type":"status","services":[
+            {"name":"api","state":"hibernating","restarts":0,"health":"degraded"},
+            {"name":"db","state":"running","restarts":2,"health":"healthy"}
+        ]}"#;
+
+        let Response::Status { services } =
+            decode::<Response>(line).expect("one unknown state must not fail the snapshot")
+        else {
+            panic!("expected a status");
+        };
+
+        assert_eq!(services[0].state, crate::ServiceState::Unknown);
+        assert_eq!(services[0].health, crate::Health::Unknown);
+        // The point of decoding it at all: everything else is still there.
+        assert_eq!(services[1].name, "db");
+        assert_eq!(services[1].state, crate::ServiceState::Running);
+        assert_eq!(services[1].restarts, 2);
+    }
+
+    #[test]
+    fn an_unknown_log_stream_still_carries_its_line() {
+        let line = r#"{"type":"event","service":"api","event":{"kind":"log","stream":"trace","line":"boom"}}"#;
+
+        let response = decode::<Response>(line).expect("an unknown stream is not a broken line");
+
+        assert_eq!(
+            response,
+            Response::Event {
+                service: "api".to_string(),
+                event: crate::Event::Log {
+                    stream: crate::Stream::Unknown,
+                    line: "boom".to_string(),
+                },
+            }
+        );
+    }
+
+    /// `unknown` is a reserved word in the wire format as a consequence of the
+    /// fallbacks: a future release that named a real variant `unknown` would be
+    /// silently classified as "not understood" by every earlier client, which is
+    /// exactly the silence these fallbacks were added to remove.
+    #[test]
+    fn the_fallback_tag_round_trips_so_it_cannot_be_reused() {
+        for line in [
+            encode(&Response::Unknown).unwrap(),
+            encode(&Request::Unknown).unwrap(),
+        ] {
+            assert!(line.contains(crate::UNKNOWN), "{line}");
+        }
+        assert_eq!(
+            decode::<Response>(&format!("{{\"type\":\"{}\"}}", crate::UNKNOWN)).unwrap(),
+            Response::Unknown
+        );
     }
 }

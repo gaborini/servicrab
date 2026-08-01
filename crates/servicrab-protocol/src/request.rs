@@ -19,7 +19,17 @@ pub const MAX_SUBSCRIBE_SERVICES: usize = 256;
 #[non_exhaustive]
 pub enum Request {
     /// Ask the daemon whether it is alive.
-    Ping,
+    Ping {
+        /// Which revision of this wire format the client speaks.
+        ///
+        /// Optional because a 0.3 client does not send it, and the daemon has to
+        /// keep answering those: absent means "did not say", not "version 0".
+        /// A daemon that hears a number below its own says so in its log, which
+        /// is the one place an operator looking at a version-skew problem will
+        /// already be.  See [`crate::PROTOCOL_VERSION`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<u32>,
+    },
 
     /// Ask the daemon for the current state of every service.
     Status,
@@ -72,6 +82,35 @@ pub enum Request {
         #[serde(default = "yes")]
         logs: bool,
     },
+
+    /// A request this build has no name for, because a newer client sent it.
+    ///
+    /// Without this the daemon answered `malformed message: unknown variant …`
+    /// and counted the line against the connection, so the wildcard arm in its
+    /// dispatcher — the one whose comment promised that "an older daemon can
+    /// still be asked something it does not know about" — could not be reached
+    /// from a socket at all.  A newer client now hears that this daemon does
+    /// not support the request, which is the difference between "upgrade the
+    /// daemon" and "your client is broken".
+    ///
+    /// It still costs the connection a strike: a request nobody can act on is
+    /// as good a sign of a broken or probing client as a malformed line, and
+    /// three of them is enough courtesy either way.  The cost of dropping that
+    /// is a connection that can be talked to forever for free.
+    #[serde(other)]
+    Unknown,
+}
+
+impl Request {
+    /// A ping that says which wire format this build speaks.
+    ///
+    /// Every caller wants the same thing, and one that spelled the field out
+    /// would be the one that forgot to update it.
+    pub fn ping() -> Self {
+        Request::Ping {
+            version: Some(crate::PROTOCOL_VERSION),
+        }
+    }
 }
 
 /// Deserialize a subscribe filter, keeping at most [`MAX_SUBSCRIBE_SERVICES`]

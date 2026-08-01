@@ -684,8 +684,15 @@ async fn handle_client(stream: UnixStream, session: Arc<Session>) {
                 continue;
             }
         };
-        // A client that talks sense has nothing held against it.
-        strikes = 0;
+        // A client that talks sense has nothing held against it.  A request
+        // this daemon has no name for is not quite that: it decodes now, which
+        // is what makes the wildcard arm in `respond` reachable from a socket at
+        // all, but it is as good a sign of a broken or probing client as a
+        // malformed line — so it is answered properly and still counted.
+        let unusable = matches!(request, Request::Unknown);
+        if !unusable {
+            strikes = 0;
+        }
 
         // Subscribing turns the connection one-way: the client stops asking
         // and only reads until it goes away.
@@ -703,20 +710,20 @@ async fn handle_client(stream: UnixStream, session: Arc<Session>) {
         if !write(&mut write_half, &response).await {
             return;
         }
+        if unusable && !struck_out(&mut strikes) {
+            return;
+        }
     }
 }
 
 /// Answer a malformed line and count it against the connection.
 ///
-/// Returns whether the connection should carry on.  A client that cannot form a
-/// request is either broken or probing; either way, three tries is enough
-/// courtesy, and closing beats letting garbage be pumped in forever.
+/// Returns whether the connection should carry on.
 async fn strike(
     strikes: &mut u32,
     sink: &mut tokio::net::unix::OwnedWriteHalf,
     message: &str,
 ) -> bool {
-    *strikes += 1;
     let alive = write(
         sink,
         &Response::Error {
@@ -727,10 +734,21 @@ async fn strike(
     if !alive {
         return false;
     }
+    struck_out(strikes)
+}
+
+/// Count one request the daemon could not act on against the connection,
+/// reporting whether it should carry on.
+///
+/// A client that cannot form a request this daemon understands is either broken
+/// or probing; either way, three tries is enough courtesy, and closing beats
+/// letting garbage be pumped in forever.
+fn struck_out(strikes: &mut u32) -> bool {
+    *strikes += 1;
     if *strikes >= MAX_MALFORMED {
         tracing::warn!(
             strikes = *strikes,
-            "closing a connection that keeps sending malformed requests"
+            "closing a connection that keeps sending requests this daemon cannot act on"
         );
         return false;
     }
@@ -801,10 +819,27 @@ async fn stream_events(
 
 async fn respond(request: Request, session: &Session) -> Response {
     match request {
-        Request::Ping => Response::Pong {
-            project: session.project.clone(),
-            pid: std::process::id(),
-        },
+        Request::Ping { version } => {
+            if let Some(theirs) = version {
+                if theirs < servicrab_protocol::PROTOCOL_VERSION {
+                    // Said once per ping and only downwards: a newer client
+                    // talking to us is the case we cannot help with from here,
+                    // and it hears about it from its own side.  An operator
+                    // chasing a command that behaved oddly is already reading
+                    // this log, which is why it goes here and not to the socket.
+                    tracing::info!(
+                        client = theirs,
+                        daemon = servicrab_protocol::PROTOCOL_VERSION,
+                        "a client is speaking an older revision of the protocol"
+                    );
+                }
+            }
+            Response::Pong {
+                project: session.project.clone(),
+                pid: std::process::id(),
+                version: Some(servicrab_protocol::PROTOCOL_VERSION),
+            }
+        }
         Request::Status => {
             let Ok(registry) = session.registry.lock() else {
                 return Response::Error {
@@ -857,8 +892,9 @@ async fn respond(request: Request, session: &Session) -> Response {
             response
         }
         Request::Reload => reload(session).await,
-        // `Request` is `#[non_exhaustive]`, so an older daemon can still be
-        // asked something it does not know about.
+        // Reached by a client newer than this daemon: an unrecognised request
+        // decodes to `Request::Unknown` rather than failing, so this says which
+        // side is behind instead of "malformed message: unknown variant".
         _ => Response::Error {
             message: "this daemon does not support that request".to_string(),
         },
