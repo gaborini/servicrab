@@ -324,10 +324,20 @@ pub fn serve(
         keep_running: true,
     };
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|e| format!("failed to start the async runtime: {e}"))?;
+    {
+        Ok(runtime) => runtime,
+        // The socket is already bound and published, so an early return here
+        // has to tidy up just like the normal exit path does.  Nothing has
+        // accepted a connection yet, and the lock is still ours.
+        Err(problem) => {
+            let _ = std::fs::remove_file(&paths.socket);
+            drop(lock);
+            return Err(format!("failed to start the async runtime: {problem}"));
+        }
+    };
 
     let result = runtime.block_on(async {
         let listener = UnixListener::from_std(bound)
