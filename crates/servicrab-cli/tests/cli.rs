@@ -678,6 +678,39 @@ fn the_man_page_has_the_hand_written_sections() {
     );
 }
 
+/// The exit codes are part of the frozen contract, and a code that is not
+/// documented is one nobody can rely on.  This used to cover only `exec` and
+/// `run`, and never mentioned the signal codes `up` and `watch` exit with.
+#[test]
+fn the_man_page_documents_every_exit_code_in_the_contract() {
+    let output = cmd()
+        .arg("man")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+    let exit_status = text
+        .split(".SH EXIT STATUS")
+        .nth(1)
+        .expect("an EXIT STATUS section")
+        .split(".SH ")
+        .next()
+        .expect("the section body");
+
+    for code in ["0", "1", "3", "126", "127", "129", "130", "143"] {
+        assert!(
+            exit_status.contains(&format!("\\fB{code}\\fR")),
+            "EXIT STATUS should document {code}: {exit_status}"
+        );
+    }
+    // And the one error format, so the section says where errors go as well as
+    // what the process exits with.
+    assert!(exit_status.contains("error: "), "{exit_status}");
+    assert!(exit_status.contains("schema_version"), "{exit_status}");
+}
+
 // ── env_file ───────────────────────────────────────────────────────────────
 
 #[test]
