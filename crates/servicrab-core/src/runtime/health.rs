@@ -255,7 +255,20 @@ impl HealthMonitor {
         let ceiling = MAX_CONSECUTIVE_FAILURES.max(self.check.retries);
 
         loop {
-            ticker.tick().await;
+            // Racing the tick against the channel's closure is what lets the
+            // monitor let go of its `EventSink` clone the moment the run that
+            // owns it ends.  Waiting for the next tick instead would hold the
+            // sink for as long as `interval`, which keeps the service's event
+            // channel open, which keeps its relay task alive, which delays the
+            // report the supervisor needs to answer a `stop`.  A probe already
+            // in flight is allowed to finish: it is bounded by `check.timeout`,
+            // and cancelling it would abandon a child mid-run.
+            tokio::select! {
+                _ = ticker.tick() => {}
+                () = tx.closed() => return,
+            }
+            // Also checked here, because `select!` picks arbitrarily when both
+            // branches are ready.
             if tx.is_closed() {
                 return;
             }
@@ -369,6 +382,58 @@ mod tests {
         assert!(probe_once(&probe, &ctx(), Duration::from_secs(5))
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_monitor_lets_go_of_its_sink_without_waiting_for_the_next_tick() {
+        // The monitor holds a clone of the service's `EventSink`, so how long it
+        // takes to notice that its run has ended is how long the service's event
+        // channel stays open — and the supervisor waits on that channel before
+        // it can report that the service stopped.  Noticing only on the next
+        // tick made every stop of a health-checked service pay the drain
+        // timeout: measured at ~2.02s against ~0.02s without a health check, and
+        // on the base this branch came from it exceeded the client's own timeout
+        // and failed the command outright.
+        let interval = Duration::from_secs(30);
+        let check = HealthCheck {
+            probe: HealthProbe::Command {
+                executable: "true".to_string(),
+                args: vec![],
+            },
+            interval,
+            timeout: Duration::from_secs(1),
+            retries: 3,
+            start_period: Duration::ZERO,
+            on_unhealthy: UnhealthyAction::Ignore,
+        };
+        // The monitor gets the only sender for this event channel, so the
+        // channel closing is exactly the observable "the monitor let go of its
+        // sink" — the thing the supervisor's relay waits for.
+        let (events_tx, mut events_rx) = crate::runtime::event::event_channel();
+        let monitor = HealthMonitor {
+            check,
+            ctx: ctx(),
+            name: ServiceName("probe".to_string()),
+            events: EventSink::new(events_tx),
+        };
+
+        let rx = monitor.spawn();
+        // The first tick fires immediately, so let the monitor reach the loop
+        // rather than racing its startup.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(rx);
+
+        // Real time, deliberately: the claim is that no `interval` elapses.  The
+        // bound is far below 30s and far above the milliseconds this needs.
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            while events_rx.recv().await.is_some() {}
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "the monitor still held its sink 5s after its receiver was dropped, \
+             so it is waiting for the next tick"
+        );
     }
 
     #[tokio::test]
