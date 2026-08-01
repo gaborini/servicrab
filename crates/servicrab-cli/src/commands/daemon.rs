@@ -498,7 +498,10 @@ mod imp {
                 if json {
                     println!("{{\"running\":false,\"services\":[]}}");
                 } else {
-                    println!(
+                    // Diagnostics, not output: `servicrab status > snapshot`
+                    // should leave the file empty when there is no snapshot to
+                    // take, rather than filling it with prose.
+                    eprintln!(
                         "no daemon is running for {} — start one with `servicrab start`",
                         cfg.project.name
                     );
@@ -507,10 +510,10 @@ mod imp {
                     // looking for one.  Said only when it is somewhere
                     // surprising, so the ordinary output does not change.
                     if !paths.socket_is_in_place() {
-                        println!(
+                        eprintln!(
                             "{}",
                             style::paint(
-                                style::color_enabled_for(Stream::Stdout),
+                                style::color_enabled_for(Stream::Stderr),
                                 DIM,
                                 &format!(
                                     "  its socket would be {} (the project's path is too long to hold one)",
@@ -553,7 +556,9 @@ mod imp {
             Ok(Response::Error { message }) => return Err(message),
             Ok(other) => return Err(format!("unexpected response from the daemon: {other:?}")),
             Err(client::ClientError::NotRunning) => {
-                println!("no daemon is running for {}", cfg.project.name);
+                // Nothing was stopped, so there is nothing to report as output;
+                // saying so is a diagnostic.
+                eprintln!("no daemon is running for {}", cfg.project.name);
                 return Ok(0);
             }
             Err(err) => return Err(err.to_string()),

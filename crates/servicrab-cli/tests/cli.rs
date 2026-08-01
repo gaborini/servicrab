@@ -609,6 +609,43 @@ fn completions_reject_an_unknown_shell() {
     cmd().arg("completions").arg("tcsh").assert().failure();
 }
 
+/// A reader that is already gone: any write to it fails with `EPIPE`.
+///
+/// `servicrab man | head` only reaches that when the page outgrows the pipe
+/// buffer, which makes it a poor test; a read end closed before the process
+/// starts is the same condition without the race.
+#[cfg(unix)]
+fn closed_pipe() -> std::process::Stdio {
+    let (read, write) = nix::unistd::pipe().expect("a pipe");
+    drop(read);
+    std::process::Stdio::from(write)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_reader_that_has_gone_away_is_not_a_failure() {
+    // `servicrab man | head` and `servicrab completions bash | head` end with
+    // the reader closing the pipe, which is it saying it has seen enough.  The
+    // man page reported that as an error and exited 1; the completion script's
+    // generator writes with `expect` and panicked on it.
+    for args in [vec!["man"], vec!["completions", "bash"]] {
+        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("servicrab"))
+            .args(&args)
+            .stdout(closed_pipe())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("failed to run servicrab");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{args:?} exited with {:?}: {stderr}",
+            output.status.code()
+        );
+        assert!(stderr.is_empty(), "{args:?} complained: {stderr}");
+    }
+}
+
 // ── man ────────────────────────────────────────────────────────────────────
 
 #[test]

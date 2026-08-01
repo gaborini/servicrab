@@ -57,7 +57,12 @@ services.
 .TP
 \fBNO_COLOR\fR
 Set to any value to disable coloured output.  Colour is also disabled when
-\fBTERM\fR is \fBdumb\fR, and whenever stdout is not a terminal.
+\fBTERM\fR is \fBdumb\fR, and for whichever of stdout and stderr is not a
+terminal.
+.TP
+\fBCLICOLOR_FORCE\fR
+Set to anything other than \fB0\fR to colour output even when it is redirected
+to a pipe or a file.  \fBNO_COLOR\fR wins over it; \fB--color\fR wins over both.
 .SH EXIT STATUS
 .TP
 \fB0\fR
@@ -111,9 +116,14 @@ pub fn run<C: CommandFactory>(output: Option<&Path>) -> Result<(), String> {
     let page = page::<C>().map_err(|e| format!("failed to render the man page: {e}"))?;
 
     let Some(dir) = output else {
-        return std::io::stdout()
-            .write_all(&page)
-            .map_err(|e| format!("failed to write the man page: {e}"));
+        return match std::io::stdout().write_all(&page) {
+            Ok(()) => Ok(()),
+            // `servicrab man | head` closes the pipe partway through the page,
+            // and that is the reader saying it has seen enough — not a failure
+            // to report and not a reason to exit non-zero.
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(err) => Err(format!("failed to write the man page: {err}")),
+        };
     };
 
     std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;

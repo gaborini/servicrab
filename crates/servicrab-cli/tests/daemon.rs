@@ -202,9 +202,12 @@ restart = "always"
     assert!(!dir.path().join(".servicrab/daemon.sock").exists());
     assert!(!dir.path().join(".servicrab/daemon.pid").exists());
 
-    let (code, stdout, _) = cli(&["status"], &cfg);
+    let (code, stdout, stderr) = cli(&["status"], &cfg);
     assert_eq!(code, 1);
-    assert!(stdout.contains("no daemon is running"), "{stdout}");
+    assert!(stderr.contains("no daemon is running"), "{stderr}");
+    // Diagnostics, so `servicrab status > snapshot` records no snapshot at all
+    // rather than a sentence about there not being one.
+    assert!(stdout.is_empty(), "{stdout}");
 }
 
 // ── start --wait ───────────────────────────────────────────────────────────
@@ -961,18 +964,21 @@ command = ["{}"]
         ),
     );
 
-    let (code, stdout, _) = cli(&["status"], &cfg);
+    let (code, stdout, stderr) = cli(&["status"], &cfg);
     assert_eq!(code, 1);
-    assert!(stdout.contains("servicrab start"), "{stdout}");
+    assert!(stderr.contains("servicrab start"), "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
 
+    // `--json` is output, not diagnostics, so it stays on stdout.
     let (code, stdout, _) = cli(&["status", "--json"], &cfg);
     assert_eq!(code, 1);
     assert!(stdout.contains("\"running\":false"), "{stdout}");
 
     // Stopping something that is not running is not a failure.
-    let (code, stdout, _) = cli(&["down"], &cfg);
+    let (code, stdout, stderr) = cli(&["down"], &cfg);
     assert_eq!(code, 0);
-    assert!(stdout.contains("no daemon is running"), "{stdout}");
+    assert!(stderr.contains("no daemon is running"), "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
 }
 
 #[test]
