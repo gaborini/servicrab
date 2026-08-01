@@ -576,6 +576,18 @@ command = ["{}"]
     drop(refusing);
 }
 
+/// Run a per-service command and insist it worked, saying what it printed if
+/// it did not.
+///
+/// `assert_eq!(cli(..).0, 0)` reports only the code, which turns any failure
+/// here into "left == 1, right == 0" and leaves the next reader guessing.  This
+/// suite has a flake history in exactly these spots, so the diagnostics have to
+/// be in the failure itself.
+fn stop_ok(args: &[&str], config_path: &Path) {
+    let (code, stdout, stderr) = cli(args, config_path);
+    assert_eq!(code, 0, "`{}` failed:\n{stdout}{stderr}", args.join(" "));
+}
+
 /// The uid the kernel reports for the other end of `stream`.
 fn peer_uid(stream: &std::os::unix::net::UnixStream) -> u32 {
     use nix::sys::socket::getsockopt;
@@ -1129,7 +1141,7 @@ fn stopping_an_already_stopped_service_is_not_an_error() {
     let daemon = Daemon::start(&cfg);
     daemon.wait_for_status("api to run", |s| s.contains("running"));
 
-    assert_eq!(cli(&["stop", "api"], &cfg).0, 0);
+    stop_ok(&["stop", "api"], &cfg);
     let (code, stdout, _) = cli(&["stop", "api"], &cfg);
     assert_eq!(code, 0);
     assert!(stdout.contains("already stopped"), "{stdout}");
@@ -1503,8 +1515,8 @@ fn a_hand_stopped_service_stays_stopped_across_a_daemon_restart() {
         state_of(s, "api") == "running" && state_of(s, "cache") == "running"
     });
 
-    assert_eq!(cli(&["stop", "api"], &cfg).0, 0);
-    assert_eq!(cli(&["stop", "cache"], &cfg).0, 0);
+    stop_ok(&["stop", "api"], &cfg);
+    stop_ok(&["stop", "cache"], &cfg);
     drop(daemon);
 
     let daemon = Daemon::start(&cfg);
@@ -1522,7 +1534,7 @@ fn starting_a_remembered_service_takes_the_stop_back() {
 
     let daemon = Daemon::start(&cfg);
     daemon.wait_for_status("api to run", |s| state_of(s, "api") == "running");
-    assert_eq!(cli(&["stop", "api"], &cfg).0, 0);
+    stop_ok(&["stop", "api"], &cfg);
     assert_eq!(cli(&["start", "api"], &cfg).0, 0);
     drop(daemon);
 
@@ -1544,7 +1556,7 @@ fn the_remembered_stop_is_a_plain_list_of_names() {
     daemon.wait_for_status("api to run", |s| state_of(s, "api") == "running");
     assert!(!remembered.exists(), "nothing was stopped yet");
 
-    assert_eq!(cli(&["stop", "api"], &cfg).0, 0);
+    stop_ok(&["stop", "api"], &cfg);
     assert_eq!(
         fs::read_to_string(&remembered).unwrap(),
         "# servicrab stopped v1\napi\n"
@@ -1638,7 +1650,7 @@ fn a_renamed_service_is_forgotten_at_the_next_start() {
 
     let daemon = Daemon::start(&cfg);
     daemon.wait_for_status("api to run", |s| state_of(s, "api") == "running");
-    assert_eq!(cli(&["stop", "api"], &cfg).0, 0);
+    stop_ok(&["stop", "api"], &cfg);
     drop(daemon);
 
     // Rename `api` to `web`, so the remembered name has nothing to refer to.
@@ -1694,7 +1706,7 @@ restart = "always"
     daemon.wait_for_status("the stack to run", |s| {
         state_of(s, "db") == "running" && state_of(s, "api") == "running"
     });
-    assert_eq!(cli(&["stop", "db"], &cfg).0, 0);
+    stop_ok(&["stop", "db"], &cfg);
     drop(daemon);
 
     // `--wait` returns 0 rather than waiting out its timeout on a service the
