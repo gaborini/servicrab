@@ -412,12 +412,30 @@ restart = "never"
     });
 
     let mut seen: Vec<String> = Vec::new();
-    let deadline = Instant::now() + CEILING;
-    let mut lines = reader.lines();
     let last = format!("line {LINES}");
-    while Instant::now() < deadline {
-        let Some(Ok(line)) = lines.next() else { break };
-        let line = line.trim().to_string();
+    // Draining stdout on its own thread keeps two things true at once: the
+    // follower never stalls on a full pipe (it has to keep polling a growing
+    // file, or the duplicate this test hunts for could not arise), and the wait
+    // below can be bounded by something other than a stopwatch.
+    let (lines_tx, lines_rx) = std::sync::mpsc::channel();
+    let drain = std::thread::spawn(move || {
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            if lines_tx.send(line.trim().to_string()).is_err() {
+                break;
+            }
+        }
+    });
+
+    // The condition is silence, not elapsed time. `CEILING` used to have to
+    // cover the paced flood *and* the follow of it, and the flood alone is
+    // `LINES * PACE` of sleeping — a floor rather than a duration, since every
+    // sleep overruns and on a loaded runner it overruns by enough that the
+    // deadline expired while the writer was still mid-file. That failed a
+    // follower that was working perfectly, blaming whichever line the clock cut
+    // it off at. A follow that has genuinely stopped is instead recognisable by
+    // what it does: it goes quiet and stays quiet, however slow the machine.
+    while let Ok(line) = lines_rx.recv_timeout(CEILING) {
         let done = line == last;
         seen.push(line);
         if done {
@@ -428,6 +446,8 @@ restart = "never"
     appender.join().unwrap();
     let _ = follower.kill();
     let _ = follower.wait();
+    drop(lines_rx);
+    let _ = drain.join();
 
     let mut once: BTreeSet<&String> = BTreeSet::new();
     let mut twice: Vec<&String> = Vec::new();

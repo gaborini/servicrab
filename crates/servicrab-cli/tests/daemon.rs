@@ -1198,6 +1198,119 @@ fn an_unknown_service_is_rejected_by_the_daemon() {
 
 // ── socket hardening ───────────────────────────────────────────────────────
 
+/// Whether reading an abusive connection to its end shows that the daemon
+/// closed it.
+///
+/// A graceful `FIN` is not the only shape a deliberate close arrives in. The
+/// daemon stops reading at its frame cap, so by the time it closes there are
+/// still megabytes of this test's 4 MiB sitting unread in the socket's receive
+/// queue — and a kernel asked to throw unread data away tells the peer so with a
+/// reset rather than an orderly end-of-stream. Linux does exactly that here;
+/// macOS reports a plain EOF for the same close. Both mean closed, which is the
+/// only thing this asserts.
+///
+/// A daemon that really had left the connection open looks nothing like either:
+/// nothing would arrive at all, and the read would sit until the socket's own
+/// timeout expired and surfaced as `WouldBlock` or `TimedOut`. That is the
+/// outcome the test exists to catch, so it has to keep failing.
+fn ended_because_the_daemon_closed(outcome: &std::io::Result<usize>) -> bool {
+    match outcome {
+        Ok(_) => true,
+        Err(err) => err.kind() == std::io::ErrorKind::ConnectionReset,
+    }
+}
+
+/// The distinction the assertion rests on, made executable rather than left to a
+/// comment: a reset is a close, and the read timeout a still-open connection
+/// produces is not.
+#[test]
+fn a_reset_ends_a_connection_but_a_read_timeout_means_it_is_still_open() {
+    use std::io::ErrorKind;
+
+    assert!(ended_because_the_daemon_closed(&Ok(0)));
+    assert!(ended_because_the_daemon_closed(&Err(
+        ErrorKind::ConnectionReset.into()
+    )));
+
+    for still_open in [ErrorKind::WouldBlock, ErrorKind::TimedOut] {
+        assert!(
+            !ended_because_the_daemon_closed(&Err(still_open.into())),
+            "{still_open:?} is the daemon never closing, not a close"
+        );
+    }
+}
+
+/// What a connection the daemon *failed* to close actually looks like to the
+/// reader, so that accepting a reset above cannot quietly accept this too.
+///
+/// The listener here is the test's own, standing in for a daemon that gave up on
+/// the frame and then simply never closed. Nothing but the socket's read timeout
+/// ends the read, and the error kind that surfaces is the platform's choice —
+/// which is the whole reason to check it against the classifier rather than
+/// assume it.
+#[test]
+fn a_daemon_that_never_closes_is_not_mistaken_for_one_that_did() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    // Short on purpose: this timeout is the thing being provoked, so it is the
+    // test's own runtime rather than a bound on somebody else's work.
+    const PATIENCE: Duration = Duration::from_millis(500);
+
+    let dir = TempDir::new().unwrap();
+    let socket = dir.path().join("stalled.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+
+    let done = Arc::new(AtomicBool::new(false));
+    let server = std::thread::spawn({
+        let done = Arc::clone(&done);
+        move || {
+            let (mut conn, _) = listener.accept().expect("accept");
+            // Read a frame's worth and then stop, as the daemon's capped reader
+            // does — but hold the connection instead of dropping it.
+            let mut buffer = vec![0u8; 8 * 1024];
+            let mut read = 0;
+            while read <= 64 * 1024 {
+                match conn.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => read += n,
+                }
+            }
+            while !done.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(conn);
+        }
+    });
+
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket).expect("connect");
+    stream.set_write_timeout(Some(PATIENCE)).expect("write");
+    stream.set_read_timeout(Some(PATIENCE)).expect("read");
+
+    let chunk = vec![b'x'; 64 * 1024];
+    let mut written = 0usize;
+    while written < 4 * 1024 * 1024 {
+        match stream.write_all(&chunk) {
+            Ok(()) => written += chunk.len(),
+            Err(_) => break,
+        }
+    }
+    let _ = stream.flush();
+
+    let mut sink = Vec::new();
+    let outcome = stream.read_to_end(&mut sink);
+
+    done.store(true, Ordering::Relaxed);
+    drop(stream);
+    server.join().expect("server thread");
+
+    assert!(
+        !ended_because_the_daemon_closed(&outcome),
+        "a connection nobody closed was read as closed: {outcome:?}"
+    );
+}
+
 /// A newline-free stream must not be able to grow the daemon's memory without
 /// bound.
 ///
@@ -1242,7 +1355,7 @@ fn an_oversized_request_closes_the_connection_and_leaves_the_daemon_alive() {
     let mut sink = Vec::new();
     let closed = stream.read_to_end(&mut sink);
     assert!(
-        closed.is_ok(),
+        ended_because_the_daemon_closed(&closed),
         "the daemon left the abusive connection open: {closed:?}"
     );
     drop(stream);
