@@ -9,12 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The `ping`/`pong` exchange now carries the revision of the wire format each
+  side speaks. It is optional, because 0.3 spoke this format without naming it
+  and "did not say" has to stay distinguishable from "said 0" — a client that
+  read silence as a mismatch would refuse to talk to a 0.3 daemon. Nothing
+  refuses on the strength of the number; the daemon logs a client that is
+  behind, which is where an operator chasing version skew is already looking.
+
 - A `Dependabot auto-merge` workflow. `main` now requires a pull request with
   green checks and one approving review, which a bot cannot collect, so the
   weekly dependency bumps are approved and queued for auto-merge from CI
   instead. Major-version updates are left for a human, including a grouped
   update that contains one — the checks are a real review for a patch bump, and
   not much of one for a breaking change.
+
+### Fixed
+
+- A newer daemon could end an older client's event stream with a single line.
+  `#[non_exhaustive]` is a promise to downstream *crates* and says nothing about
+  a line of JSON: serde rejects an unrecognised tag outright, so one unknown
+  event kind failed to decode and `servicrab events` exited with an error,
+  mid-run, taking every event behind it. One new event type in a later release
+  would have done that to every client of every earlier one. Each enum the
+  daemon can widen now has an `unknown` fallback: a client skips what it cannot
+  name, keeps reading, and passes the line through verbatim under `--json`, so a
+  consumer that knows more than that build does loses nothing. The same applies
+  to a `status` snapshot, where one unfamiliar state or health verdict used to
+  fail the whole reply.
+
+  A request a daemon does not recognise now gets `this daemon does not support
+  the request "strat"; it supports: ping, status, …` rather than `malformed
+  message: unknown variant …`, which read as "your client is broken" when the
+  truth was "this daemon is older than your client". The name and the list are
+  both there deliberately: deciding an unknown request is no longer a decode
+  error also throws away what serde said about it, and a typo in a hand-rolled
+  client is a far more common reason to see this message than a genuinely newer
+  client is.
+
+- A config written for a later schema reported one of its own keys as a typo
+  instead of naming the version. The version check ran after the field-level
+  parse, and that parse is fatal — so `version = 2` plus any key a future schema
+  would add came back as `unknown field 'new_key_from_v2'`, with not a word
+  about the version. The one message that tells an operator to upgrade servicrab
+  was unreachable for exactly the files it was written for. `version` is now
+  read first, by a pass that names nothing else. An unrecognised key inside a
+  `version = 1` file is still fatal: there it is a typo, and a misspelled
+  `comand` that loaded quietly would be far worse than one that refuses.
 
 ## [0.3.0] - 2026-07-30
 

@@ -116,6 +116,15 @@ where
         if line.trim().is_empty() {
             continue;
         }
+        // A line this build cannot name is the thing this loop must not die on:
+        // an event stream is read until the daemon goes away, so one new event
+        // kind from a newer daemon would otherwise end the whole stream with an
+        // error and a non-zero exit, mid-run.  It decodes to a fallback variant
+        // instead, and the raw line reaches the callback either way — so
+        // `--json` passes it through untouched and a consumer that knows more
+        // than this build does loses nothing.  An error here is left fatal
+        // because it is no longer version skew but a daemon writing something
+        // that is not JSON at all.
         let response = decode::<Response>(&line).map_err(|e| ClientError::Failed(e.to_string()))?;
         if !on_event(line.trim_end(), response) {
             return Ok(());
@@ -136,7 +145,7 @@ fn connect(socket: &Path) -> Result<UnixStream, ClientError> {
 
 /// Whether a daemon is listening and answering.
 pub fn is_running(socket: &Path) -> bool {
-    matches!(send(socket, &Request::Ping), Ok(Response::Pong { .. }))
+    matches!(send(socket, &Request::ping()), Ok(Response::Pong { .. }))
 }
 
 /// Ask whether a daemon is there, keeping the reason when it will not talk to
@@ -150,7 +159,7 @@ pub fn is_running(socket: &Path) -> bool {
 /// A `ping` can only be answered with an error for a reason the operator needs
 /// to hear, so every error is passed on as it stands.
 pub fn check_running(socket: &Path) -> Result<(), ClientError> {
-    match send(socket, &Request::Ping) {
+    match send(socket, &Request::ping()) {
         Ok(Response::Pong { .. }) => Ok(()),
         Ok(Response::Error { message }) => Err(ClientError::Failed(message)),
         Ok(other) => Err(ClientError::Failed(format!(

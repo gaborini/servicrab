@@ -19,7 +19,11 @@ use crate::raw::{
 };
 
 /// The only supported schema version.
-const SUPPORTED_VERSION: u32 = 1;
+///
+/// Read by [`crate::load::load`] too: the check there runs before the
+/// field-level parse, because a file written for a later schema is made of
+/// fields this build does not know and would otherwise be reported as a typo.
+pub(crate) const SUPPORTED_VERSION: u32 = 1;
 
 // Duration range constants
 const DUR_100MS: Duration = Duration::from_millis(100);

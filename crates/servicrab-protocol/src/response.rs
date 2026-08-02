@@ -2,6 +2,30 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The tag every enum here falls back to when the daemon names something this
+/// build has never heard of.
+///
+/// `#[non_exhaustive]` buys nothing on a socket.  It stops a downstream crate
+/// from writing an exhaustive `match`, which is a promise about *source*
+/// compatibility, and says nothing at all about a line of JSON: serde's
+/// internally tagged representation rejects an unrecognised tag outright, so
+/// before these fallbacks existed a single new event kind from a 1.1 daemon
+/// failed to decode and took the whole event stream down with it — on every
+/// client of every earlier release, mid-run.  Every wildcard arm written on the
+/// strength of `#[non_exhaustive]` was therefore unreachable from the wire, and
+/// the comments explaining them were describing something that could not
+/// happen.
+///
+/// The fallbacks are what make those arms real.  A client decodes what it
+/// understands, keeps reading, and hands the rest on untouched — the raw line is
+/// still what `--json` prints, so nothing is lost to a consumer that knows more
+/// than this build does.
+///
+/// It is a reserved word in the wire format as a consequence: a future release
+/// must not name a real variant `unknown`, or older clients would silently
+/// classify it as one of these instead of reporting it.
+pub const UNKNOWN: &str = "unknown";
+
 /// The lifecycle state of a service, as reported by the daemon.
 ///
 /// This mirrors `servicrab_core::ServiceState`, but the protocol crate stays
@@ -26,6 +50,11 @@ pub enum ServiceState {
     Exited,
     /// The service failed fatally.
     Failed,
+    /// A state this build has no name for, because a newer daemon reported it.
+    ///
+    /// See [`UNKNOWN`] for why every enum on this side of the wire has one.
+    #[serde(other)]
+    Unknown,
 }
 
 impl std::fmt::Display for ServiceState {
@@ -39,6 +68,7 @@ impl std::fmt::Display for ServiceState {
             ServiceState::Stopped => "stopped",
             ServiceState::Exited => "exited",
             ServiceState::Failed => "failed",
+            ServiceState::Unknown => UNKNOWN,
         };
         f.write_str(text)
     }
@@ -57,6 +87,11 @@ pub enum Health {
     Healthy,
     /// The service exhausted its retry budget.
     Unhealthy,
+    /// A verdict this build has no name for, because a newer daemon reported it.
+    ///
+    /// See [`UNKNOWN`].
+    #[serde(other)]
+    Unknown,
 }
 
 impl std::fmt::Display for Health {
@@ -66,6 +101,7 @@ impl std::fmt::Display for Health {
             Health::Starting => "starting",
             Health::Healthy => "healthy",
             Health::Unhealthy => "unhealthy",
+            Health::Unknown => UNKNOWN,
         };
         f.write_str(text)
     }
@@ -102,6 +138,11 @@ pub enum Stream {
     Stdout,
     /// The service's standard error.
     Stderr,
+    /// A stream this build has no name for, because a newer daemon named it.
+    ///
+    /// See [`UNKNOWN`].
+    #[serde(other)]
+    Unknown,
 }
 
 impl std::fmt::Display for Stream {
@@ -109,6 +150,7 @@ impl std::fmt::Display for Stream {
         match self {
             Stream::Stdout => f.write_str("stdout"),
             Stream::Stderr => f.write_str("stderr"),
+            Stream::Unknown => f.write_str(UNKNOWN),
         }
     }
 }
@@ -218,6 +260,14 @@ pub enum Event {
         /// A human-readable description of the failure.
         message: String,
     },
+    /// Something a newer daemon reported that this build has no name for.
+    ///
+    /// See [`UNKNOWN`].  The payload is dropped rather than kept: a client that
+    /// wants the detail of an event it does not understand wants the line the
+    /// daemon sent, not a half-interpreted copy of it, and that line is what
+    /// [`crate::Response`] consumers are handed alongside the decoded value.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A response returned by the servicrab daemon to a client.
@@ -238,6 +288,13 @@ pub enum Response {
         project: String,
         /// The daemon's own process id.
         pid: u32,
+        /// Which revision of this wire format the daemon speaks.
+        ///
+        /// Optional, and absent means "did not say": a 0.3 daemon has no such
+        /// field, and a client that treated silence as a mismatch would refuse
+        /// to talk to one.  See [`crate::PROTOCOL_VERSION`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<u32>,
     },
 
     /// Answer to [`crate::Request::Status`].
@@ -265,4 +322,12 @@ pub enum Response {
         /// Human-readable description of what went wrong.
         message: String,
     },
+
+    /// A reply this build has no name for, because a newer daemon sent it.
+    ///
+    /// See [`UNKNOWN`].  This is the variant that keeps a subscriber alive: an
+    /// event stream is read until the daemon goes away, so a line it cannot
+    /// name has to be something it can skip rather than something it dies on.
+    #[serde(other)]
+    Unknown,
 }

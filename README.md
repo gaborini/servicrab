@@ -968,7 +968,7 @@ echo '{"type":"status"}' | nc -U .servicrab/daemon.sock
 
 | Request | Response |
 | --- | --- |
-| `{"type":"ping"}` | `{"type":"pong","project":"…","pid":123}` |
+| `{"type":"ping"}` | `{"type":"pong","project":"…","pid":123,"version":1}` |
 | `{"type":"status"}` | `{"type":"status","services":[…]}` |
 | `{"type":"shutdown"}` | `{"type":"ok","message":"stopping the stack"}` |
 | `{"type":"start_service","name":"api"}` | `{"type":"ok","message":"api started"}` |
@@ -980,6 +980,34 @@ echo '{"type":"status"}' | nc -U .servicrab/daemon.sock
 `stop_service` and `restart_service` only answer once the service has actually
 stopped (and, for a restart, been replaced), so scripts can rely on the reply
 instead of polling.
+
+#### Reading a stream from a newer servicrab
+
+`version` in the `ping`/`pong` exchange says which revision of this protocol
+each side speaks. It is optional in both directions: a client from before it
+existed sends nothing, and is answered normally. Nothing refuses to talk on the
+strength of the number — it is there so that a version mismatch can be reported
+rather than guessed at.
+
+That is possible because both ends decode leniently instead. Anything a build
+cannot name — a request type, a response type, an event `kind`, a service
+`state`, a `health` verdict, a log `stream` — reads back as `unknown` rather than
+failing the line. A client skips what it does not understand and keeps reading,
+so a later release can add an event type without ending every older client's
+stream, and one unfamiliar state does not cost you the rest of a `status`
+snapshot.
+
+Write your own client the same way: ignore a `type` or `kind` you do not
+recognise rather than treating it as an error, and do not give a field the value
+`unknown` — it is reserved for exactly this.
+
+A request the daemon does not recognise is named back to you, with the set it
+does accept, so a typo in a hand-rolled client is one round trip to diagnose:
+
+```console
+$ echo '{"type":"strat"}' | nc -U .servicrab/daemon.sock
+{"type":"error","message":"this daemon does not support the request \"strat\"; it supports: ping, status, shutdown, start_service, stop_service, restart_service, reload, subscribe"}
+```
 
 ### Live event streaming
 
