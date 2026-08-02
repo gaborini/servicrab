@@ -678,11 +678,23 @@ what you see in the terminal — the files are a copy, not a redirect.
 Read them back with `logs`:
 
 ```console
-$ servicrab logs -n 2
+$ servicrab logs
+db     | starting postgres
 db     | db up
+worker | worker ready
+worker | picked up job 41
+$ servicrab logs -n 1
 db     | db up
 worker | picked up job 41
-worker | picked up job 41
+```
+
+A single named service is printed without the prefix, since there is nothing to
+tell apart:
+
+```console
+$ servicrab logs db
+starting postgres
+db up
 ```
 
 ```bash
