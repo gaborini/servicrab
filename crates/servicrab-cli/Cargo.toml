@@ -1,6 +1,6 @@
 [package]
 name = "servicrab"
-description = "A lightweight cross-platform process supervisor for local development stacks, homelabs, and small servers"
+description = "A lightweight process supervisor for local development stacks, homelabs, and small servers (Linux and macOS)"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
