@@ -67,6 +67,20 @@ fn parse_duration(text: &str) -> Result<std::time::Duration, String> {
     author
 )]
 struct Cli {
+    /// When to colour output: auto (a stream that is a terminal), always, never.
+    #[arg(
+        long,
+        value_name = "WHEN",
+        value_enum,
+        default_value = "auto",
+        global = true
+    )]
+    color: style::ColorChoice,
+
+    /// Never colour output; the same as --color=never.
+    #[arg(long, global = true, conflicts_with = "color")]
+    no_color: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -432,6 +446,14 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
+
+    // Recorded before anything is rendered, so every stream's colour decision
+    // sees the choice that was actually typed.
+    style::set_choice(if cli.no_color {
+        style::ColorChoice::Never
+    } else {
+        cli.color
+    });
 
     // `run` has no other progress output, so its lifecycle transitions are
     // logged by default.  `up` renders the same information from its event

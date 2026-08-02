@@ -41,4 +41,6 @@ assert_cmd = "2"
 predicates = "3"
 
 [target.'cfg(unix)'.dev-dependencies]
-nix = { workspace = true }
+# `term` is only for the tests: a colour decision is about whether a stream is a
+# terminal, so proving it needs a real one on one stream and a pipe on the other.
+nix = { workspace = true, features = ["term"] }

@@ -366,8 +366,12 @@ api   | listening on 0.0.0.0:3000
 
 A service's own stdout is written to Servicrab's stdout and its stderr to
 Servicrab's stderr, so `servicrab up > stack.log` keeps the two apart. Colour is
-disabled automatically when the output is not a terminal, when `NO_COLOR` is
-set, or when `TERM=dumb`.
+decided per stream: whichever of stdout and stderr is a terminal gets colour, so
+`servicrab up 2> stack.err` leaves the file free of escapes and
+`servicrab up | cat` still colours the progress on stderr. `--color=never` (or
+`--no-color`) turns colour off, `--color=always` forces it on both streams, and
+`CLICOLOR_FORCE` forces it for a redirected stream. `NO_COLOR` and `TERM=dumb`
+disable it; `--color` wins over all of them.
 
 ### Which services are started
 
