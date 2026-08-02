@@ -1,6 +1,6 @@
 [package]
 name = "servicrab-core"
-description = "Configuration models, validation, and service lifecycle types for servicrab"
+description = "Configuration models, validation, and the process runtime behind servicrab"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

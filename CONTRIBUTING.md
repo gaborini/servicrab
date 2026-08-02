@@ -25,11 +25,15 @@ file.
    git checkout -b feat/my-feature
    ```
 4. **Make changes**, then run the checks locally before pushing. These are the
-   same commands CI runs, so a clean sweep here means a green pipeline:
+   same commands CI runs, `--locked` included — without it cargo may resolve a
+   newer transitive dependency and you would be testing something other than
+   what `Cargo.lock` ships:
    ```sh
-   cargo fmt --all
-   cargo clippy --workspace --all-targets --all-features -- -D warnings
-   cargo test --workspace --all-features
+   cargo fmt --all -- --check
+   cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+   cargo test --workspace --all-features --locked
+   RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
+   cargo package --workspace --locked
    ```
 5. **Open a pull request** against the `main` branch.
 
@@ -39,10 +43,15 @@ file.
 
 `main` is protected, so a change reaches it through a pull request that has:
 
-- **the five CI checks green** — `fmt + clippy + test` on Linux and macOS, the
-  MSRV check, the Windows stub build, and the crates.io packaging dry run;
+- **the six CI checks green** — `fmt + clippy + test` on Linux and macOS, the
+  MSRV check, the Windows stub build, the crates.io packaging dry run, and the
+  rustdoc build with `-D warnings`;
 - **one approving review** from a maintainer;
 - **every review conversation resolved**.
+
+The `Audit` workflow's `cargo-deny` job is not one of the six. It runs on a pull
+request only when `Cargo.toml`, `Cargo.lock` or `deny.toml` changed, on the
+grounds that a newly published advisory should not fail an unrelated change.
 
 Your branch does not have to be up to date with `main` before merging: this is a
 small project, and forcing a rebase for every unrelated commit costs more than it
@@ -87,7 +96,23 @@ cargo +1.85 check --workspace --all-features --all-targets --locked
 ## Development tips
 
 - The workspace uses a **resolver = "2"** so that feature flags are resolved per-crate.
-- Keep `servicrab-core` free of I/O and async dependencies — it must stay usable from both the CLI and future daemon without pulling in the full Tokio runtime.
+- **File names are `snake_case`**, matching the module names they define
+  (`validation.rs`, `stack_stub.rs`). There is no `camelCase` file in the
+  workspace and no `*.test.rs` convention; if a tool tells you otherwise, it is
+  guessing from a different language.
+- **Imports are absolute**: `use crate::…` inside a crate,
+  `use servicrab_core::…` across crates. `use super::*;` appears only inside
+  `#[cfg(test)] mod tests`, to reach the module under test.
+- Keep the CLI's concerns out of `servicrab-core`. The split is not "no I/O" —
+  core reads config files, walks `PATH`, opens TCP health probes and runs on
+  `tokio` — it is that **core never formats output for a terminal**: it returns
+  typed values and publishes structured events, and the CLI decides how they
+  look. So no `clap`, no styling, no terminal detection, and no `println!` in
+  core; and no supervision logic in the CLI.
+- Platform-specific process code lives behind `#[cfg]` in
+  `crates/servicrab-core/src/runtime/`, with a stub that returns
+  `RuntimeError::UnsupportedPlatform` elsewhere. Windows must keep compiling —
+  CI checks it — so a new runtime entry point needs a stub alongside it.
 - Add unit tests in the same file as the code under test (in a `#[cfg(test)] mod tests { … }` block).
 - Add integration tests under `tests/` in the relevant crate only when you need to exercise the binary.
 
@@ -95,13 +120,18 @@ cargo +1.85 check --workspace --all-features --all-targets --locked
 
 ## Commit messages
 
-Use short imperative sentences:
+A subject line is a short imperative sentence saying what the commit does, and
+preferably why. There is no `type:` prefix convention — the history is plain
+sentences, and a `feat:`/`fix:` prefix would be the odd one out:
 
 ```
 Add restart-policy validation
-Fix: handle empty command in run subcommand
-Docs: update README roadmap
+Handle an empty command in the run subcommand
+Read the config version before the parse that its own keys would fail
 ```
+
+Use the body for the reasoning that will not be obvious in six months. That is
+where this project puts the *why*, in prose.
 
 ---
 

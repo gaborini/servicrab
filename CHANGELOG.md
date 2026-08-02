@@ -92,6 +92,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - In `servicrab-core`, a control command's acknowledgement carries a
   `ControlOutcome` or a `ControlRefusal` rather than `Result<String, String>`.
   Both still `Display` as exactly the sentences they replaced.
+- The crates.io description of `servicrab` no longer says "cross-platform". It
+  names Linux and macOS, because supervision has never worked anywhere else and
+  the description is the one line a prospective user reads before installing.
+  `servicrab-core`'s description now mentions the process runtime it contains.
+
+### Documentation
+
+The release audit found the documentation making claims the code does not
+support, so this round verified each one against the binary and corrected it.
+The substantive corrections, rather than the wording:
+
+- **The README documents every configuration field's range.** Not one bound was
+  written down before, so the only way to learn that `stable_after` has a floor
+  of a second or that `max_files` stops at 100 was to be refused by `check`.
+  There is a new reference table with every field's type, default and range.
+- **`servicrab-core` is no longer described as free of I/O and async.** Its
+  crate docs said "all I/O is delegated to callers" and `CONTRIBUTING.md` said
+  to keep it "free of I/O and async dependencies", while the crate reads config
+  files, walks `PATH`, opens TCP health probes, and depends on `tokio`. The
+  boundary that does exist — core never formats output for a terminal — is now
+  what all three documents describe.
+- **The durability guarantee is stated as it is, not as intended.** The README
+  said the socket and the pidfile are removed "when the daemon exits, however it
+  exits". Only the graceful path unlinks them; after `SIGKILL`, an OOM kill or a
+  panic both files survive and the supervised children are orphaned, because
+  nothing reconciles them on the next start. There is a new section on what to
+  do about that.
+- **`--profile` and the `-c` alias appear in the command reference**, which
+  listed neither.
+- The README no longer claims a `--json` event stream and `servicrab down` are
+  unimplemented; both shipped in 0.1.0. `SECURITY.md`'s supported-versions table
+  no longer stops at `0.1.x`. The bug-report template no longer suggests a
+  two-year-stale version string. The "exactly what CI runs" list was missing the
+  packaging dry run and counted `cargo deny`, which is not a required check.
+- `${VAR}` substitution is documented as applying to string-valued fields, which
+  is what it has always done — `max_restarts`, `logs.max_files`,
+  `health.retries`, `autostart`, `logs.enabled` and `restart` are not strings.
+- New sections state what v1.0 freezes (the CLI surface, the socket protocol and
+  the JSON output; not the Rust API of the internal crates, and not the column
+  alignment of `--help`), collect the exit codes in one table matching the man
+  page, and replace the roadmap of five simultaneously-current phases.
+
+A new test, `crates/servicrab-cli/tests/config_reference.rs`, keeps the range
+table honest: for each documented bound it runs `check` on a config sitting on
+the bound and one just past it, so widening a limit in `validation.rs` without
+updating the README fails the suite.
 
 ### Fixed
 

@@ -1,8 +1,15 @@
 # Servicrab
 
-A **lightweight, cross-platform process supervisor** for local development stacks, homelabs, and small servers — written in Rust.
+A **lightweight process supervisor** for local development stacks, homelabs, and
+small servers — written in Rust. Supervision is **Linux and macOS only**; the
+Windows build compiles but every runtime entry point reports
+`UnsupportedPlatform`.
 
-Think of it as a minimal, zero-dependency alternative to [overmind](https://github.com/DarthSim/overmind) or [Honcho](https://github.com/nicksylett/honcho), with a roadmap toward daemon-based management and a local API.
+Think of it as a smaller alternative to
+[overmind](https://github.com/DarthSim/overmind) or
+[Honcho](https://github.com/nicksylett/honcho): one binary, a declarative config
+file, a background daemon with a documented socket protocol, and `--json` on
+everything a script would want to read.
 
 [![CI](https://github.com/gaborini/servicrab/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gaborini/servicrab/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/servicrab.svg)](https://crates.io/crates/servicrab)
@@ -10,22 +17,23 @@ Think of it as a minimal, zero-dependency alternative to [overmind](https://gith
 
 ---
 
-## Features (v0.2)
+## Features
 
 - Declare your entire local stack in one `servicrab.toml`, or split it across
   files with `include`
 - Profiles: group the optional services and ask for them with `--profile`
-- `${VAR}` substitution in every config value, strict about unset variables
+- `${VAR}` substitution in the string-valued config fields, strict about unset
+  variables
 - `servicrab init` — scaffold a config in seconds
 - `servicrab check` — validate your config before running anything
 - `servicrab list` — see all services and their restart policies at a glance
-- `servicrab run <service>` — supervise a single service in the foreground with live stdout/stderr, restart policy, and process-group shutdown (Linux/macOS)
+- `servicrab run <service>` — supervise a single service in the foreground with live stdout/stderr, restart policy, and process-group shutdown
 - `servicrab exec <service> -- <cmd>` — run anything in a service's environment and working directory, whether or not the service is up
-- `servicrab up` — run your whole stack in the foreground: dependency-ordered start, interleaved and colour-prefixed output, reverse-order shutdown (Linux/macOS)
+- `servicrab up` — run your whole stack in the foreground: dependency-ordered start, interleaved and colour-prefixed output, reverse-order shutdown
 - Health checks: `command`, `http` and `tcp` probes with readiness gating and automatic restart of unhealthy services
 - `servicrab watch` — restart a service as soon as its sources change, with ignore rules and debouncing
 - Log files: opt-in per-service capture with size-based rotation, plus `servicrab logs [-f]` to read and follow them
-- Background daemon: `servicrab start` / `status` / `stop` / `restart` / `down`, with a documented JSON-over-Unix-socket protocol (Linux/macOS)
+- Background daemon: `servicrab start` / `status` / `stop` / `restart` / `down`, with a documented JSON-over-Unix-socket protocol
 - `servicrab start --wait` — block until every service is ready (health checks included), with an exit code that says whether it worked
 - `servicrab reload` — apply config changes to a running stack without stopping the services you did not touch
 - `servicrab events` — follow a running stack live: logs, state changes, restarts and health verdicts, as text or JSON
@@ -163,7 +171,125 @@ if you want shell semantics.
 
 ---
 
+## Configuration reference
+
+Every field, its type, its default and its accepted range. The ranges are real:
+each one is checked at load time, and `servicrab check` reports a violation with
+the field name and the limit it broke.
+
+Durations use the [humantime](https://docs.rs/humantime) syntax — `500ms`, `10s`,
+`2m`, `1h30m`. Sizes accept `B`, `KB`/`KiB`, `MB`/`MiB`, `GB`/`GiB` and
+`TB`/`TiB`, all as powers of 1024.
+
+### Top level
+
+| Field | Type | Default | Range / notes |
+|---|---|---|---|
+| `version` | integer | — | Required, and must be `1`. A later number is reported as an unsupported schema version rather than as a typo in one of its keys. |
+| `include` | string or list of strings | none | Paths to files holding further `[services.<name>]` tables. Relative to the file that declares them. Not `${VAR}`-substituted. |
+
+### `[project]`
+
+| Field | Type | Default | Range / notes |
+|---|---|---|---|
+| `name` | string | — | Required. 1–64 bytes, ASCII only, must start alphanumeric, then alphanumerics `.` `_` `-`. Not `${VAR}`-substituted: it decides where the daemon keeps its socket. |
+| `env` | table of string → string | empty | Keys must be non-empty and contain no `=` or NUL. Values are substituted. |
+| `env_file` | string or list of strings | none | Dotenv files loaded for every service, in declaration order, before `[project.env]`. Relative to the config file. |
+
+### `[project.logs]`
+
+Absent by default, and its absence means no file capture at all.
+
+| Field | Type | Default | Range / notes |
+|---|---|---|---|
+| `dir` | string | `.servicrab/logs` | Relative paths resolve against the config file. An existing non-directory is a config error. |
+| `max_size` | size string | `10MB` | **1 KiB … 1 TiB** (`1024` … `1099511627776` bytes). |
+| `max_files` | integer | `3` | **0 … 100.** `0` truncates instead of keeping history. |
+
+### `[services.<name>]`
+
+The name follows the project-name rules with a **48-byte** limit rather than 64.
+
+| Field | Type | Default | Range / notes |
+|---|---|---|---|
+| `command` | list of strings | — | Required and non-empty. First element is the executable; no element may contain a NUL. Never run through a shell. |
+| `cwd` | string | the declaring file's directory | Must exist and be a directory. Relative paths resolve against the file that declared the service. |
+| `env` | table of string → string | empty | As `[project.env]`, and wins over it. |
+| `env_file` | string or list of strings | none | Loaded after the project's, before `[services.<name>.env]`. |
+| `depends_on` | list of names, or table of name → `{ condition }` | none | A service uses one form or the other, not both. Neither the names nor the conditions are substituted. |
+| `profiles` | list of strings | empty | Each follows the service-name rules (48 bytes). Duplicates are an error. Not substituted. |
+| `autostart` | boolean | `true` | Not a string, so not `${VAR}`-substitutable. |
+| `restart` | `never` \| `on-failure` \| `always` \| `unless-stopped` | `never` | An enum, so not substitutable. |
+| `restart_delay` | duration | `1s` | **100ms … 1h.** |
+| `restart_max_delay` | duration | `30s` | **100ms … 24h**, and must be ≥ `restart_delay`. |
+| `max_restarts` | integer | `10` | Any `u32`. `0` means unlimited, so there is no range to check. |
+| `stable_after` | duration | `60s` | **1s … 24h.** |
+| `shutdown_signal` | `term` \| `int` \| `quit` \| `hup` | `term` | A string field, so substitutable — but only these four values are accepted. |
+| `shutdown_timeout` | duration | `10s` | **100ms … 1h.** |
+
+`restart_delay`, `restart_max_delay`, `max_restarts` and `stable_after` are
+warned about — not rejected — when `restart = "never"`, because there they have
+nothing to do.
+
+### `[services.<name>.health]`
+
+Absent by default. Exactly one of `command`, `http` or `tcp` must be set.
+
+| Field | Type | Default | Range / notes |
+|---|---|---|---|
+| `command` | list of strings | — | Healthy when it exits `0`. Run with the service's environment and `cwd`. |
+| `http` | string | — | An `http://host[:port][/path]` URL; healthy on any 2xx or 3xx. No TLS, no redirects, no credentials. Port defaults to `80`, path to `/`. |
+| `tcp` | string | — | `host:port`, or `[::1]:port` for an IPv6 literal. Port must not be `0`. |
+| `interval` | duration | `2s` | **100ms … 1h.** |
+| `timeout` | duration | `5s` | **100ms … 1h.** |
+| `retries` | integer | `3` | **≥ 1.** `0` is rejected: a service cannot be declared unhealthy without one failed probe. |
+| `start_period` | duration | `0s` | **0s … 24h.** Failures inside it never count. |
+| `on_unhealthy` | `restart` \| `ignore` | `restart` | With `restart`, the service is stopped and its **restart policy** decides what happens next. |
+
+### `[services.<name>.watch]`
+
+Absent by default.
+
+| Field | Type | Default | Range / notes |
+|---|---|---|---|
+| `paths` | list of strings | — | Required and non-empty; every entry must exist. Relative to the service's `cwd`. |
+| `ignore` | list of strings | empty | Names, `dir/prefix` or `*.ext`. `.git` and `.servicrab` are always added. |
+| `interval` | duration | `1s` | **100ms … 1h.** |
+| `debounce` | duration | `300ms` | **50ms … 1h.** |
+
+### `[services.<name>.logs]`
+
+| Field | Type | Default | Range / notes |
+|---|---|---|---|
+| `enabled` | boolean | `true` | `false` keeps this one service out of the log files. Inert, with a warning, when there is no `[project.logs]`. |
+
+### What `${VAR}` reaches
+
+Substitution applies to **string-valued fields only**, which follows from where
+it happens: values are expanded before the TOML is turned into typed data, so a
+field that is not a string has no string for a `${VAR}` to live in.
+
+```toml
+shutdown_timeout = "${TIMEOUT:-10s}"   # a string field — expanded
+max_restarts     = "${MAX}"            # rejected: expected u32, got a string
+```
+
+The fields that cannot take a variable are therefore `version`, `autostart`,
+`restart`, `max_restarts`, `logs.max_files`, `logs.enabled` and `health.retries`
+(all non-strings), plus `include`, the project `name`, the service names, the
+`profiles` and the `depends_on` names and conditions — those last are strings,
+but are deliberately left literal so that the shape of a stack cannot depend on
+who started it.
+
+An unknown field anywhere is a hard error, not a warning: a misspelled `comand`
+that loaded quietly would be far worse than one that refuses.
+
+---
+
 ## Command reference
+
+`--config` may be spelled `-c`, and every command accepts the two global colour
+flags (`--color=auto|always|never`, `--no-color`); neither is repeated below.
 
 | Command | Description |
 |---|---|
@@ -172,20 +298,26 @@ if you want shell semantics.
 | `servicrab list [--config PATH] [--json]` | List all services with their restart policies |
 | `servicrab run <SERVICE> [--config PATH] [--no-restart]` | Supervise one service in the foreground |
 | `servicrab exec <SERVICE> [--config PATH] -- <COMMAND>...` | Run a command in a service's environment and working directory |
-| `servicrab up [SERVICE...] [--config PATH] [--no-restart] [--no-prefix] [--timestamps] [--abort-on-failure] [--json]` | Supervise a whole stack in the foreground |
-| `servicrab watch [SERVICE...] [--config PATH] [--no-restart] [--no-prefix] [--timestamps] [--abort-on-failure] [--json]` | Like `up`, and restart services when their watched files change |
+| `servicrab up [SERVICE...] [--config PATH] [--profile NAME]... [--no-restart] [--no-prefix] [--timestamps] [--abort-on-failure] [--json]` | Supervise a whole stack in the foreground |
+| `servicrab watch [SERVICE...] [--config PATH] [--profile NAME]... [--no-restart] [--no-prefix] [--timestamps] [--abort-on-failure] [--json]` | Like `up`, and restart services when their watched files change |
 | `servicrab logs [SERVICE...] [--config PATH] [-f] [-n N] [--no-prefix]` | Show (and follow) the captured log files |
-| `servicrab start [SERVICE...] [--config PATH] [--no-restart] [--wait] [--timeout DUR]` | Start the stack in the background, optionally waiting until it is ready |
+| `servicrab start [SERVICE...] [--config PATH] [--profile NAME]... [--no-restart] [--wait] [--timeout DUR]` | Start the stack in the background, optionally waiting until it is ready |
 | `servicrab status [--config PATH] [--json]` | Show what the background daemon is doing |
 | `servicrab stop <SERVICE...> [--config PATH]` | Stop individual services in the running daemon |
 | `servicrab restart <SERVICE...> [--config PATH]` | Restart individual services |
 | `servicrab reload [--config PATH]` | Re-read the config and apply the difference to the running daemon |
 | `servicrab events [SERVICE...] [--config PATH] [--json] [--no-prefix] [--timestamps] [--no-logs]` | Follow the daemon's live event stream |
 | `servicrab down [--config PATH]` | Stop the daemon and every service it supervises |
-| `servicrab daemon [--config PATH] [--no-restart]` | Run the daemon in the foreground (for systemd/launchd/containers) |
-| `servicrab generate <systemd\|launchd> [--config PATH] [--scope system\|user] [-o PATH] [--user NAME]` | Generate an init-system unit that runs the stack |
+| `servicrab daemon [--config PATH] [--profile NAME]... [--no-restart]` | Run the daemon in the foreground (for systemd/launchd/containers) |
+| `servicrab generate <systemd\|launchd> [--config PATH] [--scope system\|user] [-o PATH] [--user NAME] [--profile NAME]...` | Generate an init-system unit that runs the stack |
 | `servicrab completions <SHELL>` | Print a completion script for bash, zsh, fish, PowerShell or elvish |
 | `servicrab man [-o DIR]` | Print the man page in roff, or write one page per command into `DIR` |
+
+`--profile` is repeatable, and the five commands that take it are `up`, `watch`,
+`start`, `daemon` and `generate` — the ones that decide which services make up a
+stack. On `up`, `watch` and `start` it cannot be combined with naming services,
+because that would be two answers to one question; `daemon` and `generate` take
+no service names, so there is nothing to conflict with.
 
 If `--config` is omitted, Servicrab discovers `servicrab.toml` by walking up
 from the current directory.
@@ -356,11 +488,12 @@ servicrab up --abort-on-failure    # tear the stack down when a service fails
 Output is interleaved and prefixed with the service name, each service getting
 its own colour:
 
-```
+```console
+$ servicrab up
 servicrab up acme-stack → redis, api
-redis | ▶ started (pgid 41234)
+redis | ▶ started (pgid 30292)
+api   | ▶ started (pgid 30293)
 redis | Ready to accept connections
-api   | ▶ started (pgid 41235)
 api   | listening on 0.0.0.0:3000
 ```
 
@@ -416,13 +549,12 @@ backend, and the run is reported as failed.
 | SIGTERM | `143` |
 | A service failed or was skipped | `1` |
 
-### Platform support and current limitations
+### Platform support
 
-`servicrab up` supports **Linux and macOS**. Current limitations:
-
-- `up` runs in the foreground and stops with your shell — use `servicrab start` for a detached stack;
-- no `--json` event stream yet;
-- `servicrab down` does not exist yet (Ctrl+C is the way to stop a stack).
+`servicrab up` supports **Linux and macOS**; on Windows it reports an
+unsupported-platform error. `up` runs in the foreground and stops with your
+shell — use [`servicrab start`](#running-in-the-background) for a detached
+stack, and `servicrab down` to stop one.
 
 ---
 
@@ -545,18 +677,50 @@ what you see in the terminal — the files are a copy, not a redirect.
 
 Read them back with `logs`:
 
+```console
+$ servicrab logs
+db     | starting postgres
+db     | db up
+worker | worker ready
+worker | picked up job 41
+$ servicrab logs -n 1
+db     | db up
+worker | picked up job 41
+```
+
+A single named service is printed without the prefix, since there is nothing to
+tell apart:
+
+```console
+$ servicrab logs db
+starting postgres
+db up
+```
+
 ```bash
 servicrab logs                 # last 50 lines of every service, prefixed
 servicrab logs api -n 200      # last 200 lines of one service, unprefixed
 servicrab logs -f              # follow new output (Ctrl+C to stop)
 ```
 
-`logs -f` notices rotation and keeps following the fresh file. Without a
-`[project.logs]` table the command tells you how to enable capture rather than
-printing nothing.
+`logs -f` notices rotation and keeps following the fresh file, prints each line
+once and whole — a file that ends mid-line has the fragment held back until its
+newline arrives — and tolerates output that is not UTF-8, replacing the
+undecodable bytes rather than failing the command. Without `--follow` there is no
+next pass, so a trailing fragment is shown.
+
+Three outcomes are worth knowing, because two of them are failures and one is
+not:
+
+| Situation | Exit code |
+|---|---|
+| The log directory is empty | `0` — a stack that has not run yet is a state of the world, not a failed command |
+| The config has no `[project.logs]` table | `1`, with a note saying how to enable capture |
+| A **named** service has `[logs] enabled = false` | `1` — there is no file, so the command asked for something that cannot exist |
 
 Sizes accept `B`, `KB`/`KiB`, `MB`/`MiB`, `GB`/`GiB` and `TB`/`TiB` suffixes;
-all of them are powers of 1024.
+all of them are powers of 1024. The accepted range is
+[in the configuration reference](#projectlogs).
 
 ---
 
@@ -584,10 +748,13 @@ servicrab start          # so does the background daemon
 ```
 
 ```console
-api | ▶ started (pgid 40311)
+$ servicrab watch
+servicrab watch demo → api
+watching for changes: api
+api | ▶ started (pgid 30315)
 api | ↻ server.js changed; restarting
 api | ◼ stopping: stopped on request
-api | ▶ started (pgid 40388)
+api | ▶ started (pgid 30327)
 ```
 
 `.git` and `.servicrab` are always ignored. The watcher polls rather than
@@ -752,9 +919,9 @@ name is not: which files make up a config should not depend on who ran it.
 
 ## Variables in the config
 
-Every value in `servicrab.toml` can refer to the environment of whoever runs
-`servicrab`, so one committed config can serve checkouts that disagree about
-where things live:
+Every **string-valued** field in `servicrab.toml` can refer to the environment of
+whoever runs `servicrab`, so one committed config can serve checkouts that
+disagree about where things live:
 
 ```toml
 [services.api]
@@ -774,22 +941,27 @@ DATABASE_URL = "postgres://localhost:${PG_PORT:-5432}/app"
 
 An unset variable stops the load and names itself:
 
-```
-error: ✗ servicrab.toml has 1 error(s):
-  • service "api": cwd refers to ${WORKSPACE}, which is not set;
-    use ${WORKSPACE:-default} if it may be absent
+```console
+$ servicrab check
+error: /srv/demo/servicrab.toml has 1 error(s)
+  • service "api": cwd refers to ${WORKSPACE}, which is not set; use ${WORKSPACE:-default} if it may be absent
 ```
 
 That is the point of the feature: a `cwd` that quietly became `/`, or a
 `command` that quietly lost an argument, is harder to diagnose than a config
 that refuses to start.
 
-Three details are worth knowing:
+Four details are worth knowing:
 
 - **The braces are required.** A bare `$` is never special, so the shell
   snippets that fill a process manager's config keep working —
   `command = ["sh", "-c", "echo $HOME; echo $$"]` reaches the shell verbatim.
   This is the one place the syntax narrows Docker Compose's.
+- **Only string fields are reached.** Expansion runs on the text of a value
+  before TOML turns it into typed data, so a field that is not a string has no
+  string for a `${VAR}` to live in: `max_restarts = "${MAX}"` is rejected as a
+  string where a `u32` belongs. See
+  [What `${VAR}` reaches](#what-var-reaches) for the full list.
 - **Values come from the environment only**, not from `[project.env]`,
   `[services.<name>.env]` or an `env_file`. Those describe what the *service*
   will see; substitution happens earlier, while the config is still being read.
@@ -858,13 +1030,25 @@ servicrab restart api db    # stop and start, one service at a time
 A service stopped this way stays stopped — the restart policy does not bring
 it back, because the stop was deliberate.
 
-```
+```console
+$ servicrab status
 SERVICE  STATE          PID    UPTIME  RESTARTS  HEALTH
-db       running      41231     4m30s         0  healthy
-api      running      41244     4m12s         1  -
-worker   backoff          -         -         3  -
-  worker: stopped (exit code 1), last status: exit code 1
+api      stopped          -         -         0  -
+db       running      83810        4s         0  -
+worker   failed           -         -         1  -
+  api: stopped (stopped on request), last status: exited with code 0
+  worker: service "worker": giving up after 1 restart attempt(s)
 ```
+
+The rows are the table; the indented lines below it are the last noteworthy
+thing that happened to a service, and only services that have one get a line.
+They are written for a person, so treat them as prose and not as a format to
+parse — `status --json` carries the same field as `message`.
+
+The `PID` column holds the service's **process group** id — every service runs
+in its own group — so `kill -TERM -<that number>` reaches the service and its
+descendants together. `status --json` calls the same number `pgid`, with `pid` as
+a deprecated alias.
 
 ### Services you stopped by hand
 
@@ -953,13 +1137,69 @@ The daemon keeps its runtime state next to the config file, in
 and `stopped` (the services you stopped by hand). Add `.servicrab/` to your
 `.gitignore`.
 
-Each project gets its own daemon, so several stacks can run side by side.
-`start` refuses to launch a second daemon for the same config, and both the
-socket and the pidfile are removed when the daemon exits, however it exits.
+**The socket is the one file that can move out of the project directory.** A
+Unix socket path has a hard length limit — 107 bytes on Linux, 103 on macOS —
+and a deeply nested project can exceed it. When that happens the socket moves to
+the first directory that is genuinely private to this user (`$XDG_RUNTIME_DIR`,
+then the temp directory), under a name derived from the project directory, and
+`servicrab start` prints the path it chose. Plain `/tmp` is refused: a
+predictable name in a shared directory is exactly what the mode-`0600` socket is
+protecting against. With nowhere private to move to, the long path stays and
+`bind` fails, saying which candidates were rejected and why.
+
+Each project gets its own daemon, so several stacks can run side by side, and
+`start` refuses to launch a second daemon for the same config.
 
 `servicrab daemon` runs the same thing in the foreground, which is what you
 want under systemd, launchd, or in a container: it supervises the stack, serves
 the socket, and stops the whole stack cleanly on `SIGTERM`.
+
+### What survives a daemon that is killed, and what does not
+
+On the graceful path — `servicrab down`, `SIGTERM`, `SIGINT` — the daemon stops
+every service in reverse dependency order, reaps them, and unlinks its socket
+and pidfile. That is the path worth relying on, and it is the only one.
+
+**After `SIGKILL`, an OOM kill or a panic, the daemon's children are not
+reconciled.** This is a deliberate 1.0 decision rather than an oversight, and
+the consequences are worth stating plainly:
+
+- **The services keep running, reparented to init.** Nothing stops them and
+  nothing is supervising them any more. Their restart policies, health checks
+  and log capture are all gone with the daemon.
+- **The socket and the pidfile are left behind.** They are unlinked by the
+  daemon's own shutdown code, which by definition did not run.
+- **A later `servicrab start` succeeds and runs a second copy.** The stale
+  pidfile is not an obstacle: the `flock` on it is released by the kernel when
+  the process dies, so the next daemon takes the lock, removes the stale socket
+  and starts the stack again — beside the orphans, not instead of them. Two
+  copies of a service that binds a port will not both come up; two copies of a
+  worker will both consume from the queue.
+
+`servicrab status` and `servicrab down` both exit `3` in this state, because
+there is genuinely no daemon to talk to. Neither one will find the orphans:
+`down` has nothing to send a request to.
+
+So the operator's job after a killed daemon is the part servicrab does not do:
+
+```bash
+servicrab status                     # exits 3 — confirms the daemon is gone
+ps -eo pid,pgid,command | grep <something from your commands>
+kill -TERM -<PGID>                   # the leading `-` signals the whole group
+servicrab start                      # only once the orphans are gone
+```
+
+Every service runs in its own process group, so signalling the group id — the
+`pgid` in `status --json` and in the `started` event, which is the number the
+group was created with — reaches the service and its descendants together.
+
+This is not hypothetical: during development two test daemons escaped a killed
+harness and ran for nineteen hours before anyone noticed, which is the same
+class of orphan. If you need supervision that survives its own supervisor being
+killed, run `servicrab daemon` under something whose job that is — systemd or
+launchd, with `Restart=` set — and see
+[Running under systemd or launchd](#running-under-systemd-or-launchd). Servicrab
+supervises your services; it does not supervise itself.
 
 ### The socket protocol
 
@@ -991,7 +1231,7 @@ Everything a program should act on is a field of its own: `changes` on a
 reload's `ok`, and on an `error`:
 
 ```json
-{"type":"error","code":"validation_failed","message":"servicrab.toml has 2 error(s); the stack was left untouched","errors":["services.api: command must not be empty","services.web: unknown dependency \"nowhere\""]}
+{"type":"error","code":"validation_failed","message":"/srv/demo/servicrab.toml has 2 error(s); the stack was left untouched","errors":["service \"api\": command must not be empty","service \"web\": depends on unknown service \"nowhere\""]}
 ```
 
 | `code` | Meaning |
@@ -1114,12 +1354,37 @@ There are two shapes, and which one a command uses follows from what it is:
   with, then writes one event per line. The version is not repeated on every
   line: these streams can run for days.
 
+**An absent value is an absent key, not a null.** A service that is not running
+has no `pgid`, `pid` or `uptime_secs` in `status --json`, and one with nothing
+noteworthy to report has no `message` — the keys are simply not there:
+
+```console
+$ servicrab status --json
+{
+  "schema_version": 1,
+  "running": true,
+  "services": [
+    {
+      "name": "worker",
+      "state": "failed",
+      "restarts": 1,
+      "health": "none",
+      "message": "service \"worker\": giving up after 1 restart attempt(s)"
+    }
+  ]
+}
+```
+
+So read these fields as optional. `jq -r '.services[].pgid'` prints `null` for a
+stopped service, which is usually what you want; `.pgid | tonumber` fails, which
+is usually not.
+
 Errors are JSON too, on **stderr**, so stdout carries nothing but the document
 that was asked for:
 
 ```console
 $ servicrab check --json
-{"schema_version":1,"error":{"code":"validation_failed","message":"servicrab.toml has 2 error(s)","errors":["services.api: command must not be empty","services.web: unknown dependency \"nowhere\""]}}
+{"schema_version":1,"error":{"code":"validation_failed","message":"/srv/demo/servicrab.toml has 2 error(s)","errors":["service \"api\": command must not be empty","service \"web\": depends on unknown service \"nowhere\""]}}
 ```
 
 `code` is the same stable set the [socket protocol](#the-socket-protocol) uses.
@@ -1127,32 +1392,55 @@ $ servicrab check --json
 
 ### Exit codes for every command
 
-Every command follows the same rules:
+This is the same set the man page's `EXIT STATUS` section documents, and it is
+frozen for 1.x.
 
-| Situation | Exit code |
+| Exit code | Meaning |
 |---|---|
-| It worked | `0` |
-| It failed | `1` |
-| No daemon is running for this project | `3` |
-| `up` / `watch` was interrupted (`SIGHUP` / Ctrl+C / `SIGTERM`) | `129` / `130` / `143` |
-| `exec` or `run` ran something | that process's own status (`128+N` for a signal, `126`/`127` for `exec`) |
+| `0` | Success. For `run` and `up` that means the services were shut down as asked, not that they never failed. `down` uses it when a daemon was there and stopped. |
+| `1` | The command failed: an invalid configuration, an unknown service, a service that exhausted its restart budget, a per-service command the daemon refused, or a `start --wait` that timed out. |
+| `3` | No daemon is running for this project. |
+| `126`, `127` | `exec` could not run the command: found but not executable (`126`), or not found (`127`), as a shell would report it. |
+| `129`, `130`, `143` | `up` and `watch` were cut short by a signal and shut the stack down cleanly: `SIGHUP` (129), Ctrl+C (130), `SIGTERM` (143). A clean shutdown, not a failure. |
+| anything else | `exec` and `run` pass through the status of the process they ran: its own exit code, or `128+N` when a signal *N* killed it. |
 
-`3` is the one worth knowing about. It means "there was nothing to talk to",
-which is a thing scripts routinely want to handle rather than report:
+A few `1`s are worth spelling out, because "it failed" is not obvious for a
+command whose job is to report:
+
+- `check` exits `1` on a config that does not load or does not validate. The
+  report is the output; the code is what a CI step reads.
+- `logs` exits `1` when the config has no `[project.logs]` table, and when a
+  named service has `[logs] enabled = false` — in both cases there is no file to
+  read, which is a mistake in the command rather than a state of the stack. An
+  **empty** log directory is a state of the stack, so that exits `0`.
+
+#### `3`, and the one breaking change in it
+
+`3` means "there was nothing to talk to", which is a thing scripts routinely
+want to handle rather than report. It comes from `status`, `down`, `reload`,
+`stop`, `restart`, `start SERVICE` and `events`.
+
+**`down` used to exit `0` when no daemon was running, and now exits `3`.** That
+is deliberate, and it is a breaking change for anything chaining off it:
 
 ```bash
-servicrab down
-case $? in
+servicrab down && echo "ok"     # prints nothing on a stopped stack, as of 1.0
+```
+
+`down` still never *fails* because nothing was running — running it twice is
+safe, which is the whole point of it — the code just distinguishes the two
+outcomes, and its note goes to stderr with no `error: ` prefix for the same
+reason. If you want the old behaviour, say so:
+
+```bash
+servicrab down; case $? in
   0) echo "stopped it" ;;
   3) echo "nothing was running" ;;  # not a failure
   *) echo "something went wrong"; exit 1 ;;
 esac
 ```
 
-`down` still never *fails* because nothing was running — running it twice is
-safe, which is the whole point of it — the code just distinguishes the two
-outcomes. The same `3` comes from `status`, `stop`, `restart`,
-`start SERVICE`, `reload` and `events`.
+### One error format
 
 Errors always go to **stderr**, prefixed with `error: `, with the individual
 problems as bullets below:
@@ -1160,8 +1448,31 @@ problems as bullets below:
 ```console
 $ servicrab check
 error: /srv/demo/servicrab.toml has 2 error(s)
-  • services.api: command must not be empty
-  • services.web: unknown dependency "nowhere"
+  • service "api": command must not be empty
+  • service "web": depends on unknown service "nowhere"
+```
+
+Under `--json` the same error is a JSON object, still on stderr, so a caller
+parsing stdout sees only the document it asked for.
+
+There is exactly one exception to the `error: ` prefix, and it is deliberate:
+
+```console
+$ servicrab down
+no daemon is running for demo
+$ echo $?
+3
+```
+
+`down` asks for a stack to be stopped, and a stack that is already stopped is a
+state of the world rather than a failure, so the note is a plain sentence. It
+still goes to stderr, and the exit code is still `3`, because a script needs to
+be able to tell the two situations apart. `status` moved to stderr in the same
+release but kept the prefix and the suggestion:
+
+```console
+$ servicrab status
+error: no daemon is running for demo — start one with `servicrab start`
 ```
 
 ### Config hot-reload
@@ -1171,7 +1482,7 @@ apply only what changed:
 
 ```console
 $ servicrab reload
-✓ reloaded demo: 1 added, 1 changed, 1 removed
+✓ reloaded demo: 1 added, 1 changed, 0 removed
   from /srv/demo/servicrab.toml
 ```
 
@@ -1192,8 +1503,8 @@ untouched, so a typo can never take a stack down:
 
 ```console
 $ servicrab reload
-✗ servicrab.toml has 1 error(s); the stack was left untouched:
-  • service "api": depends on unknown service "ghost"
+error: /srv/demo/servicrab.toml has 1 error(s)
+  • service "broken": depends on unknown service "ghost"
 ```
 
 Project-level settings — `[project.logs]`, the log directory and rotation
@@ -1249,9 +1560,12 @@ servicrab/
 │   ├── servicrab-cli/      # Binary crate — clap CLI + Tokio async runtime
 │   ├── servicrab-core/     # Library — config models, validation, lifecycle + process runtime
 │   └── servicrab-protocol/ # Library — daemon request/response wire types
-├── Cargo.toml              # Workspace manifest
-└── servicrab.toml          # (generated by servicrab init)
+└── Cargo.toml              # Workspace manifest
 ```
+
+There is no `servicrab.toml` in this repository: `servicrab init` writes one
+into *your* project, and a personal config here would be committed by accident,
+so it is in `.gitignore`.
 
 ---
 
@@ -1259,7 +1573,7 @@ servicrab/
 
 ```sh
 # Format
-cargo fmt --all
+cargo fmt --all -- --check
 
 # Lint (warnings are errors in CI)
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
@@ -1267,78 +1581,141 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 # Test
 cargo test --workspace --all-features --locked
 
+# Documentation (a broken intra-doc link is an error in CI)
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
+
+# Packaging, as crates.io will see it
+cargo package --workspace --locked
+
 # Run a specific test
 cargo test -p servicrab-core config::tests
 
 # Check against the minimum supported Rust version
 rustup toolchain install 1.85
 cargo +1.85 check --workspace --all-features --all-targets --locked
+```
 
-# Audit the dependency tree (licences, advisories, sources)
+Those are the six checks the `CI` workflow runs on every pull request:
+`fmt + clippy + test` on Linux **and** macOS (one job, a two-way matrix), the
+MSRV check, the Windows stub build, the crates.io packaging dry run, and the
+rustdoc build. `--locked` is on every one of them, because without it cargo may
+resolve a newer transitive dependency and CI stops testing what `Cargo.lock`
+ships.
+
+The dependency audit is **not** one of them:
+
+```sh
 cargo deny check
 ```
 
-The commands above are exactly what CI runs, so a clean local sweep means a
-green pipeline.
+It lives in its own `Audit` workflow, which runs on a schedule, on pushes to
+`main`, and on release tags — and on a pull request only when `Cargo.toml`,
+`Cargo.lock`, `deny.toml` or the workflow itself changed. Advisories are
+published on the RustSec calendar rather than ours, so a new one should not fail
+an unrelated documentation change, and it should be found in a week when nobody
+opens a pull request at all.
+
+---
+
+## What 1.0 promises
+
+Three surfaces are stable in 1.x. Additions are allowed; breaking any of these
+means 2.0.
+
+**1. The CLI surface.** The command and flag inventory, what each one does, and
+the exit codes. A 1.x release may add a command, add a flag, or add a value to an
+existing flag; it may not remove one, rename one, or change what one means.
+
+**2. The socket protocol.** The request and response types, their field names,
+and the `code` set on an error. A 1.x release may add a request type, a response
+field, or an event kind — which is safe precisely because every enum on the wire
+has an `unknown` fallback, so an older client skips what it cannot name instead
+of failing the line. See
+[Reading a stream from a newer servicrab](#reading-a-stream-from-a-newer-servicrab).
+
+**3. The `--json` output.** The shapes described under
+[Machine-readable output](#machine-readable-output), and the `schema_version`
+that identifies them. An optional field may be added without a bump; a change an
+existing reader would misread bumps the version.
+
+### What is not stable
+
+- **`servicrab-core` and `servicrab-protocol` carry no semver guarantee.** They
+  are published so that `servicrab` can be, and their version numbers move with
+  the workspace, but they are internal crates: their Rust API may change in any
+  release, including a patch. If you depend on either directly, pin an exact
+  version. The stable interface for a third-party program is the socket protocol
+  and the `--json` output, both of which are contracts on the wire rather than in
+  Rust.
+- **The `message` field of a socket response, and the prose of any human-readable
+  output.** Both are written for whoever is reading the terminal and may be
+  reworded in any release. Everything a program should act on is a field of its
+  own, or an exit code.
+- **The exact bytes of `--help`.** The inventory and the wording of each flag's
+  description are frozen; the *whitespace and column alignment* are not. `clap`
+  aligns the description column to the longest flag on a page, so adding a flag
+  necessarily shifts every other line on that page — and adding a flag is exactly
+  what 1.x is allowed to do. A byte-exact snapshot would forbid what semver
+  permits.
+
+  That distinction is not a matter of interpretation:
+  `crates/servicrab-cli/tests/help.rs` enforces it. It records every page's flag
+  list and every description with runs of whitespace collapsed to one space, so a
+  reword or a dropped flag fails the build while a realignment does not. That
+  file is the specification of this paragraph — if the two ever disagree, the test
+  is right.
+
+### The line to script against
+
+```bash
+servicrab status --json | jq -e '.schema_version == 1' >/dev/null || exit 1
+```
+
+Read `schema_version`, refuse what you were not written for, and treat an
+unfamiliar `type`, `kind` or `code` as something to skip rather than an error.
+That is the whole forward-compatibility contract, and it is enough.
 
 ---
 
 ## Roadmap
 
-### Phase 1 (current) — Minimal CLI ✅
-- [x] Cargo workspace setup
-- [x] `servicrab.toml` config format
-- [x] `init` / `check` / `list` commands
-- [x] Restart policy types
-- [x] Dependency declarations and deterministic start order
-- [x] CI on Linux + macOS
+### 1.0 — what is in it
 
-### Phase 1.5 (current) — Foreground runner ✅
-- [x] `servicrab run <SERVICE>` on Linux + macOS
-- [x] Per-service process groups and group-wide shutdown
-- [x] Restart policy enforcement with exponential backoff
-- [x] Graceful shutdown with `SIGKILL` escalation
+Everything documented above:
 
-### Phase 1.6 (current) — Stack runner ✅
-- [x] `servicrab up` — concurrent supervision of the whole stack
-- [x] Dependency ordering on start, reverse order on shutdown
-- [x] Interleaved, prefixed, colourised output
+- **Config**: one `servicrab.toml` or several via `include`, `${VAR}`
+  substitution in string fields, profiles, `env_file` layering, dependency
+  conditions, health checks, log capture with rotation, file watching.
+- **Foreground**: `run` for one service, `up` for a stack, `watch` for a stack
+  that restarts on change, `exec` for a one-off in a service's environment.
+- **Background**: a daemon per project over a Unix socket, with `start`,
+  `status`, `stop`, `restart`, `reload`, `events`, `down` and `daemon`, plus
+  `start --wait` for CI.
+- **Machine-readable**: `--json` on `check`, `list`, `status`, `up`, `watch` and
+  `events`, all carrying `schema_version`; one error format, on stderr, JSON
+  under `--json`.
+- **Integration**: `generate systemd|launchd`, shell completions for five
+  shells, man pages, prebuilt Linux and macOS binaries for `x86_64` and
+  `aarch64`, published on crates.io.
+- **Forward compatibility**: an `unknown` fallback on every wire enum, an
+  optional `version` on `ping`/`pong`, and a refusal that names the request it
+  did not recognise.
 
-### Phase 1.7 (current) — Health checks ✅
-- [x] `command`, `http` and `tcp` probes
-- [x] Readiness gating: dependents wait for a healthy dependency
-- [x] Unhealthy services are stopped and restarted by policy
+### Deferred to 1.1
 
-### Phase 1.8 (current) — Log files ✅
-- [x] Opt-in capture to `<dir>/<service>.log` with size-based rotation
-- [x] `servicrab logs [SERVICE...] [-f] [-n N]`
-- [x] Per-service opt-out via `[services.<name>.logs] enabled = false`
+- **An event envelope.** Every event would carry `timestamp`, `seq` and
+  `schema_version` of its own, so a consumer could order, deduplicate and
+  version-check a stream without inferring any of it. Deferred on purpose:
+  adding fields to an existing shape is an additive change semver permits, so
+  1.1 can do it without a break, and shipping it in 1.0 would have meant
+  freezing a design that has not yet met a second consumer.
+- **`status` from a killed daemon.** Reconciling orphaned children after a
+  `SIGKILL` needs state on disk that survives the process, which is a design
+  question rather than a patch — see
+  [What survives a daemon that is killed](#what-survives-a-daemon-that-is-killed-and-what-does-not)
+  for what an operator does today.
 
-### Phase 2 — Background daemon ✅
-- [x] Detached daemon per project with a Unix-socket JSON API
-- [x] `servicrab start` / `status` / `down` / `daemon`
-- [x] Status snapshot: state, pid, uptime, restarts, health
-- [x] Per-service `start` / `stop` / `restart` through the daemon
-- [x] Live event streaming over the socket
-
-### Phase 3 — Stack management ✅
-- [x] `.env` file support per project and per service
-- [x] Shell completions (`servicrab completions <SHELL>`)
-- [x] `servicrab watch` — restart on file changes, with ignore rules and debouncing
-- [x] Config hot-reload (`servicrab reload`)
-
-### Phase 4 — Platform integration ✅
-- [x] systemd unit generation (`servicrab generate systemd`)
-- [x] launchd plist generation (`servicrab generate launchd`)
-- [x] Live event streaming over the socket (`servicrab events`, `subscribe`)
-- [x] `--json` event stream for `up` and `watch`
-
-### Phase 5 — Release engineering ✅
-- [x] Publishable crate metadata and a `CHANGELOG.md`
-- [x] Tagged releases with prebuilt Linux and macOS binaries (x86_64 + aarch64)
-- [x] Man pages (`servicrab man`), shipped in the release tarballs
-- [x] Dependency audit (`cargo-deny`) and automated dependency updates
-- [x] Published to crates.io
+Windows supervision remains a non-goal.
 
 ---
 

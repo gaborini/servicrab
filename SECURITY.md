@@ -26,13 +26,19 @@ credits you unless you prefer otherwise.
 
 ## Supported versions
 
-Servicrab is pre-1.0. Fixes go onto `main` and into the next release; there are
-no long-lived maintenance branches. Only the latest release is supported.
+Only the latest release is supported. Fixes go onto `main` and into the next
+release; there are no long-lived maintenance branches, and there is no backport
+to an older line.
 
 | Version | Supported |
 | ------- | --------- |
-| 0.1.x   | yes       |
-| < 0.1   | no        |
+| 1.0.x   | yes       |
+| 0.x     | no        |
+
+From 1.0 onwards the CLI surface, the socket protocol and the JSON output follow
+semver, so upgrading to the current release to pick up a fix should not require a
+change to your configuration or your scripts. See
+[what 1.0 promises](README.md#what-10-promises).
 
 ## What is in scope
 
