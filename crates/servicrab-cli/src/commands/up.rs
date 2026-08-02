@@ -21,6 +21,7 @@ use servicrab_core::{
     SignalWatcher, Stream,
 };
 
+use crate::output::{self, CliError};
 use crate::style::{self, BOLD, DIM, RESET, SERVICE_COLORS};
 
 /// Exit code used when a run is cut short by Ctrl+C (`128 + SIGINT`).
@@ -70,36 +71,38 @@ pub fn run(
     selection: Selection<'_>,
     config: Option<&Path>,
     options: UpOptions,
-) -> Result<i32, String> {
-    let path = resolve_config_path(config).map_err(|e| format!("could not find config: {e}"))?;
+) -> Result<i32, CliError> {
+    let path = resolve_config_path(config)
+        .map_err(|e| CliError::from(format!("could not find config: {e}")).in_json(options.json))?;
 
     let (cfg, warnings) = load(&path).map_err(|errors| {
-        let msgs: Vec<String> = errors.iter().map(|e| format!("  • {e}")).collect();
-        format!(
-            "✗ {} has {} error(s):\n{}",
-            path.display(),
-            errors.len(),
-            msgs.join("\n")
+        CliError::new(
+            servicrab_protocol::ErrorCode::ValidationFailed,
+            format!("{} has {} error(s)", path.display(), errors.len()),
         )
+        .with_errors(errors.iter().map(ToString::to_string).collect())
+        .in_json(options.json)
     })?;
 
     for warning in &warnings {
         eprintln!("⚠  {warning}");
     }
 
-    let plan = plan_stack(&cfg, selection).map_err(|e| e.to_string())?;
+    let plan = plan_stack(&cfg, selection)
+        .map_err(|e| CliError::from(e.to_string()).in_json(options.json))?;
 
     let watched = watched_services(&cfg, &plan);
     if options.require_watch && watched.is_empty() {
         let names: Vec<&str> = plan.iter().map(|n| n.as_str()).collect();
-        return Err(format!(
+        return Err(CliError::from(format!(
             "nothing to watch: none of {} declares a [watch] block.\n\
              Add one, for example:\n\n\
              \x20 [services.{}.watch]\n\
              \x20 paths = [\"src\"]",
             names.join(", "),
             names.first().copied().unwrap_or("api"),
-        ));
+        ))
+        .in_json(options.json));
     }
 
     let printer = Arc::new(Printer::new(&plan, options));
@@ -117,7 +120,7 @@ pub fn run(
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|e| format!("failed to start the async runtime: {e}"))?;
+        .map_err(|e| CliError::from(format!("failed to start the async runtime: {e}")))?;
 
     let outcome = runtime.block_on({
         let printer = Arc::clone(&printer);
@@ -157,7 +160,7 @@ pub fn run(
         }
     });
 
-    let (outcome, drawn) = outcome.map_err(|e| e.to_string())?;
+    let (outcome, drawn) = outcome.map_err(|e| CliError::from(e.to_string()))?;
     if drawn {
         printer.summary(&outcome);
     }
@@ -249,6 +252,10 @@ impl Printer {
 
     fn banner(&self, config: &Config, plan: &[ServiceName]) {
         if self.options.json {
+            // The stream's own opening line, in place of the human banner:
+            // `events --json` and a raw `subscribe` both start this way, so a
+            // reader can treat all three identically.
+            output::print_stream_header();
             return;
         }
         let names: Vec<&str> = plan.iter().map(|n| n.as_str()).collect();

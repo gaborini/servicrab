@@ -202,8 +202,10 @@ restart = "always"
     assert!(!dir.path().join(".servicrab/daemon.sock").exists());
     assert!(!dir.path().join(".servicrab/daemon.pid").exists());
 
+    // Its own exit code, so a script can tell "nothing is running" from a real
+    // failure without reading the message.
     let (code, stdout, stderr) = cli(&["status"], &cfg);
-    assert_eq!(code, 1);
+    assert_eq!(code, 3, "{stderr}");
     assert!(stderr.contains("no daemon is running"), "{stderr}");
     // Diagnostics, so `servicrab status > snapshot` records no snapshot at all
     // rather than a sentence about there not being one.
@@ -964,19 +966,23 @@ command = ["{}"]
         ),
     );
 
+    // Its own exit code, so a script can tell "nothing is running" from a real
+    // failure without reading the message.
     let (code, stdout, stderr) = cli(&["status"], &cfg);
-    assert_eq!(code, 1);
+    assert_eq!(code, 3, "{stderr}");
     assert!(stderr.contains("servicrab start"), "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
 
     // `--json` is output, not diagnostics, so it stays on stdout.
     let (code, stdout, _) = cli(&["status", "--json"], &cfg);
-    assert_eq!(code, 1);
-    assert!(stdout.contains("\"running\":false"), "{stdout}");
+    assert_eq!(code, 3);
+    assert!(stdout.contains("\"running\": false"), "{stdout}");
 
-    // Stopping something that is not running is not a failure.
+    // Stopping something that is not running is still not a failure — it just
+    // says there was nothing to do, and says it as a diagnostic because nothing
+    // was stopped for stdout to report.
     let (code, stdout, stderr) = cli(&["down"], &cfg);
-    assert_eq!(code, 0);
+    assert_eq!(code, 3, "{stderr}");
     assert!(stderr.contains("no daemon is running"), "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
 }
@@ -1172,7 +1178,7 @@ fn per_service_commands_need_a_daemon() {
     let cfg = one_service(dir.path());
 
     let (code, _, stderr) = cli(&["stop", "api"], &cfg);
-    assert_eq!(code, 1);
+    assert_eq!(code, 3);
     assert!(stderr.contains("no daemon is running"), "{stderr}");
 }
 

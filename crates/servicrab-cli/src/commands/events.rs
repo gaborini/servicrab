@@ -29,6 +29,7 @@ mod imp {
     use servicrab_protocol::{Event, Request, Response, Stream};
 
     use crate::daemon::client;
+    use crate::output::{self, no_daemon, CliError};
     use crate::style::{self, BOLD, DIM, SERVICE_COLORS};
 
     /// Attach to the daemon and render its events.
@@ -36,12 +37,17 @@ mod imp {
         services: &[String],
         config: Option<&Path>,
         options: EventsOptions,
-    ) -> Result<i32, String> {
-        let (cfg, _, paths) = crate::commands::daemon::setup(config)?;
+    ) -> Result<i32, CliError> {
+        let (cfg, _, paths) =
+            crate::commands::daemon::setup(config).map_err(|e| e.in_json(options.json))?;
 
         for name in services {
             if !cfg.services.keys().any(|known| known.as_str() == name) {
-                return Err(format!("unknown service: {name}"));
+                return Err(CliError::new(
+                    servicrab_protocol::ErrorCode::UnknownService,
+                    format!("unknown service: {name}"),
+                )
+                .in_json(options.json));
             }
         }
 
@@ -51,7 +57,12 @@ mod imp {
         };
 
         let mut printer = Printer::new(services, options);
-        if !options.json {
+        if options.json {
+            // The same handshake `up --json` prints, and the same one the
+            // daemon answers a subscription with, so all three streams open
+            // identically.
+            output::print_stream_header();
+        } else {
             printer.banner(cfg.project.name.as_str(), services);
         }
 
@@ -66,11 +77,10 @@ mod imp {
             true
         }) {
             Ok(()) => Ok(0),
-            Err(client::ClientError::NotRunning) => Err(format!(
-                "no daemon is running for {} — start one with `servicrab start`",
-                cfg.project.name
-            )),
-            Err(err) => Err(err.to_string()),
+            Err(client::ClientError::NotRunning) => {
+                Err(no_daemon(cfg.project.name.as_str(), options.json))
+            }
+            Err(err) => Err(CliError::from(err.to_string()).in_json(options.json)),
         }
     }
 
@@ -148,7 +158,7 @@ mod imp {
                 Response::Lagged { skipped } => {
                     self.note(&format!("dropped {skipped} event(s): too slow to keep up"))
                 }
-                Response::Error { message } => self.note(message),
+                Response::Error { message, .. } => self.note(message),
                 _ => {}
             }
         }
@@ -331,12 +341,18 @@ mod imp {
 mod imp {
     use super::*;
 
+    use crate::output::CliError;
+
     pub fn events(
         _services: &[String],
         _config: Option<&Path>,
-        _options: EventsOptions,
-    ) -> Result<i32, String> {
-        Err("the background daemon is only supported on Linux and macOS".to_string())
+        options: EventsOptions,
+    ) -> Result<i32, CliError> {
+        Err(CliError::new(
+            servicrab_protocol::ErrorCode::Unsupported,
+            "the background daemon is only supported on Linux and macOS",
+        )
+        .in_json(options.json))
     }
 }
 

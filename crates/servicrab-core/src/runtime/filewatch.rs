@@ -266,10 +266,12 @@ pub async fn watch_service(
         }
 
         match ack_rx.await {
-            Ok(Err(message)) => {
+            Ok(Err(refusal)) => {
                 let _ = events.send(ServiceEvent::new(
                     service.clone(),
-                    EventKind::WatchFailed { message },
+                    EventKind::WatchFailed {
+                        message: refusal.to_string(),
+                    },
                 ));
             }
             Ok(Ok(_)) => {}

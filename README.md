@@ -168,7 +168,7 @@ if you want shell semantics.
 | Command | Description |
 |---|---|
 | `servicrab init [--path PATH] [--force]` | Generate an example `servicrab.toml` |
-| `servicrab check [--config PATH]` | Parse and validate the config file |
+| `servicrab check [--config PATH] [--json]` | Parse and validate the config file |
 | `servicrab list [--config PATH] [--json]` | List all services with their restart policies |
 | `servicrab run <SERVICE> [--config PATH] [--no-restart]` | Supervise one service in the foreground |
 | `servicrab exec <SERVICE> [--config PATH] -- <COMMAND>...` | Run a command in a service's environment and working directory |
@@ -974,16 +974,44 @@ echo '{"type":"status"}' | nc -U .servicrab/daemon.sock
 | --- | --- |
 | `{"type":"ping"}` | `{"type":"pong","project":"…","pid":123,"version":1}` |
 | `{"type":"status"}` | `{"type":"status","services":[…]}` |
-| `{"type":"shutdown"}` | `{"type":"ok","message":"stopping the stack"}` |
-| `{"type":"start_service","name":"api"}` | `{"type":"ok","message":"api started"}` |
-| `{"type":"stop_service","name":"api"}` | `{"type":"ok","message":"api stopped"}` |
-| `{"type":"restart_service","name":"api"}` | `{"type":"ok","message":"api restarted"}` |
-| `{"type":"reload"}` | `{"type":"ok","message":"reloaded demo: 1 added, 1 changed, 0 removed"}` |
-| `{"type":"subscribe"}` | `{"type":"ok"}`, then a `{"type":"event",…}` line per event |
+| `{"type":"shutdown"}` | `{"type":"ok","message":"…"}` |
+| `{"type":"start_service","name":"api"}` | `{"type":"ok","message":"…"}` |
+| `{"type":"stop_service","name":"api"}` | `{"type":"ok","message":"…"}` |
+| `{"type":"restart_service","name":"api"}` | `{"type":"ok","message":"…"}` |
+| `{"type":"reload"}` | `{"type":"ok","message":"…","changes":{"added":1,"changed":1,"removed":0}}` |
+| `{"type":"subscribe"}` | `{"type":"ok","schema_version":1}`, then a `{"type":"event",…}` line per event |
 
 `stop_service` and `restart_service` only answer once the service has actually
 stopped (and, for a restart, been replaced), so scripts can rely on the reply
 instead of polling.
+
+**`message` is for people, not for programs.** It is a sentence written for
+whoever is reading the terminal, and its wording may change in any release.
+Everything a program should act on is a field of its own: `changes` on a
+reload's `ok`, and on an `error`:
+
+```json
+{"type":"error","code":"validation_failed","message":"servicrab.toml has 2 error(s); the stack was left untouched","errors":["services.api: command must not be empty","services.web: unknown dependency \"nowhere\""]}
+```
+
+| `code` | Meaning |
+| --- | --- |
+| `unknown_service` | The request named a service this daemon does not supervise |
+| `busy` | Another command for that service has not finished yet |
+| `not_running` | Nothing is listening: no daemon is running for this project |
+| `already_running` | The service, or the daemon, is running already |
+| `validation_failed` | The configuration did not load, or did not validate — see `errors` |
+| `unsupported` | This daemon does not support that request |
+| `failed` | It failed for a reason with no code of its own |
+
+The set can grow, so treat an unfamiliar code as `failed`. A response from a
+0.x daemon has no `code` at all, which reads the same way.
+
+`ServiceInfo` entries carry the running process's group id as **`pgid`**.
+`pid` is a deprecated alias holding the same number: it always was a
+process-group id — every service runs in its own group, whose leader is the
+direct child — and signalling it as a pid would reach only that leader. `pgid`
+is the name `Event::Started` has always used for it.
 
 #### Reading a stream from a newer servicrab
 
@@ -1006,11 +1034,12 @@ recognise rather than treating it as an error, and do not give a field the value
 `unknown` — it is reserved for exactly this.
 
 A request the daemon does not recognise is named back to you, with the set it
-does accept, so a typo in a hand-rolled client is one round trip to diagnose:
+does accept, so a typo in a hand-rolled client is one round trip to diagnose.
+The `unsupported` code is there for the program; the sentence is for you:
 
 ```console
 $ echo '{"type":"strat"}' | nc -U .servicrab/daemon.sock
-{"type":"error","message":"this daemon does not support the request \"strat\"; it supports: ping, status, shutdown, start_service, stop_service, restart_service, reload, subscribe"}
+{"type":"error","code":"unsupported","message":"this daemon does not support the request \"strat\"; it supports: ping, status, shutdown, start_service, stop_service, restart_service, reload, subscribe"}
 ```
 
 ### Live event streaming
@@ -1022,17 +1051,18 @@ two optional fields — `services` (an allow-list; empty means all of them) and
 
 ```bash
 $ echo '{"type":"subscribe","services":["api"]}' | nc -U .servicrab/daemon.sock
-{"type":"ok"}
+{"type":"ok","schema_version":1}
 {"type":"event","service":"api","event":{"kind":"log","stream":"stdout","line":"listening on :8080"}}
 {"type":"event","service":"api","event":{"kind":"state","state":"stopping"}}
 ```
 
 `up --json` and `watch --json` print the very same lines without a daemon in
 sight, so a wrapper can consume a foreground stack the same way it consumes a
-background one:
+background one — handshake included:
 
 ```console
 $ servicrab up --json
+{"type":"ok","schema_version":1}
 {"type":"event","service":"api","event":{"kind":"state","state":"starting"}}
 {"type":"event","service":"api","event":{"kind":"log","stream":"stdout","line":"listening on :8080"}}
 ```
@@ -1063,6 +1093,76 @@ The stream is a live feed, not a backlog: a subscriber sees what happens from
 the moment it attaches (use `servicrab logs` for history). A client too slow to
 keep up gets a `{"type":"lagged","skipped":N}` notice instead of silently
 missing events, and the command exits cleanly when the daemon stops.
+
+### Machine-readable output
+
+Every `--json` output carries a `schema_version`. It is bumped only when a shape
+changes in a way an existing reader would misread — adding an optional field is
+not such a change — so a script can refuse a stream it was not written for
+instead of guessing.
+
+There are two shapes, and which one a command uses follows from what it is:
+
+- **A whole document**, pretty-printed, for the commands that answer a question
+  and exit: `check --json`, `list --json`, `status --json`. `schema_version` is
+  a key at the top level, alongside the payload. `list` keeps its services in an
+  array, but under a `services` key rather than as the top-level value — a bare
+  array has nowhere to put the version.
+- **NDJSON**, one object per line, for the commands that stream:
+  `up --json`, `watch --json`, `events --json`. Each opens with the same
+  `{"type":"ok","schema_version":1}` handshake the daemon answers `subscribe`
+  with, then writes one event per line. The version is not repeated on every
+  line: these streams can run for days.
+
+Errors are JSON too, on **stderr**, so stdout carries nothing but the document
+that was asked for:
+
+```console
+$ servicrab check --json
+{"schema_version":1,"error":{"code":"validation_failed","message":"servicrab.toml has 2 error(s)","errors":["services.api: command must not be empty","services.web: unknown dependency \"nowhere\""]}}
+```
+
+`code` is the same stable set the [socket protocol](#the-socket-protocol) uses.
+`message` is for people and may be reworded in any release.
+
+### Exit codes for every command
+
+Every command follows the same rules:
+
+| Situation | Exit code |
+|---|---|
+| It worked | `0` |
+| It failed | `1` |
+| No daemon is running for this project | `3` |
+| `up` / `watch` was interrupted (`SIGHUP` / Ctrl+C / `SIGTERM`) | `129` / `130` / `143` |
+| `exec` or `run` ran something | that process's own status (`128+N` for a signal, `126`/`127` for `exec`) |
+
+`3` is the one worth knowing about. It means "there was nothing to talk to",
+which is a thing scripts routinely want to handle rather than report:
+
+```bash
+servicrab down
+case $? in
+  0) echo "stopped it" ;;
+  3) echo "nothing was running" ;;  # not a failure
+  *) echo "something went wrong"; exit 1 ;;
+esac
+```
+
+`down` still never *fails* because nothing was running — running it twice is
+safe, which is the whole point of it — the code just distinguishes the two
+outcomes. The same `3` comes from `status`, `stop`, `restart`,
+`start SERVICE`, `reload` and `events`.
+
+Errors always go to **stderr**, prefixed with `error: `, with the individual
+problems as bullets below:
+
+```console
+$ servicrab check
+error: /srv/demo/servicrab.toml has 2 error(s)
+  • services.api: command must not be empty
+  • services.web: unknown dependency "nowhere"
+```
 
 ### Config hot-reload
 

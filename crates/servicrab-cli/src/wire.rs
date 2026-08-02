@@ -97,6 +97,8 @@ pub fn to_wire_status(status: &servicrab_core::ServiceStatus) -> servicrab_proto
     servicrab_protocol::ServiceInfo {
         name: status.name.to_string(),
         state: to_wire_state(status.state),
+        pgid: status.pid,
+        // The same number under the name every 0.x client reads.
         pid: status.pid,
         uptime_secs: status.uptime.map(|d| d.as_secs()),
         restarts: status.restarts,

@@ -18,7 +18,10 @@ pub mod response;
 
 pub use frame::{decode, encode, FrameError};
 pub use request::Request;
-pub use response::{Event, Health, Response, ServiceInfo, ServiceState, Stream, UNKNOWN};
+pub use response::{
+    ErrorCode, Event, Health, ReloadChanges, Response, ServiceInfo, ServiceState, Stream,
+    SCHEMA_VERSION, UNKNOWN,
+};
 
 /// Which revision of this wire format this build speaks.
 ///

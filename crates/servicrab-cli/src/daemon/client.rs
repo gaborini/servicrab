@@ -92,7 +92,7 @@ where
     }
     match decode::<Response>(&first) {
         Ok(Response::Ok { .. }) => {}
-        Ok(Response::Error { message }) => return Err(ClientError::Failed(message)),
+        Ok(Response::Error { message, .. }) => return Err(ClientError::Failed(message)),
         Ok(other) => {
             return Err(ClientError::Failed(format!(
                 "unexpected response from the daemon: {other:?}"
@@ -161,7 +161,7 @@ pub fn is_running(socket: &Path) -> bool {
 pub fn check_running(socket: &Path) -> Result<(), ClientError> {
     match send(socket, &Request::ping()) {
         Ok(Response::Pong { .. }) => Ok(()),
-        Ok(Response::Error { message }) => Err(ClientError::Failed(message)),
+        Ok(Response::Error { message, .. }) => Err(ClientError::Failed(message)),
         Ok(other) => Err(ClientError::Failed(format!(
             "unexpected response from the daemon: {other:?}"
         ))),
@@ -195,9 +195,10 @@ mod tests {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
-            let line = encode(&Response::Error {
-                message: message.to_string(),
-            })
+            let line = encode(&Response::error(
+                servicrab_protocol::ErrorCode::Failed,
+                message,
+            ))
             .expect("encode");
             let _ = stream.write_all(line.as_bytes());
             let _ = stream.flush();
@@ -237,9 +238,10 @@ mod tests {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
-            let line = encode(&Response::Error {
-                message: "this daemon runs as uid 501; you are uid 0".to_string(),
-            })
+            let line = encode(&Response::error(
+                servicrab_protocol::ErrorCode::Failed,
+                "this daemon runs as uid 501; you are uid 0",
+            ))
             .expect("encode");
             let _ = stream.write_all(line.as_bytes());
             let _ = stream.flush();

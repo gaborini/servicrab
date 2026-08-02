@@ -4,19 +4,22 @@ use std::path::Path;
 
 use serde::Serialize;
 use servicrab_core::{load, resolve_config_path, Service, ServiceName};
+use servicrab_protocol::ErrorCode;
+
+use crate::output::{self, CliError};
 
 /// Run the `list` subcommand.
-pub fn run(config: Option<&Path>, json: bool) -> Result<(), String> {
-    let path = resolve_config_path(config).map_err(|e| format!("could not find config: {e}"))?;
+pub fn run(config: Option<&Path>, json: bool) -> Result<(), CliError> {
+    let path = resolve_config_path(config)
+        .map_err(|e| CliError::from(format!("could not find config: {e}")).in_json(json))?;
 
     let (cfg, warnings) = load(&path).map_err(|errors| {
-        let msgs: Vec<String> = errors.iter().map(|e| format!("  • {e}")).collect();
-        format!(
-            "✗ {} has {} error(s):\n{}",
-            path.display(),
-            errors.len(),
-            msgs.join("\n")
+        CliError::new(
+            ErrorCode::ValidationFailed,
+            format!("{} has {} error(s)", path.display(), errors.len()),
         )
+        .with_errors(errors.iter().map(ToString::to_string).collect())
+        .in_json(json)
     })?;
 
     for warning in &warnings {
@@ -24,15 +27,25 @@ pub fn run(config: Option<&Path>, json: bool) -> Result<(), String> {
     }
 
     if json {
-        print_json(&cfg.services);
-    } else {
-        print_table(&cfg.services, &cfg.project.name.to_string());
+        return print_json(&cfg.project.name.to_string(), &cfg.services);
     }
+    print_table(&cfg.services, &cfg.project.name.to_string());
 
     Ok(())
 }
 
 // ── JSON output ────────────────────────────────────────────────────────────
+
+/// The `list --json` document.
+///
+/// An envelope rather than the bare array this used to print: every `--json`
+/// document carries a `schema_version`, and an array has nowhere to put one.
+/// The services themselves are still an array, under `services`.
+#[derive(Serialize)]
+struct ListJson<'a> {
+    project: &'a str,
+    services: Vec<ServiceJson<'a>>,
+}
 
 #[derive(Serialize)]
 struct ServiceJson<'a> {
@@ -59,7 +72,10 @@ struct DependencyJson<'a> {
     condition: String,
 }
 
-fn print_json(services: &std::collections::BTreeMap<ServiceName, Service>) {
+fn print_json(
+    project: &str,
+    services: &std::collections::BTreeMap<ServiceName, Service>,
+) -> Result<(), CliError> {
     let list: Vec<ServiceJson<'_>> = services
         .values()
         .map(|svc| {
@@ -83,10 +99,10 @@ fn print_json(services: &std::collections::BTreeMap<ServiceName, Service>) {
         })
         .collect();
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&list).expect("JSON serialization")
-    );
+    output::print_document(ListJson {
+        project,
+        services: list,
+    })
 }
 
 /// The dependencies of one service, each with its effective condition.
