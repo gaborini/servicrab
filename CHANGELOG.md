@@ -9,12 +9,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `servicrab check --json`, emitting the project name, the service count, the
+  start order and the profile membership — and, when the config does not load,
+  a structured error list rather than a paragraph. `check` is the most scripted
+  command and its whole job is reporting problems, so those had to become data.
+- Every `--json` output now carries a `schema_version`, so a script can refuse a
+  stream it was not written for instead of guessing. Whole documents
+  (`check --json`, `list --json`, `status --json`) carry it as a top-level key;
+  the NDJSON streams (`up --json`, `watch --json`, `events --json`) open with
+  the same `{"type":"ok","schema_version":1}` handshake the daemon answers
+  `subscribe` with, rather than repeating the version on every event line.
+- `Response::Error` gained a `code` field — `unknown_service`, `busy`,
+  `not_running`, `already_running`, `validation_failed`, `unsupported`,
+  `failed` — and, for a validation failure, an `errors` list. `message` was the
+  only thing to match on before, and it is prose.
+- `Response::Ok` for a reload gained `changes`, reporting `{added, changed,
+  removed}` as numbers beside the sentence that used to be the only way to
+  learn them.
+- `ServiceInfo` gained a `pgid` field. `pid` stays as a deprecated alias
+  carrying the same number: it always was a process-group id — its own doc
+  comment said so, and `Event::Started` calls the same value `pgid` — and
+  signalling it as a pid reaches only the group leader.
+- Exit code `3` means "no daemon is running for this project". A dedicated code
+  so that a script can tell "there was nothing to talk to" from a real failure
+  without matching on the message.
 - A `Dependabot auto-merge` workflow. `main` now requires a pull request with
   green checks and one approving review, which a bot cannot collect, so the
   weekly dependency bumps are approved and queued for auto-merge from CI
   instead. Major-version updates are left for a human, including a grouped
   update that contains one — the checks are a real review for a patch bump, and
   not much of one for a breaking change.
+
+### Changed
+
+- **`list --json` prints an object, not a bare array.** The services are still
+  an array, now under a `services` key, alongside `project` and
+  `schema_version`. A top-level array has nowhere to put a version.
+- **"No daemon" is exit `3` everywhere.** It was `1` for `status`, `stop`,
+  `restart`, `start SERVICE`, `reload` and `events`, and `0` for `down`. `down`
+  still never *fails* because nothing was running — running it twice is safe,
+  which is the point of it — the code just says whether there was anything to
+  do.
+- **`status`'s "no daemon" message moved to stderr**, where every other error
+  already was; it used to be printed on stdout while exiting non-zero.
+- **Every error is one format**: stderr, an `error: ` prefix, and the individual
+  problems as bullets below it. `stop`, `restart` and `reload` used to print a
+  bare `✗ …` for a rejection, with no prefix; `check` printed its errors itself
+  and then let the top level summarize them again, saying the same thing twice.
+  `✗` remains in `check`'s human report, but not as an error marker.
+- **Under `--json`, errors are JSON**, on stderr, carrying `schema_version` and
+  a `code`. They used to be a text `error: …` line even when the caller had
+  explicitly asked for machine-readable output.
+- `status --json`'s "not running" answer goes through serde like the running
+  one, so the two cannot drift; it used to be a hand-written compact string.
+  Both are pretty-printed now, and carry the same keys.
+- The reload error over the socket is one line plus a list. It used to be an
+  entire multi-line validation report — newlines, bullets and all — stuffed
+  into a single JSON string.
+- `message` on a `Response` is documented as being for people, and explicitly
+  not part of the API. The README no longer quotes the strings verbatim, since
+  doing so was what made them one.
+- The man page's `EXIT STATUS` section documents every code in the contract. It
+  covered only `exec` and `run`, and never mentioned the `129`/`130`/`143` that
+  `up` and `watch` exit with on a signal.
+- In `servicrab-core`, a control command's acknowledgement carries a
+  `ControlOutcome` or a `ControlRefusal` rather than `Result<String, String>`.
+  Both still `Display` as exactly the sentences they replaced.
 
 ## [0.3.0] - 2026-07-30
 
