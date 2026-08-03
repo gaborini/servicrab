@@ -3,7 +3,8 @@
 //! ## Subcommands
 //!
 //! - `servicrab init [--path PATH] [--force]` — create example config
-//! - `servicrab check [--config PATH]` — validate config, print summary
+//! - `servicrab check [--config PATH] [--json]` — validate config, print
+//!   summary
 //! - `servicrab list [--config PATH] [--json]` — list services
 //! - `servicrab run <SERVICE> [--config PATH] [--no-restart]` — run one
 //!   service in the foreground (Linux/macOS)
@@ -24,11 +25,33 @@
 //! - `servicrab completions <SHELL>` — print a shell completion script
 //! - `servicrab man` — print the man page in roff
 
+// These two rustdoc lints are allowed for this crate only, and only because of
+// the clap derive.
+//
+// The doc comments on `Cli`, `Command` and their fields are not documentation in
+// the rustdoc sense: clap turns them verbatim into the `servicrab --help` text.
+// `servicrab run --help` prints "as defined in [services.<name>]" and
+// `servicrab watch --help` prints "declares a [watch] block" — so rustdoc sees
+// `[services.<name>]` as an unclosed `<name>` HTML tag and `[watch]` as a broken
+// intra-doc link, when both are literally the config syntax we want the user to
+// read.
+//
+// The v1.0 stability contract freezes the CLI help output, so the text cannot be
+// reworded to satisfy rustdoc's HTML pedantry. Narrowing the lint here is the
+// only resolution that leaves the user-facing string alone.
+//
+// This is deliberately *not* done for `servicrab-core` or `servicrab-protocol`:
+// there the doc comments really are documentation, intra-doc links really do
+// need to resolve, and both crates keep these lints at deny.
+#![allow(rustdoc::invalid_html_tags)]
+#![allow(rustdoc::broken_intra_doc_links)]
+
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 mod commands;
 mod daemon;
+mod output;
 mod style;
 mod wire;
 
@@ -46,6 +69,20 @@ fn parse_duration(text: &str) -> Result<std::time::Duration, String> {
     author
 )]
 struct Cli {
+    /// When to colour output: auto (a stream that is a terminal), always, never.
+    #[arg(
+        long,
+        value_name = "WHEN",
+        value_enum,
+        default_value = "auto",
+        global = true
+    )]
+    color: style::ColorChoice,
+
+    /// Never colour output; the same as --color=never.
+    #[arg(long, global = true, conflicts_with = "color")]
+    no_color: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -71,6 +108,11 @@ enum Commands {
         /// servicrab.toml by walking up from the current directory.
         #[arg(long, short = 'c')]
         config: Option<std::path::PathBuf>,
+
+        /// Print machine-readable JSON instead of the human-readable report.
+        /// Validation errors become a JSON list.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// List all services defined in a servicrab.toml.
@@ -412,6 +454,14 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
 
+    // Recorded before anything is rendered, so every stream's colour decision
+    // sees the choice that was actually typed.
+    style::set_choice(if cli.no_color {
+        style::ColorChoice::Never
+    } else {
+        cli.color
+    });
+
     // `run` has no other progress output, so its lifecycle transitions are
     // logged by default.  `up` renders the same information from its event
     // stream, so logging is quiet there to avoid printing everything twice.
@@ -436,20 +486,24 @@ fn main() {
         .init();
 
     // Commands return the process exit code to use; `0` means success.
-    let result = match cli.command {
-        Commands::Init { path, force } => commands::init::run(&path, force).map(|()| 0),
-        Commands::Check { config } => commands::check::run(config.as_deref()).map(|()| 0),
+    let result: Result<i32, output::CliError> = match cli.command {
+        Commands::Init { path, force } => commands::init::run(&path, force)
+            .map(|()| 0)
+            .map_err(Into::into),
+        Commands::Check { config, json } => {
+            commands::check::run(config.as_deref(), json).map(|()| 0)
+        }
         Commands::List { config, json } => commands::list::run(config.as_deref(), json).map(|()| 0),
         Commands::Run {
             service,
             config,
             no_restart,
-        } => commands::run::run(&service, config.as_deref(), no_restart),
+        } => commands::run::run(&service, config.as_deref(), no_restart).map_err(Into::into),
         Commands::Exec {
             service,
             config,
             command,
-        } => commands::exec::run(&service, &command, config.as_deref()),
+        } => commands::exec::run(&service, &command, config.as_deref()).map_err(Into::into),
         Commands::Up {
             services,
             config,
@@ -562,9 +616,14 @@ fn main() {
                 user,
                 profiles,
             },
-        ),
-        Commands::Completions { shell } => commands::completions::run::<Cli>(shell).map(|()| 0),
-        Commands::Man { output } => commands::man::run::<Cli>(output.as_deref()).map(|()| 0),
+        )
+        .map_err(Into::into),
+        Commands::Completions { shell } => commands::completions::run::<Cli>(shell)
+            .map(|()| 0)
+            .map_err(Into::into),
+        Commands::Man { output } => commands::man::run::<Cli>(output.as_deref())
+            .map(|()| 0)
+            .map_err(Into::into),
         Commands::Logs {
             services,
             config,
@@ -580,15 +639,20 @@ fn main() {
                 no_prefix,
             },
         )
-        .map(|()| 0),
+        .map(|()| 0)
+        .map_err(Into::into),
     };
 
     match result {
         Ok(0) => {}
         Ok(code) => std::process::exit(code),
+        // Every error leaves by this one door: stderr, an `error: ` prefix, and
+        // the exit status the error itself carries.  Under `--json` the same
+        // error is a JSON object, still on stderr, so a caller parsing stdout
+        // sees only the document it asked for.
         Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
+            e.report();
+            std::process::exit(e.exit_code());
         }
     }
 }

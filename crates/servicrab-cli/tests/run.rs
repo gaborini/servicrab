@@ -124,6 +124,21 @@ fn run_count(counter: &Path) -> usize {
         .unwrap_or(0)
 }
 
+/// Wait until the counting fixture has run at least `count` times.
+fn wait_for_runs(counter: &Path, count: usize) {
+    let deadline = Instant::now() + CEILING;
+    while Instant::now() < deadline {
+        if run_count(counter) >= count {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "timed out waiting for {count} runs; saw {}",
+        run_count(counter)
+    );
+}
+
 fn is_alive(pid: i32) -> bool {
     kill(Pid::from_raw(pid), None).is_ok()
 }
@@ -397,6 +412,38 @@ fn no_restart_flag_overrides_the_configured_policy() {
     assert_eq!(run_count(&counter), 1, "--no-restart must win");
 }
 
+#[test]
+fn zero_max_restarts_means_unlimited_restarts() {
+    let dir = TempDir::new().unwrap();
+    let counter = dir.path().join("count.txt");
+    let cfg = counting_config(
+        dir.path(),
+        &counter,
+        "exit 1",
+        "restart = \"on-failure\"\nrestart_delay = \"100ms\"\nrestart_max_delay = \"100ms\"\nmax_restarts = 0\n",
+    );
+
+    let mut child = spawn_service_with(&cfg, "svc", Stdio::null(), Stdio::piped());
+
+    // More runs than the default budget of 10 would ever allow, so the count
+    // rules out both a finite limit and the old "give up on the first failure"
+    // reading of `max_restarts = 0`.
+    wait_for_runs(&counter, 12);
+    assert!(
+        is_alive(child.id() as i32),
+        "the supervisor must not have given up"
+    );
+
+    kill(Pid::from_raw(child.id() as i32), Signal::SIGINT).unwrap();
+    let code = wait_bounded(&mut child);
+    let stderr = drain_stderr(&mut child);
+    assert_eq!(code, 130, "supervisor said: {stderr}");
+    assert!(
+        !stderr.contains("giving up"),
+        "the restart limit must never be reached: {stderr}"
+    );
+}
+
 // ── shutdown ───────────────────────────────────────────────────────────────
 
 #[test]
@@ -556,6 +603,56 @@ fn no_orphans_remain_after_a_normal_run() {
     assert!(
         !is_alive(grandchild),
         "background descendant {grandchild} was left running"
+    );
+}
+
+#[test]
+fn a_hangup_does_not_leave_the_process_group_behind() {
+    // SIGHUP is what a closing terminal delivers.  Without an explicit handler
+    // its default disposition kills the supervisor outright, and every service
+    // it was supervising keeps running.
+    let dir = TempDir::new().unwrap();
+    let pidfile = dir.path().join("grandchild.pid");
+    let sh = script(
+        dir.path(),
+        "parent.sh",
+        &format!("sleep 30 &\necho $! > {}\nwait", pidfile.display()),
+    );
+    let cfg = config(
+        dir.path(),
+        &format!(
+            "version = 1\n\
+             [project]\nname = \"hangup\"\n\
+             [services.tree]\ncommand = [\"{}\"]\n\
+             restart = \"always\"\nshutdown_timeout = \"1s\"\n",
+            sh.display()
+        ),
+    );
+
+    let mut child = spawn_service_with(&cfg, "tree", Stdio::null(), Stdio::piped());
+    wait_for_file(&pidfile);
+    let grandchild: i32 = fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(is_alive(grandchild), "fixture grandchild should be running");
+
+    kill(Pid::from_raw(child.id() as i32), Signal::SIGHUP).unwrap();
+    let code = wait_bounded(&mut child);
+    let stderr = drain_stderr(&mut child);
+
+    // 129 == 128 + SIGHUP; `restart = "always"` must not resurrect the service
+    // after the terminal went away either.
+    assert_eq!(code, 129, "supervisor said: {stderr}");
+
+    let deadline = Instant::now() + CEILING;
+    while is_alive(grandchild) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !is_alive(grandchild),
+        "grandchild {grandchild} outlived the hung-up supervisor"
     );
 }
 

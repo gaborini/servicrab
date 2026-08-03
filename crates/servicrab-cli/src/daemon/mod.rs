@@ -10,6 +10,12 @@ pub mod stopped;
 #[cfg(unix)]
 pub mod client;
 #[cfg(unix)]
+pub mod lock;
+#[cfg(unix)]
+pub mod peer;
+#[cfg(unix)]
 pub mod server;
+#[cfg(unix)]
+pub mod signals;
 
 pub use paths::DaemonPaths;

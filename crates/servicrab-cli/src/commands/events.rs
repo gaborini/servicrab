@@ -29,29 +29,40 @@ mod imp {
     use servicrab_protocol::{Event, Request, Response, Stream};
 
     use crate::daemon::client;
-    use crate::style::{self, BOLD, DIM, RESET, SERVICE_COLORS};
+    use crate::output::{self, no_daemon, CliError};
+    use crate::style::{self, BOLD, DIM, SERVICE_COLORS};
 
     /// Attach to the daemon and render its events.
     pub fn events(
         services: &[String],
         config: Option<&Path>,
         options: EventsOptions,
-    ) -> Result<i32, String> {
-        let (cfg, _, paths) = crate::commands::daemon::setup(config)?;
+    ) -> Result<i32, CliError> {
+        let (cfg, _, paths) =
+            crate::commands::daemon::setup(config).map_err(|e| e.in_json(options.json))?;
 
         for name in services {
             if !cfg.services.keys().any(|known| known.as_str() == name) {
-                return Err(format!("unknown service: {name}"));
+                return Err(CliError::new(
+                    servicrab_protocol::ErrorCode::UnknownService,
+                    format!("unknown service: {name}"),
+                )
+                .in_json(options.json));
             }
         }
 
         let request = Request::Subscribe {
-            services: services.to_vec(),
+            services: services.iter().cloned().collect(),
             logs: !options.no_logs,
         };
 
         let mut printer = Printer::new(services, options);
-        if !options.json {
+        if options.json {
+            // The same handshake `up --json` prints, and the same one the
+            // daemon answers a subscription with, so all three streams open
+            // identically.
+            output::print_stream_header();
+        } else {
             printer.banner(cfg.project.name.as_str(), services);
         }
 
@@ -66,11 +77,10 @@ mod imp {
             true
         }) {
             Ok(()) => Ok(0),
-            Err(client::ClientError::NotRunning) => Err(format!(
-                "no daemon is running for {} — start one with `servicrab start`",
-                cfg.project.name
-            )),
-            Err(err) => Err(err.to_string()),
+            Err(client::ClientError::NotRunning) => {
+                Err(no_daemon(cfg.project.name.as_str(), options.json))
+            }
+            Err(err) => Err(CliError::from(err.to_string()).in_json(options.json)),
         }
     }
 
@@ -78,13 +88,17 @@ mod imp {
     struct Printer {
         colors: BTreeMap<String, &'static str>,
         width: usize,
-        color: bool,
+        /// Whether the stdout half — a service's captured stdout — is coloured.
+        color_out: bool,
+        /// Whether the stderr half — status lines and notes — is coloured.
+        color_err: bool,
         options: EventsOptions,
     }
 
     impl Printer {
         fn new(services: &[String], options: EventsOptions) -> Self {
-            let color = style::color_enabled();
+            let color_out = style::color_enabled_for(style::Stream::Stdout);
+            let color_err = style::color_enabled_for(style::Stream::Stderr);
             let width = services.iter().map(String::len).max().unwrap_or(0);
             let colors = services
                 .iter()
@@ -94,7 +108,8 @@ mod imp {
             Self {
                 colors,
                 width,
-                color,
+                color_out,
+                color_err,
                 options,
             }
         }
@@ -107,7 +122,7 @@ mod imp {
             };
             eprintln!(
                 "{} {project} → {scope}",
-                style::paint(self.color, BOLD, "servicrab events")
+                style::paint(self.color_err, BOLD, "servicrab events")
             );
         }
 
@@ -115,26 +130,26 @@ mod imp {
         ///
         /// Colours are handed out as services first show up, so a stream that
         /// was not filtered still gets stable, distinct prefixes.
-        fn prefix(&mut self, service: &str) -> String {
+        fn prefix(&mut self, service: &str, color: bool) -> String {
             if self.options.no_prefix {
                 return String::new();
             }
             let next = SERVICE_COLORS[self.colors.len() % SERVICE_COLORS.len()];
-            let color = *self
+            let tint = *self
                 .colors
                 .entry(service.to_string())
                 .or_insert_with(|| next);
             self.width = self.width.max(service.len());
             let label = format!("{:width$}", service, width = self.width);
-            format!("{} {} ", style::paint(self.color, color, &label), "|")
+            format!("{} {} ", style::paint(color, tint, &label), "|")
         }
 
-        fn timestamp(&self) -> String {
+        fn timestamp(&self, color: bool) -> String {
             if !self.options.timestamps {
                 return String::new();
             }
             let now = style::utc_hms(std::time::SystemTime::now());
-            format!("{} ", style::paint(self.color, DIM, &now))
+            format!("{} ", style::paint(color, DIM, &now))
         }
 
         fn response(&mut self, response: &Response) {
@@ -143,7 +158,7 @@ mod imp {
                 Response::Lagged { skipped } => {
                     self.note(&format!("dropped {skipped} event(s): too slow to keep up"))
                 }
-                Response::Error { message } => self.note(message),
+                Response::Error { message, .. } => self.note(message),
                 _ => {}
             }
         }
@@ -210,6 +225,11 @@ mod imp {
                         "watch: more than {limit} files; narrow `paths` or add `ignore` entries"
                     ),
                 ),
+                Event::LogLinesDropped { count } => self.status(
+                    service,
+                    "!",
+                    &format!("dropped {count} output line(s): faster than they could be consumed"),
+                ),
                 // Unlike `up`, a client that just attached has no idea what
                 // the services are doing, so state changes are worth showing.
                 Event::State { state } => self.status(service, "·", &state.to_string()),
@@ -219,14 +239,25 @@ mod imp {
         }
 
         fn log(&mut self, service: &str, stream: Stream, line: &str) {
-            let text = format!("{}{}{}", self.timestamp(), self.prefix(service), line);
             match stream {
                 Stream::Stderr => {
+                    let text = format!(
+                        "{}{}{}",
+                        self.timestamp(self.color_err),
+                        self.prefix(service, self.color_err),
+                        line
+                    );
                     let mut err = std::io::stderr().lock();
                     let _ = writeln!(err, "{text}");
                     let _ = err.flush();
                 }
                 _ => {
+                    let text = format!(
+                        "{}{}{}",
+                        self.timestamp(self.color_out),
+                        self.prefix(service, self.color_out),
+                        line
+                    );
                     let mut out = std::io::stdout().lock();
                     let _ = writeln!(out, "{text}");
                     let _ = out.flush();
@@ -237,9 +268,9 @@ mod imp {
         fn status(&mut self, service: &str, symbol: &str, message: &str) {
             let text = format!(
                 "{}{}{}",
-                self.timestamp(),
-                self.prefix(service),
-                style::paint(self.color, DIM, &format!("{symbol} {message}"))
+                self.timestamp(self.color_err),
+                self.prefix(service, self.color_err),
+                style::paint(self.color_err, DIM, &format!("{symbol} {message}"))
             );
             let mut err = std::io::stderr().lock();
             let _ = writeln!(err, "{text}");
@@ -248,13 +279,10 @@ mod imp {
 
         /// Report something about the stream itself, not about a service.
         fn note(&self, message: &str) {
-            eprintln!("{}⚠  {message}{}", if self.color { DIM } else { "" }, {
-                if self.color {
-                    RESET
-                } else {
-                    ""
-                }
-            });
+            eprintln!(
+                "{}",
+                style::paint(self.color_err, DIM, &format!("⚠  {message}"))
+            );
         }
     }
 
@@ -284,12 +312,12 @@ mod imp {
         #[test]
         fn prefixes_are_padded_and_stable() {
             let mut printer = Printer::new(&[], EventsOptions::default());
-            let first = printer.prefix("api");
-            let second = printer.prefix("worker");
+            let first = printer.prefix("api", false);
+            let second = printer.prefix("worker", false);
             assert!(first.contains("api"));
             assert!(second.contains("worker"));
             // The second, longer name widens the column for later lines.
-            assert!(printer.prefix("api").contains("api   "));
+            assert!(printer.prefix("api", false).contains("api   "));
             // A name keeps the colour it was first given.
             assert_eq!(printer.colors["api"], SERVICE_COLORS[0]);
             assert_eq!(printer.colors["worker"], SERVICE_COLORS[1]);
@@ -304,7 +332,7 @@ mod imp {
                     ..EventsOptions::default()
                 },
             );
-            assert_eq!(printer.prefix("api"), "");
+            assert_eq!(printer.prefix("api", false), "");
         }
     }
 }
@@ -313,12 +341,18 @@ mod imp {
 mod imp {
     use super::*;
 
+    use crate::output::CliError;
+
     pub fn events(
         _services: &[String],
         _config: Option<&Path>,
-        _options: EventsOptions,
-    ) -> Result<i32, String> {
-        Err("the background daemon is only supported on Linux and macOS".to_string())
+        options: EventsOptions,
+    ) -> Result<i32, CliError> {
+        Err(CliError::new(
+            servicrab_protocol::ErrorCode::Unsupported,
+            "the background daemon is only supported on Linux and macOS",
+        )
+        .in_json(options.json))
     }
 }
 

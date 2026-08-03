@@ -11,7 +11,10 @@
 //! ```
 //!
 //! Signalling only the direct child would leave `node` and `esbuild` running,
-//! so every signal is delivered with `killpg(2)`.
+//! so every signal is delivered with `killpg(2)`, and [`ProcessHandle`] sweeps
+//! its group with `SIGKILL` when it is dropped without having been swept — an
+//! early return or an aborted supervision task must not orphan a grandchild
+//! either.  `kill_on_drop(true)` alone would only reach the direct child.
 //!
 //! [`ServiceRunner`] supervises exactly one service and is driven entirely by a
 //! shutdown channel, which makes it reusable both for the single-service `run`
@@ -66,11 +69,20 @@ fn spawn_error_is_retryable(err: &std::io::Error) -> bool {
 }
 
 /// A running service process and the process group it leads.
+///
+/// Dropping the handle sweeps the group with `SIGKILL` unless it has already
+/// been swept, so an early return — a failed `wait`, a rejected state
+/// transition, a cancelled supervision task — cannot leave a grandchild
+/// behind.  `kill_on_drop(true)` alone would only reach the direct child.
 #[derive(Debug)]
 pub struct ProcessHandle {
     child: Child,
     pgid: Pid,
     started_at: Instant,
+    /// Set once the group has been swept.  After that the leader has been
+    /// reaped and the kernel may hand its id to somebody else, so signalling
+    /// it again would be signalling a stranger.
+    swept: bool,
 }
 
 impl ProcessHandle {
@@ -121,6 +133,7 @@ impl ProcessHandle {
             child,
             pgid,
             started_at: Instant::now(),
+            swept: false,
         })
     }
 
@@ -152,7 +165,8 @@ impl ProcessHandle {
 
     /// `SIGKILL` any process left in the group, ignoring an already-empty
     /// group.  Used to make sure no descendant outlives the supervisor.
-    fn kill_group(&self, service: &str, timeout: Duration) -> Result<(), RuntimeError> {
+    fn kill_group(&mut self, service: &str, timeout: Duration) -> Result<(), RuntimeError> {
+        self.swept = true;
         match killpg(self.pgid, Signal::SIGKILL) {
             Ok(()) => Ok(()),
             Err(errno) if group_is_gone(errno) => {
@@ -184,6 +198,27 @@ impl ProcessHandle {
                 source,
             })?;
         Ok(exit_reason(status))
+    }
+}
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        // Invariant: no process group of ours outlives its handle.  The normal
+        // path sweeps the group explicitly and sets `swept`; this covers every
+        // other way the handle can go away — a `?` on a failed `wait` or a
+        // rejected state transition, or the supervision task being aborted.
+        if self.swept {
+            return;
+        }
+        if let Err(errno) = killpg(self.pgid, Signal::SIGKILL) {
+            if !group_is_gone(errno) {
+                tracing::warn!(
+                    pgid = self.pgid.as_raw(),
+                    %errno,
+                    "could not sweep the process group while dropping its handle"
+                );
+            }
+        }
     }
 }
 
@@ -226,11 +261,16 @@ async fn next_unhealthy(health: &mut Option<mpsc::UnboundedReceiver<HealthSignal
     }
 }
 
-/// SIGINT/SIGTERM handling for the current process.
+/// SIGINT/SIGTERM/SIGHUP handling for the current process.
 ///
 /// The watcher forwards every signal it sees into a shutdown channel so that
 /// one or many [`ServiceRunner`]s can react to it.  A second signal is
 /// forwarded as well, which the runners interpret as "stop waiting, kill now".
+///
+/// SIGHUP has to be registered explicitly: its default disposition kills the
+/// supervisor outright, and every service's process group would then be left
+/// running — which is exactly what closing a terminal on a foreground `up`
+/// does.
 #[derive(Debug)]
 pub struct SignalWatcher {
     tx: ShutdownTx,
@@ -238,7 +278,7 @@ pub struct SignalWatcher {
 }
 
 impl SignalWatcher {
-    /// Install SIGINT and SIGTERM handlers.
+    /// Install SIGINT, SIGTERM and SIGHUP handlers.
     ///
     /// `label` only gives signal-registration errors a useful subject: a
     /// service name for `run`, the project name for `up`.
@@ -257,6 +297,13 @@ impl SignalWatcher {
                 source,
             }
         })?;
+        let mut sighup = signal(SignalKind::hangup()).map_err(|source| {
+            RuntimeError::SignalRegistrationFailed {
+                service: label.to_string(),
+                signal: "SIGHUP",
+                source,
+            }
+        })?;
 
         let (tx, _rx) = shutdown_channel();
         let sender = tx.clone();
@@ -265,6 +312,7 @@ impl SignalWatcher {
                 let reason = tokio::select! {
                     _ = sigint.recv() => ShutdownReason::UserInterrupt,
                     _ = sigterm.recv() => ShutdownReason::Terminated,
+                    _ = sighup.recv() => ShutdownReason::HangUp,
                 };
                 // `send` fails only when every receiver is gone, in which case
                 // there is nothing left to shut down.
@@ -383,15 +431,33 @@ impl<'a> ServiceRunner<'a> {
 
     /// Wait for the output readers to finish, but never block shutdown on a
     /// descendant that inherited the pipe and refuses to close it.
+    ///
+    /// A reader that overruns the timeout is **aborted**, not merely dropped.
+    /// Dropping a [`JoinHandle`] detaches its task, and a detached reader keeps
+    /// the clone of the event sink it captured — which keeps the per-service
+    /// event channel open, which keeps the relay task that forwards from it
+    /// alive, which means the supervision task never gets past awaiting the
+    /// relay and never sends its report.  The operator's `stop` then waits for
+    /// an ack that nothing can ever send: the command times out and the slot
+    /// stays busy, while the service itself has already exited cleanly.
+    ///
+    /// Trailing output can be lost when this fires.  That is the trade this
+    /// timeout was always making; what it must not also trade away is the
+    /// supervisor's ability to report that the service stopped.
     async fn drain_readers(readers: Vec<JoinHandle<()>>) {
         for reader in readers {
+            // Taken before the handle is moved into the timeout, which is what
+            // consumes it.
+            let abort = reader.abort_handle();
             if tokio::time::timeout(READER_DRAIN_TIMEOUT, reader)
                 .await
                 .is_err()
             {
-                // The timeout dropped the JoinHandle, which detaches the task;
-                // it ends as soon as the pipe closes.
-                tracing::debug!("output reader did not finish within the drain timeout");
+                abort.abort();
+                tracing::debug!(
+                    "output reader did not finish within the drain timeout; \
+                     dropping the rest of its output"
+                );
             }
         }
     }
@@ -668,13 +734,98 @@ impl<'a> ForegroundRunner<'a> {
 /// has been reaped and only unrelated processes could still claim the id.
 /// Either way there is no process of ours left to kill, and failing the run
 /// over it would turn a successful shutdown into a spurious error.
-fn group_is_gone(errno: nix::errno::Errno) -> bool {
+pub(crate) fn group_is_gone(errno: nix::errno::Errno) -> bool {
     matches!(errno, nix::errno::Errno::ESRCH | nix::errno::Errno::EPERM)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A validated service running `body` through `/bin/sh`.
+    fn sh_service(name: &str, body: &str) -> Service {
+        let toml = format!(
+            "version = 1\n[project]\nname = \"probe\"\n\
+             [services.{name}]\ncommand = [\"/bin/sh\", \"-c\", \"{body}\"]\n"
+        );
+        let raw: crate::raw::RawConfig = toml::from_str(&toml).expect("valid test toml");
+        let cfg = crate::validation::validate_raw(raw, std::path::Path::new("/tmp/servicrab.toml"))
+            .expect("valid test config")
+            .0;
+        cfg.services.values().next().cloned().expect("one service")
+    }
+
+    fn is_alive(pid: i32) -> bool {
+        nix::sys::signal::kill(Pid::from_raw(pid), None).is_ok()
+    }
+
+    /// Wait, with an upper bound, for `pid` to disappear.
+    fn wait_until_gone(pid: i32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if !is_alive(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// Read the grandchild's pid the fixture wrote, with an upper bound.
+    fn wait_for_pid(path: &std::path::Path) -> i32 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(pid) = text.trim().parse() {
+                    return pid;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the fixture never recorded its grandchild");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_handle_sweeps_the_whole_process_group() {
+        // Every `?` in `ServiceRunner::run` returns while the handle still owns
+        // a live group, and so does an aborted supervision task.
+        // `kill_on_drop(true)` would only reach the direct child, orphaning a
+        // grandchild that ignores the shutdown signal.
+        let dir = tempfile::TempDir::new().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let service = sh_service(
+            "tree",
+            &format!(
+                "trap '' TERM INT; sleep 30 & echo $! > {}; wait",
+                pidfile.display()
+            ),
+        );
+
+        let handle = ProcessHandle::spawn(&service, OutputMode::Capture).expect("spawned");
+        let leader = handle.pgid();
+        let grandchild = wait_for_pid(&pidfile);
+        assert!(is_alive(grandchild));
+
+        drop(handle);
+
+        assert!(
+            wait_until_gone(grandchild),
+            "grandchild {grandchild} of group {leader} survived the handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_swept_group_is_not_signalled_again_on_drop() {
+        // Once the leader has been reaped the kernel may hand its group id to
+        // somebody else, so the drop guard has to stay out of the way.
+        let service = sh_service("quick", "exit 0");
+        let mut handle = ProcessHandle::spawn(&service, OutputMode::Capture).expect("spawned");
+        handle.wait("quick").await.expect("reaped");
+        handle
+            .kill_group("quick", Duration::from_secs(1))
+            .expect("sweeping an empty group is fine");
+        assert!(handle.swept);
+    }
 
     #[test]
     fn a_vanished_group_is_not_an_error() {
@@ -720,5 +871,41 @@ mod tests {
             exit_reason(std::process::ExitStatus::from_raw(9)),
             ExitReason::Signal(9)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_output_reader_is_aborted_so_the_event_channel_can_close() {
+        // A reader that overruns its drain timeout used to be detached rather
+        // than aborted, and a detached reader keeps the clone of the event sink
+        // it captured.  That one live sender keeps the service's event channel
+        // open forever, which strands the relay task that forwards from it, and
+        // the supervision task waiting on that relay never sends its report —
+        // so an operator's `stop` waits for an ack that nobody can send.
+        let (tx, mut rx) = crate::runtime::event_channel();
+        let service = sh_service("stuck", "exit 0");
+        let runner = ServiceRunner::new(
+            &service,
+            RunOptions::default().with_output(OutputMode::Capture),
+        )
+        .with_events(EventSink::new(tx));
+
+        // The writing half stands in for a descendant that inherited the
+        // child's stdout and survived the group sweep: the reader can never
+        // reach end-of-file on its own.
+        let (writer, pipe) = tokio::io::duplex(64);
+        let reader = runner.spawn_reader(pipe, Stream::Stdout);
+
+        ServiceRunner::drain_readers(vec![reader]).await;
+        // What the supervision task does once its runner has returned.
+        drop(runner);
+
+        let drained = tokio::time::timeout(Duration::from_secs(30), rx.recv()).await;
+        assert_eq!(
+            drained,
+            Ok(None),
+            "the event channel must close once the runner is done, even with a \
+             reader stuck on a pipe that never reaches end-of-file"
+        );
+        drop(writer);
     }
 }

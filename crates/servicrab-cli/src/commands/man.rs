@@ -57,25 +57,50 @@ services.
 .TP
 \fBNO_COLOR\fR
 Set to any value to disable coloured output.  Colour is also disabled when
-\fBTERM\fR is \fBdumb\fR, and whenever stdout is not a terminal.
+\fBTERM\fR is \fBdumb\fR, and for whichever of stdout and stderr is not a
+terminal.
+.TP
+\fBCLICOLOR_FORCE\fR
+Set to anything other than \fB0\fR to colour output even when it is redirected
+to a pipe or a file.  \fBNO_COLOR\fR wins over it; \fB--color\fR wins over both.
 .SH EXIT STATUS
 .TP
 \fB0\fR
 Success.  For \fBrun\fR and \fBup\fR this means the services were shut down as
-asked, not that they never failed.
+asked, not that they never failed.  \fBdown\fR uses it when a daemon was there
+and stopped.
 .TP
 \fB1\fR
-The command failed: an invalid configuration, no daemon running, an unknown
-service, or a service that exhausted its restart budget.
+The command failed: an invalid configuration, an unknown service, a service that
+exhausted its restart budget, a per-service command the daemon refused, or a
+\fBstart --wait\fR that timed out.
+.TP
+\fB3\fR
+No daemon is running for this project.  Its own status so that a script can tell
+"there is nothing to talk to" from a real failure, and it is what \fBstatus\fR,
+\fBstop\fR, \fBrestart\fR, \fBstart\fR \fISERVICE\fR, \fBreload\fR,
+\fBevents\fR and \fBdown\fR all report.  \fBdown\fR still does not \fIfail\fR
+because nothing was running — this only says there was nothing to do.
 .TP
 \fB126\fR, \fB127\fR
 \fBexec\fR could not run the command: found but not executable (126), or not
 found (127).  These follow the shell convention, so a script can tell a missing
 command from one that ran and failed.
 .TP
+\fB129\fR, \fB130\fR, \fB143\fR
+\fBup\fR and \fBwatch\fR were cut short by a signal and shut the stack down
+cleanly: \fBSIGHUP\fR (129), Ctrl+C (130), or \fBSIGTERM\fR (143).  These follow
+the \fB128+N\fR convention, and a clean shutdown is what they mean — not a
+failure.
+.TP
 \fBanything else\fR
 \fBexec\fR and \fBrun\fR pass through the status of the process they ran: its own
 exit code, or \fB128+N\fR when a signal \fIN\fR killed it.
+.PP
+Every error is written to standard error, prefixed with \fBerror: \fR, with the
+individual problems as bullets below it.  Under \fB--json\fR it is a JSON object
+on standard error instead, carrying \fBschema_version\fR and a stable \fBcode\fR,
+so that standard output holds nothing but the document that was asked for.
 .SH SEE ALSO
 Full documentation, including the configuration reference, at
 \fBhttps://github.com/gaborini/servicrab\fR
@@ -111,9 +136,14 @@ pub fn run<C: CommandFactory>(output: Option<&Path>) -> Result<(), String> {
     let page = page::<C>().map_err(|e| format!("failed to render the man page: {e}"))?;
 
     let Some(dir) = output else {
-        return std::io::stdout()
-            .write_all(&page)
-            .map_err(|e| format!("failed to write the man page: {e}"));
+        return match std::io::stdout().write_all(&page) {
+            Ok(()) => Ok(()),
+            // `servicrab man | head` closes the pipe partway through the page,
+            // and that is the reader saying it has seen enough — not a failure
+            // to report and not a reason to exit non-zero.
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(err) => Err(format!("failed to write the man page: {err}")),
+        };
     };
 
     std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;

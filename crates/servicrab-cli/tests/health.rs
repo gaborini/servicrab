@@ -366,6 +366,63 @@ on_unhealthy = "ignore"
 }
 
 #[test]
+fn a_dead_probe_still_reports_its_first_failure_but_not_every_tick() {
+    // `HealthProbeFailed` used to go out on every failing tick, so a probe that
+    // is dead for good under `on_unhealthy = "ignore"` was a perpetual event
+    // source.  The first failure still has to be reported — that is the one an
+    // operator acts on.
+    let dir = TempDir::new().unwrap();
+    let done = dir.path().join("done.txt");
+
+    script(
+        dir.path(),
+        "svc.sh",
+        &format!("sleep 2\necho done > {}", done.display()),
+    );
+    script(dir.path(), "probe.sh", "exit 1");
+
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+
+[project]
+name = "demo"
+
+[services.svc]
+command = ["{svc}"]
+restart = "never"
+
+[services.svc.health]
+command = ["{probe}"]
+interval = "100ms"
+retries = 1
+on_unhealthy = "ignore"
+"#,
+            svc = dir.path().join("svc.sh").display(),
+            probe = dir.path().join("probe.sh").display(),
+        ),
+    );
+
+    let (code, _stdout, stderr) = up(&cfg, &[]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    wait_for_file(&done);
+
+    let reports = stderr
+        .lines()
+        .filter(|l| l.contains("health probe failed"))
+        .count();
+    assert!(reports >= 1, "the first failure was not reported: {stderr}");
+    // Roughly twenty ticks fit into the two seconds the service runs, so an
+    // unthrottled monitor would report about twenty times.
+    assert!(
+        reports <= 3,
+        "a dead probe reported {reports} times; the throttle is not working:\n{stderr}"
+    );
+}
+
+#[test]
 fn a_tcp_probe_reports_a_listening_service_as_healthy() {
     let dir = TempDir::new().unwrap();
     // Pick a port by binding and releasing it immediately.

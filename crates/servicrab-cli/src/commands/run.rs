@@ -10,13 +10,15 @@ use std::path::Path;
 use servicrab_core::runtime::{lookup_service, OutputMode, RunOptions, RunOutcome};
 use servicrab_core::{
     event_channel, load, resolve_config_path, EventKind, EventReceiver, ExitReason,
-    ForegroundRunner, LogRouter, ShutdownReason, Stream,
+    ForegroundRunner, LogRouter, LogSink, ShutdownReason, Stream,
 };
 
 /// Exit code used when a run is cut short by Ctrl+C (`128 + SIGINT`).
 const EXIT_SIGINT: i32 = 130;
 /// Exit code used when the supervisor itself was terminated (`128 + SIGTERM`).
 const EXIT_SIGTERM: i32 = 143;
+/// Exit code used when the controlling terminal went away (`128 + SIGHUP`).
+const EXIT_SIGHUP: i32 = 129;
 
 /// Run the `run` subcommand, returning the process exit code to use.
 pub fn run(service: &str, config: Option<&Path>, no_restart: bool) -> Result<i32, String> {
@@ -97,12 +99,17 @@ fn foreground(
 }
 
 /// Echo captured output verbatim while copying it into the log file.
-async fn tee_output(mut events: EventReceiver, mut router: LogRouter) {
+///
+/// The file work runs on a blocking task, so a slow disk cannot stall the
+/// runtime that is waiting on the child.
+async fn tee_output(mut events: EventReceiver, router: LogRouter) {
+    let sink = LogSink::spawn(router);
+
     while let Some(event) = events.recv().await {
         let EventKind::Log { stream, line } = &event.kind else {
             continue;
         };
-        if let Some(problem) = router.record(&event.service, line) {
+        if let Some(problem) = sink.record(&event.service, line) {
             eprintln!("⚠  {problem}");
         }
         match stream {
@@ -118,6 +125,11 @@ async fn tee_output(mut events: EventReceiver, mut router: LogRouter) {
             }
         }
     }
+
+    // The run is over; the queued lines still have to reach the file.
+    if let Some(problem) = sink.shutdown().await {
+        eprintln!("⚠  {problem}");
+    }
 }
 
 /// Map a terminal [`RunOutcome`] to a process exit code.
@@ -131,6 +143,7 @@ fn exit_code(outcome: RunOutcome) -> i32 {
         RunOutcome::Stopped { reason } => match reason {
             ShutdownReason::UserInterrupt => EXIT_SIGINT,
             ShutdownReason::Terminated => EXIT_SIGTERM,
+            ShutdownReason::HangUp => EXIT_SIGHUP,
             // `run` supervises a single service with no daemon around it, so
             // nobody can ask for a targeted stop; treat it as a clean one.
             ShutdownReason::Requested => 0,
@@ -187,6 +200,12 @@ mod tests {
                 reason: ShutdownReason::Terminated
             }),
             143
+        );
+        assert_eq!(
+            exit_code(RunOutcome::Stopped {
+                reason: ShutdownReason::HangUp
+            }),
+            129
         );
         assert_eq!(
             exit_code(RunOutcome::Stopped {

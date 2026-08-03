@@ -86,8 +86,79 @@ impl StackOutcome {
     }
 }
 
+/// What a [`Control`] command did.  See the Unix implementation for the real
+/// thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ControlOutcome {
+    /// A service that was not running was spawned.
+    Started,
+    /// A running service was stopped and spawned again.
+    Restarted,
+    /// A running service was stopped.
+    Stopped,
+    /// Nothing was done: the service was not running to begin with.
+    AlreadyStopped,
+    /// A new configuration was applied to the running stack.
+    Reloaded {
+        /// Services started because the new configuration declares them.
+        added: usize,
+        /// Services restarted because their definition changed.
+        changed: usize,
+        /// Services stopped because the new configuration drops them.
+        removed: usize,
+    },
+}
+
+impl std::fmt::Display for ControlOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ControlOutcome::Started => f.write_str("started"),
+            ControlOutcome::Restarted => f.write_str("restarted"),
+            ControlOutcome::Stopped => f.write_str("stopped"),
+            ControlOutcome::AlreadyStopped => f.write_str("already stopped"),
+            ControlOutcome::Reloaded {
+                added: 0,
+                changed: 0,
+                removed: 0,
+            } => f.write_str("no changes"),
+            ControlOutcome::Reloaded {
+                added,
+                changed,
+                removed,
+            } => write!(f, "{added} added, {changed} changed, {removed} removed"),
+        }
+    }
+}
+
+/// Why a [`Control`] command was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ControlRefusal {
+    /// The stack does not supervise a service by that name.
+    UnknownService(ServiceName),
+    /// Another command for that service has not finished yet.
+    Busy(ServiceName),
+    /// The service is running already, so there was nothing to start.
+    AlreadyRunning(ServiceName),
+}
+
+impl std::fmt::Display for ControlRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ControlRefusal::UnknownService(service) => {
+                write!(f, "{service} is not part of the running stack")
+            }
+            ControlRefusal::Busy(service) => {
+                write!(f, "{service} is busy with another command")
+            }
+            ControlRefusal::AlreadyRunning(service) => write!(f, "{service} is already running"),
+        }
+    }
+}
+
 /// Acknowledgement channel for a [`Control`] command.
-pub type Ack = tokio::sync::oneshot::Sender<Result<String, String>>;
+pub type Ack = tokio::sync::oneshot::Sender<Result<ControlOutcome, ControlRefusal>>;
 
 /// A command an operator sends to a running stack.
 #[derive(Debug)]

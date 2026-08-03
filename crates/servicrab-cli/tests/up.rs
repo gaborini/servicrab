@@ -426,7 +426,194 @@ command = ["{0}"]
     );
 }
 
+/// A service that prints faster than the supervisor can render must not grow
+/// the supervisor's heap without limit.  The bound comes with a drop policy, and
+/// the policy has to be *visible*: the operator sees a `LogLinesDropped` event
+/// rather than silently missing output.
+#[test]
+fn a_flooding_service_has_its_output_dropped_and_says_so() {
+    // Far more than the channel's log-line allowance, and more than fits in the
+    // pipe the renderer writes to while it is blocked below.
+    const LINES: usize = 20_000;
+
+    let dir = TempDir::new().unwrap();
+    let printed = dir.path().join("printed");
+    script(
+        dir.path(),
+        "flood.sh",
+        &format!(
+            "awk 'BEGIN{{for (i = 1; i <= {LINES}; i++) print \"line \" i}}'\necho done > {}\nsleep 30",
+            printed.display()
+        ),
+    );
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+
+[project]
+name = "demo"
+
+[services.api]
+command = ["{0}"]
+restart = "never"
+"#,
+            dir.path().join("flood.sh").display()
+        ),
+    );
+
+    // Both streams are piped and neither is read yet, so the renderer blocks on
+    // its first full stdout write and the queue behind it has to absorb the
+    // flood — or refuse to.
+    let mut child = Command::new(binary())
+        .arg("up")
+        .arg("--config")
+        .arg(&cfg)
+        .env_remove("RUST_LOG")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn servicrab up");
+
+    // The script is done printing, so every line has been read off the pipe and
+    // either queued or dropped.
+    wait_for_file(&printed);
+
+    // Now let the renderer catch up, which is when it gets to the report.
+    let mut stdout = child.stdout.take().expect("stdout");
+    let drain = std::thread::spawn(move || {
+        let mut sink = String::new();
+        use std::io::Read;
+        let _ = stdout.read_to_string(&mut sink);
+        sink.lines().filter(|l| l.contains("line ")).count()
+    });
+
+    let mut stderr = std::io::BufReader::new(child.stderr.take().expect("stderr"));
+    let mut reported = None;
+    let deadline = Instant::now() + CEILING;
+    let mut seen = String::new();
+    while Instant::now() < deadline {
+        let mut line = String::new();
+        use std::io::BufRead;
+        if stderr.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        seen.push_str(&line);
+        if line.contains("dropped") {
+            reported = Some(line);
+            break;
+        }
+    }
+
+    kill(Pid::from_raw(child.id() as i32), Signal::SIGINT).unwrap();
+    wait_bounded(&mut child);
+    let rendered = drain.join().expect("drain thread");
+
+    let reported = reported.unwrap_or_else(|| {
+        panic!("the drop was never reported; stderr so far:\n{seen}\nrendered {rendered} line(s)")
+    });
+    assert!(
+        reported.contains("output line(s)"),
+        "unexpected report: {reported}"
+    );
+    // The verdict is the observable one: output really was dropped, so the
+    // supervisor never had to hold all of it.
+    assert!(
+        rendered < LINES,
+        "nothing was dropped, so the channel was not bounded ({rendered} of {LINES} rendered)"
+    );
+}
+
 // ── ordering, dependencies, shutdown ───────────────────────────────────────
+
+/// Ctrl+C has to work even when the operator's own output has backed up.
+///
+/// The renderer writes to stdout and stderr synchronously, and those writes
+/// block while the far end is not keeping up — which is the right thing to do
+/// to a slow terminal.  But a consumer that has stopped reading altogether (a
+/// parent that captured both pipes and reads them only after the child exits is
+/// the classic way to arrange this) leaves the renderer parked in a write that
+/// never returns.  The supervisor used to wait for that renderer before exiting,
+/// so `up` never exited at all: not in ten seconds, not in two minutes.
+///
+/// The verdict is the observable one an operator cares about: the service is
+/// gone and the process is gone, with the Ctrl+C exit code.
+#[test]
+fn a_ctrl_c_is_honoured_while_the_output_nobody_reads_is_backed_up() {
+    // Comfortably more than a pipe buffer holds once the renderer has prefixed
+    // it, so the renderer is certain to be parked in a write by the time the
+    // signal arrives.
+    const LINES: usize = 1_500;
+    const WIDTH: usize = 200;
+
+    let dir = TempDir::new().unwrap();
+    let printed = dir.path().join("printed");
+    let pidfile = dir.path().join("service.pid");
+    script(
+        dir.path(),
+        "noisy.sh",
+        &format!(
+            "echo $$ > {}\n\
+             awk 'BEGIN{{for (i = 1; i <= {LINES}; i++) printf \"warn %d {}\\n\", i}}' 1>&2\n\
+             echo done > {}\n\
+             sleep 30",
+            pidfile.display(),
+            "-".repeat(WIDTH),
+            printed.display()
+        ),
+    );
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+
+[project]
+name = "demo"
+
+[services.api]
+command = ["{0}"]
+restart = "never"
+"#,
+            dir.path().join("noisy.sh").display()
+        ),
+    );
+
+    // Both pipes are captured and neither is ever read, so every write the
+    // renderer makes past the first pipeful blocks for good.
+    let mut child = Command::new(binary())
+        .arg("up")
+        .arg("--config")
+        .arg(&cfg)
+        .env_remove("RUST_LOG")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn servicrab up");
+
+    wait_for_file(&pidfile);
+    let service = read_pid(&pidfile);
+    // Every line has been handed over, so the renderer has as much to write as
+    // it is ever going to get.
+    wait_for_file(&printed);
+
+    kill(Pid::from_raw(child.id() as i32), Signal::SIGINT).unwrap();
+    let code = wait_bounded(&mut child);
+
+    assert_eq!(
+        code, 130,
+        "a Ctrl+C that is honoured exits 130, whatever the output is doing"
+    );
+    // Nothing may be left behind, which is the promise the process groups exist
+    // for; the pid is the service's shell, which leads its own group.
+    assert!(
+        !is_alive(service),
+        "the service ({service}) outlived the supervisor"
+    );
+}
 
 /// The verdict comes from the supervisor's own event stream, not from what the
 /// two service scripts manage to write to a shared file.
@@ -918,10 +1105,17 @@ command = ["{}"]
     let (code, stdout, stderr) = up(&cfg, &["--json"]);
     assert_eq!(code, 0, "{stdout}{stderr}");
 
-    let events: Vec<serde_json::Value> = stdout
+    let lines: Vec<serde_json::Value> = stdout
         .lines()
         .map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("{line:?}: {e}")))
         .collect();
+
+    // The stream opens with the same handshake line the daemon answers a
+    // `subscribe` with, so a reader can treat all three streams identically.
+    let (header, events) = lines.split_first().expect("a handshake line");
+    assert_eq!(header["type"], "ok", "{stdout}");
+    assert_eq!(header["schema_version"], 1, "{stdout}");
+
     assert!(!events.is_empty(), "no events on stdout");
     assert!(events.iter().all(|e| e["type"] == "event"));
     assert!(events.iter().all(|e| e["service"] == "hello"));

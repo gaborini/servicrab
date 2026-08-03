@@ -9,22 +9,43 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use servicrab_core::runtime::stack::{
     control_channel, ServiceResult, StackOptions, StackSupervisor,
 };
 use servicrab_core::{
     event_channel, load, plan_stack, resolve_config_path, spawn_watchers, watched_services, Config,
-    EventKind, EventReceiver, LogRouter, Selection, ServiceName, ShutdownReason, SignalWatcher,
-    Stream,
+    EventKind, EventReceiver, LogRouter, LogSink, Selection, ServiceName, ShutdownReason,
+    SignalWatcher, Stream,
 };
 
+use crate::output::{self, CliError};
 use crate::style::{self, BOLD, DIM, RESET, SERVICE_COLORS};
 
 /// Exit code used when a run is cut short by Ctrl+C (`128 + SIGINT`).
 const EXIT_SIGINT: i32 = 130;
 /// Exit code used when the supervisor itself was terminated (`128 + SIGTERM`).
 const EXIT_SIGTERM: i32 = 143;
+/// Exit code used when the controlling terminal went away (`128 + SIGHUP`).
+const EXIT_SIGHUP: i32 = 129;
+
+/// How long the shutdown waits for the renderer to draw what is still queued.
+///
+/// Writing to the operator's stdout and stderr blocks while the other end is
+/// not keeping up, and while the stack is running that is exactly right: a
+/// terminal read slowly should slow the drawing down, not lose lines.  Once the
+/// stack has stopped, though, the only thing left to do is draw — and if
+/// nothing is reading at all, the write never returns.  Waiting for the
+/// renderer then means never exiting: the services are already stopped, the
+/// exit code is already decided, and the operator's Ctrl+C has to be worth
+/// something anyway.
+///
+/// Overrunning this costs the tail of the terminal output.  It does not cost
+/// the log files: lines reach `LogSink` before they are drawn, and its writer
+/// is a separate task that flushes whenever it catches up.
+const RENDER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Command-line options for `up`.
 #[derive(Debug, Clone, Copy, Default)]
@@ -50,39 +71,41 @@ pub fn run(
     selection: Selection<'_>,
     config: Option<&Path>,
     options: UpOptions,
-) -> Result<i32, String> {
-    let path = resolve_config_path(config).map_err(|e| format!("could not find config: {e}"))?;
+) -> Result<i32, CliError> {
+    let path = resolve_config_path(config)
+        .map_err(|e| CliError::from(format!("could not find config: {e}")).in_json(options.json))?;
 
     let (cfg, warnings) = load(&path).map_err(|errors| {
-        let msgs: Vec<String> = errors.iter().map(|e| format!("  • {e}")).collect();
-        format!(
-            "✗ {} has {} error(s):\n{}",
-            path.display(),
-            errors.len(),
-            msgs.join("\n")
+        CliError::new(
+            servicrab_protocol::ErrorCode::ValidationFailed,
+            format!("{} has {} error(s)", path.display(), errors.len()),
         )
+        .with_errors(errors.iter().map(ToString::to_string).collect())
+        .in_json(options.json)
     })?;
 
     for warning in &warnings {
         eprintln!("⚠  {warning}");
     }
 
-    let plan = plan_stack(&cfg, selection).map_err(|e| e.to_string())?;
+    let plan = plan_stack(&cfg, selection)
+        .map_err(|e| CliError::from(e.to_string()).in_json(options.json))?;
 
     let watched = watched_services(&cfg, &plan);
     if options.require_watch && watched.is_empty() {
         let names: Vec<&str> = plan.iter().map(|n| n.as_str()).collect();
-        return Err(format!(
+        return Err(CliError::from(format!(
             "nothing to watch: none of {} declares a [watch] block.\n\
              Add one, for example:\n\n\
              \x20 [services.{}.watch]\n\
              \x20 paths = [\"src\"]",
             names.join(", "),
             names.first().copied().unwrap_or("api"),
-        ));
+        ))
+        .in_json(options.json));
     }
 
-    let printer = Printer::new(&plan, options);
+    let printer = Arc::new(Printer::new(&plan, options));
     printer.banner(&cfg, &plan);
     printer.watching(&watched);
 
@@ -97,36 +120,57 @@ pub fn run(
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|e| format!("failed to start the async runtime: {e}"))?;
+        .map_err(|e| CliError::from(format!("failed to start the async runtime: {e}")))?;
 
-    let outcome = runtime.block_on(async move {
-        let signals = SignalWatcher::install(cfg.project.name.as_str())?;
-        let mut shutdown = signals.subscribe();
+    let outcome = runtime.block_on({
+        let printer = Arc::clone(&printer);
+        async move {
+            let signals = SignalWatcher::install(cfg.project.name.as_str())?;
+            let mut shutdown = signals.subscribe();
 
-        let (events_tx, events_rx) = event_channel();
-        let renderer = tokio::spawn(render(events_rx, printer, logs));
+            let (events_tx, events_rx) = event_channel();
+            let renderer = tokio::spawn(render(events_rx, printer, logs));
 
-        let (control_tx, control_rx) = control_channel();
-        let watchers = spawn_watchers(&cfg, &plan, &control_tx, &events_tx);
-        drop(control_tx);
+            let (control_tx, control_rx) = control_channel();
+            let watchers = spawn_watchers(&cfg, &plan, &control_tx, &events_tx);
+            drop(control_tx);
 
-        let supervisor =
-            StackSupervisor::new(&cfg, plan, stack_options, events_tx).with_control(control_rx);
-        let outcome = supervisor.run(&mut shutdown).await;
+            let supervisor =
+                StackSupervisor::new(&cfg, plan, stack_options, events_tx).with_control(control_rx);
+            let outcome = supervisor.run(&mut shutdown).await;
 
-        for watcher in watchers {
-            watcher.abort();
+            for watcher in watchers {
+                watcher.abort();
+            }
+
+            // The supervisor owned the last sender, so the renderer stops as
+            // soon as it has drained the queue — unless the far end of stdout or
+            // stderr has stopped reading, in which case it is parked in a write
+            // that will never return.  The stack is already stopped by now, so
+            // the wait for the drawing to finish is bounded and the exit does
+            // not depend on anyone consuming the output.
+            let drawn = tokio::time::timeout(RENDER_DRAIN_TIMEOUT, renderer).await;
+            if let Ok(joined) = &drawn {
+                // A renderer that panicked is a bug worth surfacing; one that
+                // could not finish drawing is not.
+                assert!(joined.is_ok(), "renderer task");
+            }
+
+            Ok::<_, servicrab_core::RuntimeError>((outcome, drawn.is_ok()))
         }
-
-        // The supervisor owned the last sender, so the renderer stops as soon
-        // as it has drained the queue.
-        let printer = renderer.await.expect("renderer task");
-        printer.summary(&outcome);
-
-        Ok::<_, servicrab_core::RuntimeError>(outcome)
     });
 
-    let outcome = outcome.map_err(|e| e.to_string())?;
+    let (outcome, drawn) = outcome.map_err(|e| CliError::from(e.to_string()))?;
+    if drawn {
+        printer.summary(&outcome);
+    }
+    // A renderer still parked in a write cannot be joined — a blocking write is
+    // not an await point, so the task can be neither aborted nor waited out —
+    // and dropping the runtime would wait for that thread.  Nothing is left to
+    // schedule that anybody is reading, so let the process exit collect it.
+    if !drawn {
+        runtime.shutdown_background();
+    }
 
     if !outcome.is_success() {
         return Ok(1);
@@ -134,6 +178,7 @@ pub fn run(
     Ok(match outcome.shutdown {
         Some(ShutdownReason::UserInterrupt) => EXIT_SIGINT,
         Some(ShutdownReason::Terminated) => EXIT_SIGTERM,
+        Some(ShutdownReason::HangUp) => EXIT_SIGHUP,
         Some(_) => 1,
         None => 0,
     })
@@ -141,33 +186,55 @@ pub fn run(
 
 /// Drain the event stream, rendering everything as it arrives and copying
 /// captured output to the log files when file logging is enabled.
-async fn render(
-    mut events: EventReceiver,
-    printer: Printer,
-    mut logs: Option<LogRouter>,
-) -> Printer {
+///
+/// The file work happens on a blocking task behind [`LogSink`], so a slow disk
+/// delays the log rather than the async worker that is also driving child
+/// `wait()`s, health probes and the control channel.
+///
+/// Drawing itself is synchronous and *does* block when the operator's terminal
+/// is not keeping up, which is the right back-pressure while services are
+/// running.  It is the caller's job to make sure the shutdown does not depend on
+/// this task finishing; see the drain timeout in [`run`].
+async fn render(mut events: EventReceiver, printer: Arc<Printer>, logs: Option<LogRouter>) {
+    let sink = logs.map(LogSink::spawn);
+
     while let Some(event) = events.recv().await {
-        if let (Some(router), EventKind::Log { line, .. }) = (logs.as_mut(), &event.kind) {
-            if let Some(problem) = router.record(&event.service, line) {
+        if let (Some(sink), EventKind::Log { line, .. }) = (sink.as_ref(), &event.kind) {
+            if let Some(problem) = sink.record(&event.service, line) {
                 printer.warn(&problem);
             }
         }
         printer.event(&event.service, &event.kind);
     }
-    printer
+
+    // The stack has stopped; wait for the queued lines to reach the disk before
+    // the process goes away, so a graceful stop never loses output.  This comes
+    // first because it is the durable half: the terminal is best-effort, the log
+    // file is not.
+    if let Some(sink) = sink {
+        if let Some(problem) = sink.shutdown().await {
+            printer.warn(&problem);
+        }
+    }
 }
 
 /// Renders runtime events for a terminal.
 struct Printer {
     colors: BTreeMap<ServiceName, &'static str>,
     width: usize,
-    color: bool,
+    /// Whether the stdout half of the output is coloured.  Both halves are
+    /// asked separately, because a stack whose stdout is redirected into a file
+    /// still has a terminal on stderr to draw progress on.
+    color_out: bool,
+    /// Whether the stderr half of the output is coloured.
+    color_err: bool,
     options: UpOptions,
 }
 
 impl Printer {
     fn new(plan: &[ServiceName], options: UpOptions) -> Self {
-        let color = style::color_enabled();
+        let color_out = style::color_enabled_for(style::Stream::Stdout);
+        let color_err = style::color_enabled_for(style::Stream::Stderr);
         let width = plan.iter().map(|n| n.as_str().len()).max().unwrap_or(0);
         let colors = plan
             .iter()
@@ -177,13 +244,18 @@ impl Printer {
         Self {
             colors,
             width,
-            color,
+            color_out,
+            color_err,
             options,
         }
     }
 
     fn banner(&self, config: &Config, plan: &[ServiceName]) {
         if self.options.json {
+            // The stream's own opening line, in place of the human banner:
+            // `events --json` and a raw `subscribe` both start this way, so a
+            // reader can treat all three identically.
+            output::print_stream_header();
             return;
         }
         let names: Vec<&str> = plan.iter().map(|n| n.as_str()).collect();
@@ -194,7 +266,7 @@ impl Printer {
         };
         eprintln!(
             "{} {} → {}",
-            style::paint(self.color, BOLD, command),
+            style::paint(self.color_err, BOLD, command),
             config.project.name,
             names.join(", ")
         );
@@ -208,7 +280,7 @@ impl Printer {
         eprintln!(
             "{}",
             style::paint(
-                self.color,
+                self.color_err,
                 DIM,
                 &format!("watching for changes: {}", names.join(", "))
             )
@@ -216,21 +288,21 @@ impl Printer {
     }
 
     /// `api    | ` (or an empty string when prefixes are disabled).
-    fn prefix(&self, service: &ServiceName) -> String {
+    fn prefix(&self, service: &ServiceName, color: bool) -> String {
         if self.options.no_prefix {
             return String::new();
         }
-        let color = self.colors.get(service).copied().unwrap_or(RESET);
+        let tint = self.colors.get(service).copied().unwrap_or(RESET);
         let label = format!("{:width$}", service.as_str(), width = self.width);
-        format!("{} {} ", style::paint(self.color, color, &label), "|")
+        format!("{} {} ", style::paint(color, tint, &label), "|")
     }
 
-    fn timestamp(&self) -> String {
+    fn timestamp(&self, color: bool) -> String {
         if !self.options.timestamps {
             return String::new();
         }
         let now = style::utc_hms(std::time::SystemTime::now());
-        format!("{} ", style::paint(self.color, DIM, &now))
+        format!("{} ", style::paint(color, DIM, &now))
     }
 
     fn event(&self, service: &ServiceName, kind: &EventKind) {
@@ -295,6 +367,11 @@ impl Printer {
                 "!",
                 &format!("watch: more than {limit} files; narrow `paths` or add `ignore` entries"),
             ),
+            EventKind::LogLinesDropped { count } => self.status(
+                service,
+                "!",
+                &format!("dropped {count} output line(s): faster than they could be consumed"),
+            ),
             // State transitions and the final summary are already conveyed by
             // the events above; showing them too would only add noise.
             EventKind::State(_) | EventKind::Finished { .. } => {}
@@ -317,14 +394,25 @@ impl Printer {
     }
 
     fn log(&self, service: &ServiceName, stream: Stream, line: &str) {
-        let text = format!("{}{}{}", self.timestamp(), self.prefix(service), line);
         match stream {
             Stream::Stdout => {
+                let text = format!(
+                    "{}{}{}",
+                    self.timestamp(self.color_out),
+                    self.prefix(service, self.color_out),
+                    line
+                );
                 let mut out = std::io::stdout().lock();
                 let _ = writeln!(out, "{text}");
                 let _ = out.flush();
             }
             Stream::Stderr => {
+                let text = format!(
+                    "{}{}{}",
+                    self.timestamp(self.color_err),
+                    self.prefix(service, self.color_err),
+                    line
+                );
                 let mut err = std::io::stderr().lock();
                 let _ = writeln!(err, "{text}");
                 let _ = err.flush();
@@ -337,9 +425,9 @@ impl Printer {
         let _ = writeln!(
             err,
             "{}{}{}",
-            self.timestamp(),
-            self.prefix(service),
-            style::paint(self.color, DIM, &format!("{symbol} {message}"))
+            self.timestamp(self.color_err),
+            self.prefix(service, self.color_err),
+            style::paint(self.color_err, DIM, &format!("{symbol} {message}"))
         );
         let _ = err.flush();
     }
@@ -358,7 +446,7 @@ impl Printer {
         if outcome.is_success() {
             eprintln!(
                 "{}",
-                style::paint(self.color, DIM, "all services stopped cleanly")
+                style::paint(self.color_err, DIM, "all services stopped cleanly")
             );
             return;
         }
@@ -418,7 +506,7 @@ mod tests {
     fn prefixes_are_padded_to_the_longest_name() {
         let plan = vec![service("api"), service("database")];
         let printer = Printer::new(&plan, UpOptions::default());
-        let prefix = printer.prefix(&plan[0]);
+        let prefix = printer.prefix(&plan[0], false);
         assert!(
             prefix.starts_with("api     "),
             "unexpected prefix {prefix:?}"
@@ -436,14 +524,22 @@ mod tests {
                 ..UpOptions::default()
             },
         );
-        assert_eq!(printer.prefix(&plan[0]), "");
+        assert_eq!(printer.prefix(&plan[0], false), "");
+    }
+
+    #[test]
+    fn a_prefix_is_only_coloured_for_the_stream_that_allows_it() {
+        let plan = vec![service("api")];
+        let printer = Printer::new(&plan, UpOptions::default());
+        assert!(printer.prefix(&plan[0], true).contains("\x1b["));
+        assert!(!printer.prefix(&plan[0], false).contains("\x1b["));
     }
 
     #[test]
     fn timestamps_are_only_added_when_requested() {
         let plan = vec![service("api")];
         let plain = Printer::new(&plan, UpOptions::default());
-        assert_eq!(plain.timestamp(), "");
+        assert_eq!(plain.timestamp(false), "");
 
         let stamped = Printer::new(
             &plan,
@@ -452,7 +548,7 @@ mod tests {
                 ..UpOptions::default()
             },
         );
-        let stamp = stamped.timestamp();
+        let stamp = stamped.timestamp(false);
         assert_eq!(stamp.trim().len(), 8, "expected HH:MM:SS, got {stamp:?}");
     }
 }

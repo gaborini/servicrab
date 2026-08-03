@@ -1,6 +1,6 @@
 [package]
 name = "servicrab"
-description = "A lightweight cross-platform process supervisor for local development stacks, homelabs, and small servers"
+description = "A lightweight process supervisor for local development stacks, homelabs, and small servers (Linux and macOS)"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -41,4 +41,6 @@ assert_cmd = "2"
 predicates = "3"
 
 [target.'cfg(unix)'.dev-dependencies]
-nix = { workspace = true }
+# `term` is only for the tests: a colour decision is about whether a stream is a
+# terminal, so proving it needs a real one on one stream and a pipe on the other.
+nix = { workspace = true, features = ["term"] }

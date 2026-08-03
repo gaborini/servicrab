@@ -4,31 +4,48 @@ use std::path::Path;
 
 use serde::Serialize;
 use servicrab_core::{load, resolve_config_path, Service, ServiceName};
+use servicrab_protocol::ErrorCode;
+
+use crate::output::{self, CliError};
 
 /// Run the `list` subcommand.
-pub fn run(config: Option<&Path>, json: bool) -> Result<(), String> {
-    let path = resolve_config_path(config).map_err(|e| format!("could not find config: {e}"))?;
+pub fn run(config: Option<&Path>, json: bool) -> Result<(), CliError> {
+    let path = resolve_config_path(config)
+        .map_err(|e| CliError::from(format!("could not find config: {e}")).in_json(json))?;
 
-    let (cfg, _) = load(&path).map_err(|errors| {
-        let msgs: Vec<String> = errors.iter().map(|e| format!("  • {e}")).collect();
-        format!(
-            "✗ {} has {} error(s):\n{}",
-            path.display(),
-            errors.len(),
-            msgs.join("\n")
+    let (cfg, warnings) = load(&path).map_err(|errors| {
+        CliError::new(
+            ErrorCode::ValidationFailed,
+            format!("{} has {} error(s)", path.display(), errors.len()),
         )
+        .with_errors(errors.iter().map(ToString::to_string).collect())
+        .in_json(json)
     })?;
 
-    if json {
-        print_json(&cfg.services);
-    } else {
-        print_table(&cfg.services, &cfg.project.name.to_string());
+    for warning in &warnings {
+        eprintln!("⚠  {warning}");
     }
+
+    if json {
+        return print_json(&cfg.project.name.to_string(), &cfg.services);
+    }
+    print_table(&cfg.services, &cfg.project.name.to_string());
 
     Ok(())
 }
 
 // ── JSON output ────────────────────────────────────────────────────────────
+
+/// The `list --json` document.
+///
+/// An envelope rather than the bare array this used to print: every `--json`
+/// document carries a `schema_version`, and an array has nowhere to put one.
+/// The services themselves are still an array, under `services`.
+#[derive(Serialize)]
+struct ListJson<'a> {
+    project: &'a str,
+    services: Vec<ServiceJson<'a>>,
+}
 
 #[derive(Serialize)]
 struct ServiceJson<'a> {
@@ -55,7 +72,10 @@ struct DependencyJson<'a> {
     condition: String,
 }
 
-fn print_json(services: &std::collections::BTreeMap<ServiceName, Service>) {
+fn print_json(
+    project: &str,
+    services: &std::collections::BTreeMap<ServiceName, Service>,
+) -> Result<(), CliError> {
     let list: Vec<ServiceJson<'_>> = services
         .values()
         .map(|svc| {
@@ -79,10 +99,10 @@ fn print_json(services: &std::collections::BTreeMap<ServiceName, Service>) {
         })
         .collect();
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&list).expect("JSON serialization")
-    );
+    output::print_document(ListJson {
+        project,
+        services: list,
+    })
 }
 
 /// The dependencies of one service, each with its effective condition.
@@ -107,6 +127,26 @@ fn dependencies<'a>(
 
 // ── Human-readable table ───────────────────────────────────────────────────
 
+/// Shorten a command line to at most `max` characters, marking the cut with
+/// an ellipsis.
+///
+/// The width is counted in characters and the slice is taken at a character
+/// boundary: `len()` is in bytes, so slicing on a byte offset panics as soon as
+/// a command contains an accented path, an emoji or any other multi-byte
+/// character.  Grapheme clusters can still be split — this is a column preview,
+/// not a faithful rendering — but the output is always valid UTF-8.
+fn truncate(cmd: &str, max: usize) -> String {
+    debug_assert!(max > 0, "a preview needs room for at least the ellipsis");
+    // The character *after* the last one that fits, plus whatever follows it.
+    let mut rest = cmd.char_indices().skip(max - 1);
+    match (rest.next(), rest.next()) {
+        // Only `max` characters at most: the ellipsis would cost more than the
+        // one character it would hide.
+        (Some((cut, _)), Some(_)) => format!("{}…", &cmd[..cut]),
+        _ => cmd.to_string(),
+    }
+}
+
 fn print_table(services: &std::collections::BTreeMap<ServiceName, Service>, project: &str) {
     println!("Project: {project}");
     println!();
@@ -123,11 +163,7 @@ fn print_table(services: &std::collections::BTreeMap<ServiceName, Service>, proj
         let mut cmd_parts = vec![svc.executable.as_str()];
         cmd_parts.extend(svc.args.iter().map(String::as_str));
         let cmd_str = cmd_parts.join(" ");
-        let cmd_preview = if cmd_str.len() > 30 {
-            format!("{}…", &cmd_str[..29])
-        } else {
-            cmd_str
-        };
+        let cmd_preview = truncate(&cmd_str, 30);
         println!(
             "{:<24} {:<12} {:<8} {}",
             svc.name.as_str(),
@@ -152,5 +188,39 @@ fn print_table(services: &std::collections::BTreeMap<ServiceName, Service>, proj
                 humantime::format_duration(health.interval)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_short_command_is_left_alone() {
+        assert_eq!(truncate("echo hi", 30), "echo hi");
+        // Exactly at the limit, so nothing is hidden and no ellipsis is needed.
+        assert_eq!(truncate(&"a".repeat(30), 30), "a".repeat(30));
+    }
+
+    #[test]
+    fn a_long_command_is_cut_with_an_ellipsis() {
+        assert_eq!(
+            truncate(&"a".repeat(31), 30),
+            format!("{}…", "a".repeat(29))
+        );
+    }
+
+    #[test]
+    fn a_multi_byte_command_is_cut_on_a_character_boundary() {
+        // Byte 29 lands inside the last '€', which is what used to panic.
+        let cmd = "echo x€€€€€€€€€";
+        assert_eq!(truncate(cmd, 30), cmd, "15 characters is under the limit");
+
+        // Long enough to be cut, with the cut point inside a multi-byte
+        // character: the result must stay valid UTF-8 and count characters.
+        let long = format!("echo {}", "€".repeat(40));
+        let cut = truncate(&long, 30);
+        assert_eq!(cut.chars().count(), 30, "29 characters plus the ellipsis");
+        assert!(cut.ends_with('…'), "{cut}");
     }
 }

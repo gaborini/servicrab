@@ -50,13 +50,13 @@ pub use event::{
 pub use filewatch::{scan, spawn_watchers, watch_service, watched_services, FileStamp, Scan};
 #[cfg(unix)]
 pub use health::{HealthMonitor, HealthSignal};
-pub use logs::{LogRouter, LogWriter};
+pub use logs::{LogRouter, LogSink, LogWriter};
 pub use plan::{
     known_profiles, known_services, lookup_service, plan_stack, with_dependents, Selection,
 };
 pub use stack::{
-    control_channel, Ack, Control, ControlRx, ControlTx, Readiness, ServiceReport, ServiceResult,
-    StackOptions, StackOutcome, StackSupervisor,
+    control_channel, Ack, Control, ControlOutcome, ControlRefusal, ControlRx, ControlTx, Readiness,
+    ServiceReport, ServiceResult, StackOptions, StackOutcome, StackSupervisor,
 };
 pub use status::{Health, ServiceStatus, StatusRegistry};
 

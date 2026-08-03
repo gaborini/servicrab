@@ -19,7 +19,11 @@ use crate::raw::{
 };
 
 /// The only supported schema version.
-const SUPPORTED_VERSION: u32 = 1;
+///
+/// Read by [`crate::load::load`] too: the check there runs before the
+/// field-level parse, because a file written for a later schema is made of
+/// fields this build does not know and would otherwise be reported as a typo.
+pub(crate) const SUPPORTED_VERSION: u32 = 1;
 
 // Duration range constants
 const DUR_100MS: Duration = Duration::from_millis(100);
@@ -187,6 +191,9 @@ pub fn validate_raw(
             &mut errors,
         );
 
+        // No range check to make: every `u32` is meaningful, and `0` is the
+        // unlimited budget rather than an out-of-domain value (see
+        // `RestartTracker::budget_left`).
         let max_restarts = raw_svc.max_restarts.unwrap_or(10);
 
         let stable_after = parse_duration_field(
@@ -248,6 +255,33 @@ pub fn validate_raw(
                     });
                 }
             }
+
+            // Not one of the fields above, because the setting is not inert:
+            // an unhealthy service still gets stopped, it just never comes
+            // back.  Only an explicit `restart` is warned about — the default
+            // covers the legitimate case of a health check used purely to gate
+            // dependents, where nothing is meant to be restarted.
+            let asks_for_restart = raw_svc
+                .health
+                .as_ref()
+                .is_some_and(|health| health.on_unhealthy.as_deref() == Some("restart"));
+            if asks_for_restart {
+                warnings.push(ConfigWarning::UnhealthyRestartWithoutPolicy {
+                    service: raw_name.clone(),
+                });
+            }
+        }
+
+        // Warning: a service that asks to be logged in a project that has no
+        // log directory.  `log_to_file` above is computed either way, but
+        // `LogRouter` is only built when `[project.logs]` exists, so the
+        // request is silently inert.  The raw table is what is checked, not the
+        // validated one, so a broken `[project.logs]` reports its own error
+        // instead of also producing this warning.
+        if raw.project.logs.is_none() && raw_svc.logs.as_ref().is_some_and(|logs| logs.enabled) {
+            warnings.push(ConfigWarning::LogsWithoutProjectLogs {
+                service: raw_name.clone(),
+            });
         }
 
         // Warning: executable not in PATH
@@ -988,8 +1022,20 @@ fn validate_health(
     };
 
     // `retries` is the number of consecutive failures needed to declare the
-    // service unhealthy, so it is always at least one probe.
-    let retries = raw.retries.unwrap_or(3).max(1);
+    // service unhealthy, so it is always at least one probe.  Zero used to be
+    // rewritten to one; it is an error now, like every other out-of-domain
+    // value in this file, because silently disagreeing with the config is a
+    // worse answer than refusing it.
+    let retries = match raw.retries {
+        Some(0) => {
+            errors.push(ConfigError::InvalidHealthRetries {
+                service: service.to_string(),
+            });
+            1
+        }
+        Some(retries) => retries,
+        None => 3,
+    };
 
     Some(HealthCheck {
         probe: probe?,
@@ -1559,21 +1605,21 @@ interval = "10ms""#,
     }
 
     #[test]
-    fn zero_retries_are_normalised_to_one() {
-        let (cfg, _) = load_from_str(&with_health(
+    fn zero_retries_are_rejected() {
+        // A service cannot be declared unhealthy without a single failed
+        // probe, so zero is out of domain rather than a value to be corrected.
+        let err = expect_one_error(&with_health(
             r#"tcp = "127.0.0.1:5432"
 retries = 0"#,
-        ))
-        .unwrap();
-        let health = cfg
-            .services
-            .values()
-            .next()
-            .unwrap()
-            .health
-            .clone()
-            .unwrap();
-        assert_eq!(health.retries, 1);
+        ));
+        assert!(
+            matches!(err, ConfigError::InvalidHealthRetries { .. }),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains("retries must be at least 1"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2531,6 +2577,153 @@ restart_delay = "2s"
                 }
             )),
             "expected restart_delay warning"
+        );
+    }
+
+    #[test]
+    fn max_restarts_warns_when_restart_never() {
+        let toml = r#"
+version = 1
+[project]
+name = "p"
+[services.s]
+command = ["echo"]
+restart = "never"
+max_restarts = 5
+"#;
+        let (_, warnings) = load_from_str(toml).unwrap();
+        assert!(
+            warnings.iter().any(|w| matches!(
+                w,
+                ConfigWarning::RestartSettingsIgnored {
+                    field: "max_restarts",
+                    ..
+                }
+            )),
+            "expected max_restarts warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn service_logs_warn_without_a_project_logs_table() {
+        let toml = r#"
+version = 1
+[project]
+name = "p"
+[services.s]
+command = ["echo"]
+[services.s.logs]
+enabled = true
+"#;
+        let (_, warnings) = load_from_str(toml).unwrap();
+        let warning = warnings
+            .iter()
+            .find(|w| matches!(w, ConfigWarning::LogsWithoutProjectLogs { .. }))
+            .unwrap_or_else(|| panic!("expected a logs warning, got: {warnings:?}"));
+        let msg = warning.to_string();
+        assert!(msg.contains("\"s\""), "{msg}");
+        assert!(msg.contains("[project.logs]"), "{msg}");
+    }
+
+    #[test]
+    fn service_logs_are_silent_when_the_project_declares_a_log_directory() {
+        let (_, warnings) = load_from_str(&with_logs("", "[services.api.logs]\nenabled = true"))
+            .expect("valid config");
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| matches!(w, ConfigWarning::LogsWithoutProjectLogs { .. })),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn disabled_service_logs_do_not_warn() {
+        // `enabled = false` is inert in exactly the same way, but it says the
+        // same thing the missing table does, so there is nothing to point out.
+        let toml = r#"
+version = 1
+[project]
+name = "p"
+[services.s]
+command = ["echo"]
+[services.s.logs]
+enabled = false
+"#;
+        let (_, warnings) = load_from_str(toml).unwrap();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| matches!(w, ConfigWarning::LogsWithoutProjectLogs { .. })),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn on_unhealthy_restart_warns_when_restart_never() {
+        let toml = r#"
+version = 1
+[project]
+name = "p"
+[services.s]
+command = ["echo"]
+restart = "never"
+[services.s.health]
+tcp = "127.0.0.1:5432"
+on_unhealthy = "restart"
+"#;
+        let (_, warnings) = load_from_str(toml).unwrap();
+        let warning = warnings
+            .iter()
+            .find(|w| matches!(w, ConfigWarning::UnhealthyRestartWithoutPolicy { .. }))
+            .unwrap_or_else(|| panic!("expected an on_unhealthy warning, got: {warnings:?}"));
+        let msg = warning.to_string();
+        assert!(msg.contains("\"s\""), "{msg}");
+        assert!(msg.contains("on_unhealthy"), "{msg}");
+    }
+
+    #[test]
+    fn on_unhealthy_restart_is_silent_with_a_restart_policy() {
+        let toml = r#"
+version = 1
+[project]
+name = "p"
+[services.s]
+command = ["echo"]
+restart = "on-failure"
+[services.s.health]
+tcp = "127.0.0.1:5432"
+on_unhealthy = "restart"
+"#;
+        let (_, warnings) = load_from_str(toml).unwrap();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| matches!(w, ConfigWarning::UnhealthyRestartWithoutPolicy { .. })),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_health_check_used_only_for_gating_does_not_warn() {
+        // No explicit `on_unhealthy`, so this is the readiness-gating case:
+        // `restart = "never"` is the intended configuration, not a trap.
+        let toml = r#"
+version = 1
+[project]
+name = "p"
+[services.s]
+command = ["echo"]
+restart = "never"
+[services.s.health]
+tcp = "127.0.0.1:5432"
+"#;
+        let (_, warnings) = load_from_str(toml).unwrap();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| matches!(w, ConfigWarning::UnhealthyRestartWithoutPolicy { .. })),
+            "{warnings:?}"
         );
     }
 

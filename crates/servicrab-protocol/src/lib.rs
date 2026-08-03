@@ -18,4 +18,21 @@ pub mod response;
 
 pub use frame::{decode, encode, FrameError};
 pub use request::Request;
-pub use response::{Event, Health, Response, ServiceInfo, ServiceState, Stream};
+pub use response::{
+    ErrorCode, Event, Health, ReloadChanges, Response, ServiceInfo, ServiceState, Stream,
+    SCHEMA_VERSION, UNKNOWN,
+};
+
+/// Which revision of this wire format this build speaks.
+///
+/// It is not the crate version: the two move independently, and a release that
+/// changes nothing on the socket must not make every daemon look mismatched.
+/// It travels in the `ping`/`pong` exchange as an `Option`, because 0.3 spoke
+/// this format without naming it and "did not say" has to stay distinguishable
+/// from "said 0".
+///
+/// Nothing refuses to talk on the strength of this number.  Both sides decode
+/// leniently — see [`UNKNOWN`] — so a mismatch is a thing to report, not a thing
+/// to fail on, and the report is what turns "my command silently did nothing
+/// useful" into "this daemon is older than this client".
+pub const PROTOCOL_VERSION: u32 = 1;

@@ -2,6 +2,7 @@
 
 #![cfg(unix)]
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
@@ -359,6 +360,204 @@ restart = "never"
 }
 
 #[test]
+fn a_sustained_append_is_never_followed_into_a_duplicate_line() {
+    // The bug this pins: `follow` sampled the file length, read to whatever the
+    // current end was — which by then could be past that length — and then set
+    // the offset back to the stale sample.  Everything appended in between came
+    // out again on the next pass.  A writer that never pauses is what makes that
+    // window land on every pass, so the assertion is simply that no line is ever
+    // printed twice.
+    const LINES: usize = 6_000;
+    /// Paced so the writer is still appending during every follow pass: at 200µs
+    /// a line, the flood outlasts several of the 200ms polls, which is exactly
+    /// when a read can run past a length sampled before it started.
+    const PACE: Duration = Duration::from_micros(200);
+
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join("logs")).unwrap();
+    let log = dir.path().join("logs/api.log");
+    // A tail to start from, so the follower has an offset that is not zero.
+    fs::write(&log, "line 0\n").unwrap();
+
+    let cfg = config(
+        dir.path(),
+        r#"
+version = 1
+[project]
+name = "demo"
+[project.logs]
+dir = "logs"
+[services.api]
+command = ["true"]
+restart = "never"
+"#,
+    );
+
+    let mut follower = spawn(&["logs", "-f", "-n", "1"], &cfg);
+    let reader = BufReader::new(follower.stdout.take().unwrap());
+
+    // Nothing supervises this file: the writer here is the test, so the flood is
+    // under its control rather than a service's.
+    let appender = std::thread::spawn({
+        let log = log.clone();
+        move || {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new().append(true).open(&log).unwrap();
+            for i in 1..=LINES {
+                writeln!(file, "line {i}").unwrap();
+                file.flush().unwrap();
+                std::thread::sleep(PACE);
+            }
+        }
+    });
+
+    let mut seen: Vec<String> = Vec::new();
+    let last = format!("line {LINES}");
+    // Draining stdout on its own thread keeps two things true at once: the
+    // follower never stalls on a full pipe (it has to keep polling a growing
+    // file, or the duplicate this test hunts for could not arise), and the wait
+    // below can be bounded by something other than a stopwatch.
+    let (lines_tx, lines_rx) = std::sync::mpsc::channel();
+    let drain = std::thread::spawn(move || {
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            if lines_tx.send(line.trim().to_string()).is_err() {
+                break;
+            }
+        }
+    });
+
+    // The condition is silence, not elapsed time. `CEILING` used to have to
+    // cover the paced flood *and* the follow of it, and the flood alone is
+    // `LINES * PACE` of sleeping — a floor rather than a duration, since every
+    // sleep overruns and on a loaded runner it overruns by enough that the
+    // deadline expired while the writer was still mid-file. That failed a
+    // follower that was working perfectly, blaming whichever line the clock cut
+    // it off at. A follow that has genuinely stopped is instead recognisable by
+    // what it does: it goes quiet and stays quiet, however slow the machine.
+    while let Ok(line) = lines_rx.recv_timeout(CEILING) {
+        let done = line == last;
+        seen.push(line);
+        if done {
+            break;
+        }
+    }
+
+    appender.join().unwrap();
+    let _ = follower.kill();
+    let _ = follower.wait();
+    drop(lines_rx);
+    let _ = drain.join();
+
+    let mut once: BTreeSet<&String> = BTreeSet::new();
+    let mut twice: Vec<&String> = Vec::new();
+    for line in &seen {
+        if !once.insert(line) {
+            twice.push(line);
+        }
+    }
+    assert!(
+        twice.is_empty(),
+        "{} line(s) came out more than once, e.g. {:?}",
+        twice.len(),
+        &twice[..twice.len().min(5)]
+    );
+    assert!(
+        seen.iter().any(|l| l == &format!("line {LINES}")),
+        "the follow stopped early: last was {:?}",
+        seen.last()
+    );
+}
+
+#[test]
+fn a_line_still_being_written_is_printed_once_and_whole() {
+    // A log file ends mid-line whenever a service is in the middle of writing
+    // one.  Treating that fragment as a finished line printed it immediately and
+    // then again, in full, once its newline arrived.
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join("logs")).unwrap();
+    let log = dir.path().join("logs/api.log");
+    fs::write(&log, "complete\n").unwrap();
+
+    let cfg = config(
+        dir.path(),
+        r#"
+version = 1
+[project]
+name = "demo"
+[project.logs]
+dir = "logs"
+[services.api]
+command = ["true"]
+restart = "never"
+"#,
+    );
+
+    let mut follower = spawn(&["logs", "-f", "-n", "1"], &cfg);
+    let mut reader = BufReader::new(follower.stdout.take().unwrap());
+
+    let mut first = String::new();
+    reader.read_line(&mut first).unwrap();
+    assert_eq!(first.trim(), "complete");
+
+    {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new().append(true).open(&log).unwrap();
+        write!(file, "half a").unwrap();
+        file.flush().unwrap();
+        // Long enough that a follow pass has certainly seen the fragment.
+        std::thread::sleep(Duration::from_millis(500));
+        writeln!(file, " line").unwrap();
+        file.flush().unwrap();
+    }
+
+    let mut second = String::new();
+    reader.read_line(&mut second).unwrap();
+    let _ = follower.kill();
+    let _ = follower.wait();
+
+    assert_eq!(
+        second.trim(),
+        "half a line",
+        "the fragment was printed before it was finished"
+    );
+}
+
+#[test]
+fn a_log_line_that_is_not_utf8_does_not_stop_the_command() {
+    // A service is free to print a stray byte — a binary blob, output in another
+    // encoding, a multi-byte character caught mid-write.  That used to fail the
+    // whole command, and silently cut a follow short at the offending line.
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join("logs")).unwrap();
+    fs::write(
+        dir.path().join("logs/api.log"),
+        b"before\n\xff\xfe not text\nafter\n",
+    )
+    .unwrap();
+
+    let cfg = config(
+        dir.path(),
+        r#"
+version = 1
+[project]
+name = "demo"
+[project.logs]
+dir = "logs"
+[services.api]
+command = ["true"]
+restart = "never"
+"#,
+    );
+
+    let (code, stdout, stderr) = cli(&["logs"], &cfg);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("before"), "{stdout}");
+    assert!(stdout.contains("after"), "{stdout}");
+    assert!(stdout.contains('\u{fffd}'), "{stdout}");
+}
+
+#[test]
 fn logs_explains_that_file_logging_is_off() {
     let dir = TempDir::new().unwrap();
     let hello = script(dir.path(), "hello.sh", "echo hi");
@@ -407,6 +606,35 @@ command = ["{}"]
 }
 
 #[test]
+fn logs_reports_config_warnings() {
+    let dir = TempDir::new().unwrap();
+    let hello = script(dir.path(), "hello.sh", "echo hi");
+    // `max_restarts` alongside `restart = "never"` is inert, so loading warns.
+    // `logs` used to throw those warnings away, unlike the other commands.
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[project.logs]
+[services.api]
+command = ["{}"]
+restart = "never"
+max_restarts = 3
+"#,
+            hello.display()
+        ),
+    );
+
+    // The command itself still fails (nothing has been captured), which is
+    // exactly the case where a warning is easiest to lose.
+    let (_, _, stderr) = cli(&["logs"], &cfg);
+    assert!(stderr.contains("max_restarts"), "{stderr}");
+}
+
+#[test]
 fn logs_reports_when_nothing_has_been_captured_yet() {
     let dir = TempDir::new().unwrap();
     let hello = script(dir.path(), "hello.sh", "echo hi");
@@ -425,9 +653,83 @@ command = ["{}"]
         ),
     );
 
-    let (code, _, stderr) = cli(&["logs"], &cfg);
-    assert_eq!(code, 1);
+    // An empty log directory is what a stack that has not run yet looks like,
+    // so this says so and succeeds; `servicrab logs && …` is not a failure path.
+    let (code, stdout, stderr) = cli(&["logs"], &cfg);
+    assert_eq!(code, 0, "{stderr}");
     assert!(stderr.contains("no log output yet"), "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+}
+
+#[test]
+fn every_line_reaches_the_file_across_a_graceful_stop() {
+    // The writer batches its flushes, so the interesting case is the tail: the
+    // lines that were still buffered when the stack was asked to stop.  They
+    // have to be on disk by the time the process exits, in order, with nothing
+    // missing in between.
+    // Fewer than the event channel's log-line allowance, so nothing is dropped
+    // and the batched flush is what the test is about; far more than one flush
+    // batch, so the tail really is still buffered when the stop arrives.
+    const LINES: usize = 900;
+
+    let dir = TempDir::new().unwrap();
+    let done = dir.path().join("printed");
+    let chatty = script(
+        dir.path(),
+        "chatty.sh",
+        &format!(
+            "awk 'BEGIN{{for (i = 1; i <= {LINES}; i++) print \"line \" i}}'\necho printed > {}\nsleep 30",
+            done.display()
+        ),
+    );
+    let cfg = config(
+        dir.path(),
+        &format!(
+            r#"
+version = 1
+[project]
+name = "demo"
+[project.logs]
+dir = "logs"
+max_size = "1MB"
+max_files = 1
+[services.api]
+command = ["{}"]
+restart = "never"
+"#,
+            chatty.display()
+        ),
+    );
+
+    let mut stack = spawn(&["up"], &cfg);
+    // Keep reading the terminal output, so the renderer never stalls on a full
+    // pipe: what is being tested here is the batched flush, not the drop policy
+    // that a stalled consumer would trigger.
+    let terminal = stack.stdout.take().expect("stdout");
+    let drain = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut sink = Vec::new();
+        let _ = std::io::BufReader::new(terminal).read_to_end(&mut sink);
+    });
+
+    // The script is done printing, so every line is either in the pipe, in the
+    // queue or already written — a stop from here must lose none of them.
+    wait_for_file(&done);
+    interrupt(&stack);
+    wait_bounded(&mut stack);
+    drain.join().expect("drain thread");
+
+    let written = fs::read_to_string(dir.path().join("logs/api.log")).unwrap();
+    let seen: Vec<&str> = written.lines().collect();
+    let expected: Vec<String> = (1..=LINES).map(|i| format!("line {i}")).collect();
+    assert_eq!(
+        seen.len(),
+        LINES,
+        "lost {} line(s) of output; last written was {:?}",
+        LINES - seen.len().min(LINES),
+        seen.last()
+    );
+    assert_eq!(seen, expected, "output was reordered");
 }
 
 #[test]

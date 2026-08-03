@@ -4,7 +4,14 @@
 //! lets the CLI decide how to render them.  This keeps process handling and
 //! user-facing presentation cleanly separated, and gives the future daemon a
 //! ready-made stream to forward over its socket.
+//!
+//! The channel is unbounded for everything the supervisor says *about* a
+//! service — that traffic is bounded by the number of services — but the
+//! captured output that flows through it is not, so log lines get an explicit
+//! allowance and an explicit drop policy.  See [`MAX_QUEUED_LOG_LINES`].
 
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -111,6 +118,12 @@ pub enum EventKind {
         /// How many files the watcher is willing to scan.
         limit: usize,
     },
+    /// Captured output was dropped because the service produced it faster than
+    /// the supervisor could consume it.
+    LogLinesDropped {
+        /// How many lines were dropped since this was last reported.
+        count: u64,
+    },
     /// The service failed fatally.
     Failed {
         /// A human-readable description of the failure.
@@ -134,14 +147,160 @@ impl ServiceEvent {
     }
 }
 
+/// How many captured log lines may be queued on one event channel.
+///
+/// The channel itself is unbounded, and stays that way for everything the
+/// supervisor sends about its services: the number of lifecycle, health and
+/// watch events in flight is bounded by the number of services.  Log lines are
+/// not — they are bounded only by what a child chooses to print — and they
+/// travel to a consumer that writes files, so a single noisy service could
+/// grow the supervisor's heap without limit.
+///
+/// The stack relays each service's events through a per-service channel into the
+/// global one, so the allowance is per channel and the supervisor's total is
+/// this many lines per running service plus this many on the global stream.
+/// That is a bound, which is the point; it is not a tight one.
+pub const MAX_QUEUED_LOG_LINES: usize = 1024;
+
+/// Report dropped lines at least this often while the flood continues.
+///
+/// A drop is normally reported as soon as the flood lets up; this is the
+/// backstop for a service that never stops flooding.
+const REPORT_DROPS_EVERY: u64 = 1024;
+
+/// How much of the allowance has to be free again before the flood counts as
+/// over.
+///
+/// A single line getting through is *not* a let-up: it frees exactly one slot,
+/// which a flood refills immediately, so treating it as one reports the loss
+/// once per **delivered** line.  That turns a bounded stream of log lines into
+/// an unbounded stream of reports — and the reports travel as ordinary events,
+/// which are deliberately never dropped, so the bound this whole mechanism
+/// exists to enforce is undone by the announcement of it.  Requiring half the
+/// allowance back is a let-up the consumer had to earn.
+const FLOOD_OVER_BELOW: usize = MAX_QUEUED_LOG_LINES / 2;
+
+/// The log-line allowance shared by one channel's senders and its receiver.
+#[derive(Debug, Default)]
+struct LogBudget {
+    /// Log lines handed to the channel but not taken out of it yet.
+    queued: AtomicUsize,
+    /// Lines dropped since the last [`EventKind::LogLinesDropped`].
+    dropped: AtomicU64,
+}
+
 /// Sending half of the runtime event stream.
-pub type EventSender = mpsc::UnboundedSender<ServiceEvent>;
+///
+/// Cheap to clone, and never blocks: a log line that does not fit in the
+/// channel's allowance is dropped rather than queued, and the loss is reported
+/// as an [`EventKind::LogLinesDropped`] event so it is visible in `up` and in
+/// `servicrab events` instead of being silent.
+#[derive(Debug, Clone)]
+pub struct EventSender {
+    inner: mpsc::UnboundedSender<ServiceEvent>,
+    budget: Arc<LogBudget>,
+}
+
+impl EventSender {
+    /// Publish one event.
+    ///
+    /// `Err` means the receiver is gone.  A dropped log line is *not* an error:
+    /// the channel is alive and the loss is reported through it.
+    pub fn send(&self, event: ServiceEvent) -> Result<(), ServiceEvent> {
+        if !matches!(event.kind, EventKind::Log { .. }) {
+            return self.inner.send(event).map_err(|err| err.0);
+        }
+
+        // Dropping the newest line rather than the oldest is what keeps the log
+        // in order: the queue is a channel, so the only line the sender can
+        // still choose to lose is the one in its hand.
+        let queued = self.budget.queued.fetch_add(1, Ordering::AcqRel);
+        if queued >= MAX_QUEUED_LOG_LINES {
+            self.budget.queued.fetch_sub(1, Ordering::AcqRel);
+            let dropped = self.budget.dropped.fetch_add(1, Ordering::AcqRel) + 1;
+            if dropped % REPORT_DROPS_EVERY == 0 {
+                self.report_drops(&event.service);
+            }
+            return Ok(());
+        }
+
+        // The flood really let up — the consumer has won back a good part of
+        // the allowance, not just the one slot this line is about to take — so
+        // say how much went missing.  Reporting on the strength of a single
+        // free slot would emit one report per delivered line for as long as the
+        // flood lasts; see `FLOOD_OVER_BELOW`.
+        if queued < FLOOD_OVER_BELOW && self.budget.dropped.load(Ordering::Acquire) > 0 {
+            self.report_drops(&event.service);
+        }
+
+        self.inner.send(event).map_err(|err| {
+            self.budget.queued.fetch_sub(1, Ordering::AcqRel);
+            err.0
+        })
+    }
+
+    /// Publish how many lines have been dropped since the last report.
+    ///
+    /// Sent straight down the channel: the report is one event per burst, not
+    /// per line, so it is never itself worth dropping.
+    fn report_drops(&self, service: &ServiceName) {
+        let count = self.budget.dropped.swap(0, Ordering::AcqRel);
+        if count == 0 {
+            return;
+        }
+        let _ = self.inner.send(ServiceEvent::new(
+            service.clone(),
+            EventKind::LogLinesDropped { count },
+        ));
+    }
+}
+
 /// Receiving half of the runtime event stream.
-pub type EventReceiver = mpsc::UnboundedReceiver<ServiceEvent>;
+#[derive(Debug)]
+pub struct EventReceiver {
+    inner: mpsc::UnboundedReceiver<ServiceEvent>,
+    budget: Arc<LogBudget>,
+}
+
+impl EventReceiver {
+    /// Wait for the next event, or `None` once every sender is gone.
+    pub async fn recv(&mut self) -> Option<ServiceEvent> {
+        let event = self.inner.recv().await;
+        if let Some(event) = &event {
+            self.release(event);
+        }
+        event
+    }
+
+    /// Take an event that is already queued.
+    pub fn try_recv(&mut self) -> Result<ServiceEvent, mpsc::error::TryRecvError> {
+        let event = self.inner.try_recv()?;
+        self.release(&event);
+        Ok(event)
+    }
+
+    /// Give a delivered log line's allowance back to the senders.
+    fn release(&self, event: &ServiceEvent) {
+        if matches!(event.kind, EventKind::Log { .. }) {
+            self.budget.queued.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
 
 /// Create a new event channel.
 pub fn event_channel() -> (EventSender, EventReceiver) {
-    mpsc::unbounded_channel()
+    let (inner_tx, inner_rx) = mpsc::unbounded_channel();
+    let budget = Arc::new(LogBudget::default());
+    (
+        EventSender {
+            inner: inner_tx,
+            budget: Arc::clone(&budget),
+        },
+        EventReceiver {
+            inner: inner_rx,
+            budget,
+        },
+    )
 }
 
 /// An optional event sink.
@@ -218,5 +377,190 @@ mod tests {
     fn streams_display_as_lowercase_names() {
         assert_eq!(Stream::Stdout.to_string(), "stdout");
         assert_eq!(Stream::Stderr.to_string(), "stderr");
+    }
+
+    fn log(line: &str) -> EventKind {
+        EventKind::Log {
+            stream: Stream::Stdout,
+            line: line.to_string(),
+        }
+    }
+
+    #[test]
+    fn queued_log_lines_are_capped_and_the_loss_is_reported() {
+        let (tx, mut rx) = event_channel();
+        let api = name("api");
+
+        // Nothing reads while the flood runs, so every line stays queued.
+        let flood = MAX_QUEUED_LOG_LINES + REPORT_DROPS_EVERY as usize;
+        for i in 0..flood {
+            tx.send(ServiceEvent::new(api.clone(), log(&format!("line {i}"))))
+                .expect("the channel is alive");
+        }
+
+        let mut lines = Vec::new();
+        let mut dropped = 0u64;
+        while let Ok(event) = rx.try_recv() {
+            match event.kind {
+                EventKind::Log { line, .. } => lines.push(line),
+                EventKind::LogLinesDropped { count } => dropped += count,
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+
+        // The heap is what this bounds, so the queue length is the assertion.
+        assert_eq!(lines.len(), MAX_QUEUED_LOG_LINES);
+        // The oldest lines are what survived, so the log stays in order.
+        let expected: Vec<String> = (0..MAX_QUEUED_LOG_LINES)
+            .map(|i| format!("line {i}"))
+            .collect();
+        assert_eq!(lines, expected);
+        assert_eq!(
+            dropped + lines.len() as u64,
+            flood as u64,
+            "every line is either delivered or counted as dropped"
+        );
+    }
+
+    #[test]
+    fn the_allowance_comes_back_once_a_line_is_delivered() {
+        let (tx, mut rx) = event_channel();
+        let api = name("api");
+
+        for i in 0..MAX_QUEUED_LOG_LINES {
+            tx.send(ServiceEvent::new(api.clone(), log(&format!("first {i}"))))
+                .unwrap();
+        }
+        // Full: one more line has to be dropped.
+        tx.send(ServiceEvent::new(api.clone(), log("dropped")))
+            .unwrap();
+
+        // Drain, which is what a consumer keeping up looks like, then flood
+        // again: the second burst must be delivered in full.
+        while rx.try_recv().is_ok() {}
+        for i in 0..MAX_QUEUED_LOG_LINES {
+            tx.send(ServiceEvent::new(api.clone(), log(&format!("second {i}"))))
+                .unwrap();
+        }
+
+        let mut lines = 0;
+        let mut reported = 0u64;
+        while let Ok(event) = rx.try_recv() {
+            match event.kind {
+                EventKind::Log { .. } => lines += 1,
+                EventKind::LogLinesDropped { count } => reported += count,
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert_eq!(lines, MAX_QUEUED_LOG_LINES);
+        assert_eq!(reported, 1, "the earlier drop should be reported once");
+    }
+
+    #[test]
+    fn a_sustained_flood_is_not_reported_once_per_delivered_line() {
+        // A consumer that is making slow progress frees one slot at a time, and
+        // the flood refills it at once.  Reporting the loss on the strength of a
+        // single delivered line therefore emits one `LogLinesDropped` per
+        // delivered line — and those reports are ordinary events, which are
+        // never dropped, so the flood escapes its own bound through them.  In
+        // `up` that meant thousands of report lines on a stderr nobody had
+        // asked for, enough to fill the pipe and wedge the renderer in a
+        // blocking write for good.
+        let (tx, mut rx) = event_channel();
+        let api = name("api");
+        let send = |i: usize| {
+            tx.send(ServiceEvent::new(api.clone(), log(&format!("line {i}"))))
+                .expect("the channel is alive")
+        };
+
+        // Fill the allowance, so from here on every send is a drop.
+        for i in 0..MAX_QUEUED_LOG_LINES {
+            send(i);
+        }
+
+        // One line out, two lines in, over and over: the queue never recovers,
+        // which is what a sustained flood past a slow consumer looks like.
+        const ROUNDS: usize = 4 * REPORT_DROPS_EVERY as usize;
+        let mut delivered = 0usize;
+        let mut reports = 0usize;
+        for i in 0..ROUNDS {
+            match rx.try_recv().expect("something is queued").kind {
+                EventKind::Log { .. } => delivered += 1,
+                EventKind::LogLinesDropped { .. } => reports += 1,
+                other => panic!("unexpected event {other:?}"),
+            }
+            send(MAX_QUEUED_LOG_LINES + 2 * i);
+            send(MAX_QUEUED_LOG_LINES + 2 * i + 1);
+        }
+
+        assert!(delivered > 0, "the consumer has to be making progress");
+        // The backstop is what reports during a flood, so the count is set by
+        // how much was dropped and not by how much got through.
+        let backstop = ROUNDS * 2 / REPORT_DROPS_EVERY as usize;
+        assert!(
+            reports <= backstop + 1,
+            "expected about {backstop} report(s) from the backstop, got {reports} \
+             after delivering {delivered} line(s): the loss is being reported per \
+             delivered line, which is not bounded by anything"
+        );
+        // Silence would be the other way to fail this: the operator still has
+        // to learn that output is going missing.
+        assert!(reports > 0, "a flood this long has to be reported at all");
+    }
+
+    #[test]
+    fn a_real_let_up_reports_the_loss_without_waiting_for_the_backstop() {
+        // The other half of the contract: once the consumer has genuinely
+        // caught up, the operator hears about the loss straight away rather
+        // than only after the next `REPORT_DROPS_EVERY` lines go missing.
+        let (tx, mut rx) = event_channel();
+        let api = name("api");
+        let send = |line: &str| {
+            tx.send(ServiceEvent::new(api.clone(), log(line)))
+                .expect("the channel is alive")
+        };
+
+        for i in 0..MAX_QUEUED_LOG_LINES {
+            send(&format!("line {i}"));
+        }
+        // One drop only — far too few for the backstop, which needs
+        // `REPORT_DROPS_EVERY` of them, so what reports here can only be the
+        // let-up.
+        send("dropped");
+
+        // The consumer catches up completely.
+        while rx.try_recv().is_ok() {}
+        send("after the let-up");
+
+        let reported: u64 = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event.kind {
+                EventKind::LogLinesDropped { count } => Some(count),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(reported, 1, "the drop should be reported once, promptly");
+    }
+
+    #[test]
+    fn events_other_than_log_lines_are_never_dropped() {
+        let (tx, mut rx) = event_channel();
+        let api = name("api");
+
+        for i in 0..MAX_QUEUED_LOG_LINES {
+            tx.send(ServiceEvent::new(api.clone(), log(&format!("line {i}"))))
+                .unwrap();
+        }
+        // The queue is full of log lines; a lifecycle event still has to make
+        // it, because losing one would corrupt the status registry.
+        tx.send(ServiceEvent::new(
+            api.clone(),
+            EventKind::State(ServiceState::Running),
+        ))
+        .unwrap();
+
+        let states = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|event| matches!(event.kind, EventKind::State(ServiceState::Running)))
+            .count();
+        assert_eq!(states, 1);
     }
 }

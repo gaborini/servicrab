@@ -280,7 +280,8 @@ pub struct RawService {
     #[serde(default)]
     pub restart_max_delay: Option<String>,
 
-    /// Maximum number of restarts before giving up.  Defaults to `10`.
+    /// Maximum number of restarts before giving up.  Defaults to `10`; `0`
+    /// means unlimited.
     #[serde(default)]
     pub max_restarts: Option<u32>,
 

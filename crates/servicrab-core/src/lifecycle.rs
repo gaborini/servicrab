@@ -190,6 +190,12 @@ pub enum ShutdownReason {
     UserInterrupt,
     /// The supervisor itself received SIGTERM.
     Terminated,
+    /// The supervisor's controlling terminal went away (SIGHUP).
+    ///
+    /// Distinct from [`ShutdownReason::Terminated`] because the cause is
+    /// different — a closed terminal rather than a deliberate `kill` — and
+    /// because it maps to a different exit code.
+    HangUp,
     /// The restart limit was exhausted.
     RestartLimit,
     /// Another service in the stack failed and the whole stack is being torn
@@ -207,7 +213,10 @@ impl ShutdownReason {
     pub fn is_user_requested(self) -> bool {
         matches!(
             self,
-            ShutdownReason::UserInterrupt | ShutdownReason::Terminated | ShutdownReason::Requested
+            ShutdownReason::UserInterrupt
+                | ShutdownReason::Terminated
+                | ShutdownReason::HangUp
+                | ShutdownReason::Requested
         )
     }
 }
@@ -217,6 +226,7 @@ impl std::fmt::Display for ShutdownReason {
         match self {
             ShutdownReason::UserInterrupt => write!(f, "interrupted by user"),
             ShutdownReason::Terminated => write!(f, "supervisor terminated"),
+            ShutdownReason::HangUp => write!(f, "controlling terminal closed"),
             ShutdownReason::RestartLimit => write!(f, "restart limit exhausted"),
             ShutdownReason::StackFailure => write!(f, "another service failed"),
             ShutdownReason::Requested => write!(f, "stopped on request"),
@@ -269,6 +279,7 @@ pub struct RestartTracker {
     policy: RestartPolicy,
     restart_delay: Duration,
     restart_max_delay: Duration,
+    /// Restarts allowed between stable runs; `0` means unlimited.
     max_restarts: u32,
     stable_after: Duration,
     attempts: u32,
@@ -276,6 +287,8 @@ pub struct RestartTracker {
 
 impl RestartTracker {
     /// Build a tracker from validated service settings.
+    ///
+    /// `max_restarts = 0` means unlimited restarts.
     pub fn new(
         policy: RestartPolicy,
         restart_delay: Duration,
@@ -360,18 +373,30 @@ impl RestartTracker {
             return RestartDecision::Stop;
         }
 
-        if self.attempts >= self.max_restarts {
+        if !self.budget_left() {
             return RestartDecision::Fail {
                 reason: ShutdownReason::RestartLimit,
             };
         }
 
         let delay = self.backoff_for_attempt(self.attempts);
-        self.attempts += 1;
+        // Saturating because an unlimited budget has no bound to stop the
+        // counter: the number is only reported, and a service that has crashed
+        // four billion times has bigger problems than an off-by-one.
+        self.attempts = self.attempts.saturating_add(1);
         RestartDecision::Restart {
             delay,
             attempt: self.attempts,
         }
+    }
+
+    /// Whether another restart attempt is allowed.
+    ///
+    /// `max_restarts = 0` means unlimited, which is the reading users expect
+    /// and the one Compose and systemd use.  "Give up on the first failure" is
+    /// what `restart = "never"` is for.
+    fn budget_left(&self) -> bool {
+        self.max_restarts == 0 || self.attempts < self.max_restarts
     }
 
     fn should_restart(&self, reason: ExitReason) -> bool {
@@ -593,7 +618,11 @@ mod tests {
 
     #[test]
     fn user_shutdown_never_restarts() {
-        for reason in [ShutdownReason::UserInterrupt, ShutdownReason::Terminated] {
+        for reason in [
+            ShutdownReason::UserInterrupt,
+            ShutdownReason::Terminated,
+            ShutdownReason::HangUp,
+        ] {
             let mut t = tracker(RestartPolicy::Always);
             assert_eq!(
                 t.decide(outcome(ExitReason::Code(1)), Some(reason)),
@@ -667,14 +696,100 @@ mod tests {
     }
 
     #[test]
-    fn zero_max_restarts_fails_immediately() {
+    fn zero_max_restarts_means_unlimited() {
         let mut t =
             RestartTracker::new(RestartPolicy::Always, SEC, SEC, 0, Duration::from_secs(60));
+        // Well past any plausible finite budget, including the old default.
+        for expected in 1..=50 {
+            assert_eq!(
+                t.decide(outcome(ExitReason::Code(1)), None),
+                RestartDecision::Restart {
+                    delay: SEC,
+                    attempt: expected
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn an_unlimited_budget_still_obeys_the_policy() {
+        // "Unlimited" is about the budget, not about the policy: a clean exit
+        // under `on-failure` is still not a reason to restart.
+        let mut t = RestartTracker::new(
+            RestartPolicy::OnFailure,
+            SEC,
+            SEC,
+            0,
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            t.decide(outcome(ExitReason::Code(0)), None),
+            RestartDecision::Stop
+        );
+
+        let mut t = RestartTracker::new(RestartPolicy::Never, SEC, SEC, 0, Duration::from_secs(60));
         assert_eq!(
             t.decide(outcome(ExitReason::Code(1)), None),
+            RestartDecision::Stop
+        );
+    }
+
+    #[test]
+    fn an_unlimited_budget_still_stops_on_a_user_shutdown() {
+        // The interaction of two independently-added features: `max_restarts =
+        // 0` removes the only bound that would otherwise end the restart loop,
+        // so this pins that a user-requested stop still wins over an unlimited
+        // budget.
+        for reason in [
+            ShutdownReason::UserInterrupt,
+            ShutdownReason::Terminated,
+            ShutdownReason::HangUp,
+            ShutdownReason::Requested,
+        ] {
+            let mut t =
+                RestartTracker::new(RestartPolicy::Always, SEC, SEC, 0, Duration::from_secs(60));
+            // Crash a few times first, so the tracker is mid-loop rather than
+            // fresh when the shutdown arrives.
+            for _ in 0..3 {
+                t.decide(outcome(ExitReason::Code(1)), None);
+            }
+            assert_eq!(
+                t.decide(outcome(ExitReason::Code(1)), Some(reason)),
+                RestartDecision::Stop,
+                "unlimited budget must not survive {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_user_shutdown_outranks_an_exhausted_budget() {
+        // This is what actually pins the order of the two checks in `decide`.
+        // Moving the user-requested short-circuit below the budget check leaves
+        // every other test green — including the unlimited case above, because
+        // an unlimited budget never reaches `Fail` — and only shows up here: a
+        // service the user stopped must report `Stop`, not blame the restart
+        // limit for a shutdown the user asked for.
+        let mut t =
+            RestartTracker::new(RestartPolicy::Always, SEC, SEC, 2, Duration::from_secs(60));
+        for _ in 0..2 {
+            assert!(matches!(
+                t.decide(outcome(ExitReason::Code(1)), None),
+                RestartDecision::Restart { .. }
+            ));
+        }
+        // The budget is now spent: without a shutdown this is a `Fail`.
+        assert_eq!(
+            t.clone().decide(outcome(ExitReason::Code(1)), None),
             RestartDecision::Fail {
                 reason: ShutdownReason::RestartLimit
             }
+        );
+        assert_eq!(
+            t.decide(
+                outcome(ExitReason::Code(1)),
+                Some(ShutdownReason::UserInterrupt)
+            ),
+            RestartDecision::Stop
         );
     }
 
@@ -735,6 +850,9 @@ mod tests {
     fn restart_limit_shutdown_is_not_user_requested() {
         assert!(ShutdownReason::UserInterrupt.is_user_requested());
         assert!(ShutdownReason::Terminated.is_user_requested());
+        // A closed terminal is the user going away, not a failure to restart
+        // around: `restart = "always"` must not resurrect the service.
+        assert!(ShutdownReason::HangUp.is_user_requested());
         assert!(!ShutdownReason::RestartLimit.is_user_requested());
     }
 }

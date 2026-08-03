@@ -8,11 +8,15 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use servicrab_core::{load, plan_stack, resolve_config_path, Config, Selection, ServiceName};
+use servicrab_protocol::ErrorCode;
 
 use crate::daemon::{stopped, DaemonPaths};
+use crate::output::{self, CliError};
 
 /// How long to wait for a freshly spawned daemon to answer.
 const START_TIMEOUT: Duration = Duration::from_secs(15);
+/// How often to check on a daemon that has not answered yet.
+const START_POLL: Duration = Duration::from_millis(50);
 /// How long to wait for a stopping daemon to disappear.
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long `--wait` waits for readiness when `--timeout` is not given.
@@ -36,23 +40,34 @@ pub struct StartOptions {
 }
 
 /// Load the config the daemon commands all need.
-pub(crate) fn setup(config: Option<&Path>) -> Result<(Config, PathBuf, DaemonPaths), String> {
-    let path = resolve_config_path(config).map_err(|e| format!("could not find config: {e}"))?;
+pub(crate) fn setup(config: Option<&Path>) -> Result<(Config, PathBuf, DaemonPaths), CliError> {
+    let path = resolve_config_path(config)
+        .map_err(|e| CliError::from(format!("could not find config: {e}")))?;
 
     let (cfg, warnings) = load(&path).map_err(|errors| {
-        let msgs: Vec<String> = errors.iter().map(|e| format!("  • {e}")).collect();
-        format!(
-            "✗ {} has {} error(s):\n{}",
-            path.display(),
-            errors.len(),
-            msgs.join("\n")
+        CliError::new(
+            ErrorCode::ValidationFailed,
+            format!("{} has {} error(s)", path.display(), errors.len()),
         )
+        .with_errors(errors.iter().map(ToString::to_string).collect())
     })?;
     for warning in &warnings {
         eprintln!("⚠  {warning}");
     }
 
     let paths = DaemonPaths::for_config(&path);
+    // Nothing here can work if the socket path cannot be bound, and every
+    // command would otherwise report it differently and unhelpfully: the daemon
+    // as `ENAMETOOLONG` from `bind`, every client as `SUN_LEN` from `connect`.
+    // Said once, with the reason each candidate directory was refused.
+    if !paths.socket_advice().is_empty() {
+        return Err(format!(
+            "the socket for {} cannot be created{}",
+            cfg.project.name,
+            paths.socket_advice()
+        )
+        .into());
+    }
     Ok((cfg, path, paths))
 }
 
@@ -65,14 +80,15 @@ mod imp {
     use servicrab_protocol::{Request, Response, ServiceInfo};
 
     use crate::daemon::{client, server};
-    use crate::style::{self, BOLD, DIM, GREEN, RED, RESET, YELLOW};
+    use crate::output::no_daemon;
+    use crate::style::{self, Stream, BOLD, DIM, GREEN, RED, RESET, YELLOW};
 
     /// Run the daemon in the foreground (this is the process `start` spawns).
     pub fn daemon(
         config: Option<&Path>,
         no_restart: bool,
         profiles: &[String],
-    ) -> Result<i32, String> {
+    ) -> Result<i32, CliError> {
         let (cfg, config_path, paths) = setup(config)?;
         server::serve(
             &cfg,
@@ -83,6 +99,7 @@ mod imp {
                 profiles: profiles.to_vec(),
             },
         )
+        .map_err(CliError::from)
     }
 
     /// Start the daemon, or individual services inside a running one.
@@ -90,7 +107,7 @@ mod imp {
         config: Option<&Path>,
         selection: Selection<'_>,
         options: StartOptions,
-    ) -> Result<i32, String> {
+    ) -> Result<i32, CliError> {
         let services = selection.services;
         if !services.is_empty() {
             let code = control(config, services, |name| Request::StartService { name })?;
@@ -105,11 +122,24 @@ mod imp {
 
         let (cfg, config_path, paths) = setup(config)?;
 
-        if client::is_running(&paths.socket) {
-            return Err(format!(
+        // An advisory fast path for a friendly message.  It cannot be
+        // authoritative — another `start` may be between this check and its
+        // daemon's lock — so the daemon takes the pidfile lock and this code
+        // reports whatever it says.
+        match client::check_running(&paths.socket) {
+            Ok(()) => {
+                return Err(CliError::new(
+                    ErrorCode::AlreadyRunning,
+                    format!(
                 "a daemon is already running for {} — use `servicrab status` or `servicrab down`",
                 cfg.project.name
-            ));
+            ),
+                ))
+            }
+            // A daemon that refuses us is still a daemon, and spawning another
+            // one over its socket would fail in a much less obvious way.
+            Err(client::ClientError::Failed(why)) => return Err(why.into()),
+            Err(client::ClientError::NotRunning) => {}
         }
         paths.ensure_dir()?;
 
@@ -117,13 +147,13 @@ mod imp {
             .create(true)
             .append(true)
             .open(&paths.log)
-            .map_err(|e| format!("could not open {}: {e}", paths.log.display()))?;
+            .map_err(|e| CliError::from(format!("could not open {}: {e}", paths.log.display())))?;
         let errors = log
             .try_clone()
-            .map_err(|e| format!("could not open {}: {e}", paths.log.display()))?;
+            .map_err(|e| CliError::from(format!("could not open {}: {e}", paths.log.display())))?;
 
         let exe = std::env::current_exe()
-            .map_err(|e| format!("could not find the servicrab executable: {e}"))?;
+            .map_err(|e| CliError::from(format!("could not find the servicrab executable: {e}")))?;
         let mut command = std::process::Command::new(exe);
         command
             .arg("daemon")
@@ -151,20 +181,11 @@ mod imp {
 
         let mut child = command
             .spawn()
-            .map_err(|e| format!("could not start the daemon: {e}"))?;
+            .map_err(|e| CliError::from(format!("could not start the daemon: {e}")))?;
 
-        if !client::wait_until_running(&paths.socket, START_TIMEOUT) {
-            // Reap it so a failed start does not leave a zombie behind.
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!(
-                "the daemon did not come up within {}s — see {}",
-                START_TIMEOUT.as_secs(),
-                paths.log.display()
-            ));
-        }
+        wait_for_the_daemon(&mut child, &paths)?;
 
-        let color = style::color_enabled();
+        let color = style::color_enabled_for(Stream::Stdout);
         println!(
             "{} daemon started for {} ({} service(s))",
             style::paint(color, GREEN, "✓"),
@@ -195,8 +216,70 @@ mod imp {
         Ok(0)
     }
 
-    /// What a status snapshot says about one service's readiness.
+    /// Wait for the spawned daemon to answer, or to tell us why it will not.
     ///
+    /// Two starts can race here, and only one of them gets the project lock.
+    /// The loser exits straight away — while the *winner's* socket is up, so a
+    /// live socket alone proves nothing about the child we spawned.  The lock
+    /// holder records its pid before it binds, so the pidfile is what identifies
+    /// whose daemon is answering; the child's exit status then turns a
+    /// 15-second timeout into an immediate, accurate message, and reaps the
+    /// process either way.
+    fn wait_for_the_daemon(
+        child: &mut std::process::Child,
+        paths: &DaemonPaths,
+    ) -> Result<(), CliError> {
+        let deadline = std::time::Instant::now() + START_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if !status.success() => {
+                    return Err(format!(
+                        "the daemon we started exited with {} — see {}",
+                        status
+                            .code()
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "a signal".to_string()),
+                        paths.log.display()
+                    )
+                    .into())
+                }
+                // A stack of nothing but one-shot services can be finished
+                // before we look, and that is a start that worked.
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => {}
+                Err(err) => return Err(format!("could not watch the daemon: {err}").into()),
+            }
+            if daemon_is_ours(child, paths) && client::is_running(&paths.socket) {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                // Reap it so a failed start does not leave a zombie behind.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "the daemon did not come up within {}s — see {}",
+                    START_TIMEOUT.as_secs(),
+                    paths.log.display()
+                )
+                .into());
+            }
+            std::thread::sleep(START_POLL);
+        }
+    }
+
+    /// Whether the daemon holding this project's lock is the child we spawned.
+    ///
+    /// The pid in the file is written under the lock and before the socket is
+    /// bound, so a socket that answers while this says "not ours" belongs to a
+    /// daemon somebody else started.
+    fn daemon_is_ours(child: &std::process::Child, paths: &DaemonPaths) -> bool {
+        std::fs::read_to_string(&paths.pid)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+            .is_some_and(|pid| pid == child.id())
+    }
+
+    /// What a status snapshot says about one service's readiness.    ///
     /// The same three answers the supervisor's own dependency gating uses under
     /// its *default* condition, so `--wait` returns when a dependent that did
     /// not spell out a condition would have been allowed to start.  A spelled
@@ -256,20 +339,29 @@ mod imp {
         only: &[String],
         skip: &BTreeSet<ServiceName>,
         timeout: Option<Duration>,
-    ) -> Result<i32, String> {
+    ) -> Result<i32, CliError> {
         let timeout = timeout.unwrap_or(WAIT_TIMEOUT);
         let deadline = std::time::Instant::now() + timeout;
-        let color = style::color_enabled();
+        let color_out = style::color_enabled_for(Stream::Stdout);
+        let color_err = style::color_enabled_for(Stream::Stderr);
 
         loop {
             let services = match client::send(socket, &Request::Status) {
                 Ok(Response::Status { services }) => services,
-                Ok(Response::Error { message }) => return Err(message),
-                Ok(other) => return Err(format!("unexpected response from the daemon: {other:?}")),
-                Err(client::ClientError::NotRunning) => {
-                    return Err("the daemon stopped while waiting for the stack".to_string())
+                Ok(Response::Error { code, message, .. }) => {
+                    return Err(CliError::new(code, message))
                 }
-                Err(err) => return Err(err.to_string()),
+                Ok(other) => {
+                    return Err(format!("unexpected response from the daemon: {other:?}").into())
+                }
+                Err(client::ClientError::NotRunning) => {
+                    return Err(CliError::new(
+                        ErrorCode::NotRunning,
+                        "the daemon stopped while waiting for the stack",
+                    )
+                    .with_exit(output::EXIT_NO_DAEMON))
+                }
+                Err(err) => return Err(err.to_string().into()),
             };
 
             let watched: Vec<&ServiceInfo> = services
@@ -290,7 +382,7 @@ mod imp {
 
             if !gone.is_empty() {
                 for (name, why) in &gone {
-                    eprintln!("{} {name}: {why}", style::paint(color, RED, "✗"));
+                    eprintln!("{} {name}: {why}", style::paint(color_err, RED, "✗"));
                 }
                 return Ok(1);
             }
@@ -298,7 +390,7 @@ mod imp {
             if waiting.is_empty() {
                 println!(
                     "{} {} service(s) ready",
-                    style::paint(color, GREEN, "✓"),
+                    style::paint(color_out, GREEN, "✓"),
                     watched.len()
                 );
                 return Ok(0);
@@ -307,14 +399,14 @@ mod imp {
             if std::time::Instant::now() >= deadline {
                 eprintln!(
                     "{} timed out after {}: still waiting for {}",
-                    style::paint(color, RED, "✗"),
+                    style::paint(color_err, RED, "✗"),
                     humantime::format_duration(timeout),
                     waiting.join(", ")
                 );
                 eprintln!(
                     "{}",
                     style::paint(
-                        color,
+                        color_err,
                         DIM,
                         "  the daemon is still running — see `servicrab status` and `servicrab logs`"
                     )
@@ -327,45 +419,61 @@ mod imp {
     }
 
     /// Stop individual services without touching the rest of the stack.
-    pub fn stop(config: Option<&Path>, services: &[String]) -> Result<i32, String> {
+    pub fn stop(config: Option<&Path>, services: &[String]) -> Result<i32, CliError> {
         control(config, services, |name| Request::StopService { name })
     }
 
+    /// Refuse to go on unless a daemon we may talk to is there.
+    ///
+    /// "Is one running" and "will it talk to us" are different questions, and
+    /// the second one has an answer worth repeating: a daemon belonging to
+    /// another user refuses the connection and says so, and reporting that as
+    /// "no daemon is running" would send the operator looking for one that is
+    /// already there.
+    fn expect_a_daemon(cfg: &Config, paths: &DaemonPaths) -> Result<(), CliError> {
+        match client::check_running(&paths.socket) {
+            Ok(()) => Ok(()),
+            Err(client::ClientError::NotRunning) => {
+                Err(no_daemon(cfg.project.name.as_str(), false))
+            }
+            Err(err) => Err(err.to_string().into()),
+        }
+    }
+
     /// Restart individual services.
-    pub fn restart(config: Option<&Path>, services: &[String]) -> Result<i32, String> {
+    pub fn restart(config: Option<&Path>, services: &[String]) -> Result<i32, CliError> {
         control(config, services, |name| Request::RestartService { name })
     }
 
     /// Ask the daemon to re-read the configuration file.
-    pub fn reload(config: Option<&Path>) -> Result<i32, String> {
+    pub fn reload(config: Option<&Path>) -> Result<i32, CliError> {
         let (cfg, config_path, paths) = setup(config)?;
-        if !client::is_running(&paths.socket) {
-            return Err(format!(
-                "no daemon is running for {} — start one with `servicrab start`",
-                cfg.project.name
-            ));
-        }
+        expect_a_daemon(&cfg, &paths)?;
 
-        let color = style::color_enabled();
+        let color_out = style::color_enabled_for(Stream::Stdout);
         match client::send(&paths.socket, &Request::Reload) {
-            Ok(Response::Ok { message }) => {
+            Ok(Response::Ok { message, .. }) => {
                 println!(
                     "{} {}",
-                    style::paint(color, GREEN, "✓"),
+                    style::paint(color_out, GREEN, "✓"),
                     message.unwrap_or_else(|| "reloaded".to_string())
                 );
                 println!(
                     "{}",
-                    style::paint(color, DIM, &format!("  from {}", config_path.display()))
+                    style::paint(color_out, DIM, &format!("  from {}", config_path.display()))
                 );
                 Ok(0)
             }
-            Ok(Response::Error { message }) => {
-                eprintln!("{} {message}", style::paint(color, RED, "✗"));
-                Ok(1)
-            }
-            Ok(other) => Err(format!("unexpected response from the daemon: {other:?}")),
-            Err(err) => Err(err.to_string()),
+            // A config the daemon refused is the operator's problem to fix, and
+            // it is reported the way every other error is: `CliError` writes to
+            // stderr, so there is no second stream to decide a colour for here.
+            Ok(Response::Error {
+                code,
+                message,
+                errors,
+            }) => Err(CliError::new(code, message).with_errors(errors)),
+            Ok(other) => Err(format!("unexpected response from the daemon: {other:?}").into()),
+            Err(err) => Err(err.to_string().into()),
         }
     }
 
@@ -374,87 +482,140 @@ mod imp {
         config: Option<&Path>,
         services: &[String],
         build: impl Fn(String) -> Request,
-    ) -> Result<i32, String> {
+    ) -> Result<i32, CliError> {
         let (cfg, _, paths) = setup(config)?;
-        if !client::is_running(&paths.socket) {
-            return Err(format!(
-                "no daemon is running for {} — start one with `servicrab start`",
-                cfg.project.name
-            ));
-        }
+        expect_a_daemon(&cfg, &paths)?;
 
-        let color = style::color_enabled();
+        let color_out = style::color_enabled_for(Stream::Stdout);
         let mut failed = false;
         for name in services {
             match client::send(&paths.socket, &build(name.clone())) {
-                Ok(Response::Ok { message }) => println!(
+                Ok(Response::Ok { message, .. }) => println!(
                     "{} {}",
-                    style::paint(color, GREEN, "✓"),
+                    style::paint(color_out, GREEN, "✓"),
                     message.unwrap_or_else(|| format!("{name} done"))
                 ),
-                Ok(Response::Error { message }) => {
-                    eprintln!("{} {message}", style::paint(color, RED, "✗"));
+                // Reported like every other error — on stderr, so the loop's
+                // successes stay a clean list on stdout — and the loop carries
+                // on so the remaining names are still attempted.
+                Ok(Response::Error {
+                    code,
+                    message,
+                    errors,
+                }) => {
+                    CliError::new(code, message).with_errors(errors).report();
                     failed = true;
                 }
-                Ok(other) => return Err(format!("unexpected response from the daemon: {other:?}")),
-                Err(err) => return Err(err.to_string()),
+                Ok(other) => {
+                    return Err(format!("unexpected response from the daemon: {other:?}").into())
+                }
+                Err(err) => return Err(err.to_string().into()),
             }
         }
         Ok(if failed { 1 } else { 0 })
     }
 
     /// Print what the daemon is doing.
-    pub fn status(config: Option<&Path>, json: bool) -> Result<i32, String> {
-        let (cfg, _, paths) = setup(config)?;
+    pub fn status(config: Option<&Path>, json: bool) -> Result<i32, CliError> {
+        let (cfg, _, paths) = setup(config).map_err(|e| e.in_json(json))?;
 
         let response = match client::send(&paths.socket, &Request::Status) {
             Ok(response) => response,
             Err(client::ClientError::NotRunning) => {
                 if json {
-                    println!("{{\"running\":false,\"services\":[]}}");
-                } else {
-                    println!(
-                        "no daemon is running for {} — start one with `servicrab start`",
-                        cfg.project.name
-                    );
+                    // Through serde like the running case, rather than a
+                    // hand-written string that could drift from it.
+                    output::print_document(StatusJson {
+                        running: false,
+                        services: Vec::new(),
+                    })?;
+                    return Ok(output::EXIT_NO_DAEMON);
                 }
-                return Ok(1);
+                // Diagnostics, not output: `servicrab status > snapshot` should
+                // leave the file empty when there is no snapshot to take, rather
+                // than filling it with prose, and `CliError` writes to stderr.
+                let mut error = no_daemon(cfg.project.name.as_str(), false);
+                // Nothing else would lead them to a relocated socket, and
+                // "not running" is exactly the moment someone starts
+                // looking for one.  Said only when it is somewhere
+                // surprising, so the ordinary output does not change.
+                if !paths.socket_is_in_place() {
+                    error = error.with_hint(format!(
+                        "its socket would be {} (the project's path is too long to hold one)",
+                        paths.socket.display()
+                    ));
+                }
+                return Err(error);
             }
-            Err(err) => return Err(err.to_string()),
+            Err(err) => return Err(CliError::from(err.to_string()).in_json(json)),
         };
 
         let services = match response {
             Response::Status { services } => services,
-            Response::Error { message } => return Err(message),
-            other => return Err(format!("unexpected response from the daemon: {other:?}")),
+            Response::Error {
+                code,
+                message,
+                errors,
+            } => {
+                return Err(CliError::new(code, message)
+                    .with_errors(errors)
+                    .in_json(json))
+            }
+            other => {
+                return Err(CliError::from(format!(
+                    "unexpected response from the daemon: {other:?}"
+                ))
+                .in_json(json))
+            }
         };
 
         if json {
-            let payload = serde_json::json!({ "running": true, "services": services });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload)
-                    .map_err(|e| format!("could not render JSON: {e}"))?
-            );
+            output::print_document(StatusJson {
+                running: true,
+                services,
+            })?;
         } else {
             print_table(&services);
         }
         Ok(0)
     }
 
+    /// The `status --json` document, for both the running and the absent case.
+    ///
+    /// One type for both, so the "not running" answer cannot drift away from
+    /// the running one: it used to be a hand-written `{"running":false,
+    /// "services":[]}` that never went through serde at all.
+    #[derive(serde::Serialize)]
+    struct StatusJson {
+        running: bool,
+        services: Vec<ServiceInfo>,
+    }
+
     /// Ask the daemon to stop the stack and exit.
-    pub fn down(config: Option<&Path>) -> Result<i32, String> {
+    pub fn down(config: Option<&Path>) -> Result<i32, CliError> {
         let (cfg, _, paths) = setup(config)?;
 
         match client::send(&paths.socket, &Request::Shutdown) {
             Ok(Response::Ok { .. }) => {}
-            Ok(Response::Error { message }) => return Err(message),
-            Ok(other) => return Err(format!("unexpected response from the daemon: {other:?}")),
-            Err(client::ClientError::NotRunning) => {
-                println!("no daemon is running for {}", cfg.project.name);
-                return Ok(0);
+            Ok(Response::Error {
+                code,
+                message,
+                errors,
+            }) => return Err(CliError::new(code, message).with_errors(errors)),
+            Ok(other) => {
+                return Err(format!("unexpected response from the daemon: {other:?}").into())
             }
-            Err(err) => return Err(err.to_string()),
+            Err(client::ClientError::NotRunning) => {
+                // Not a failure — `down` on an already stopped stack is meant to
+                // be safe to run twice — but the exit code says there was
+                // nothing to do, so a script can tell the two apart.  Nothing
+                // was stopped, so saying so is a diagnostic and not output: it
+                // must not land in a `servicrab down > log` beside the report of
+                // a stack that really was stopped.
+                eprintln!("no daemon is running for {}", cfg.project.name);
+                return Ok(output::EXIT_NO_DAEMON);
+            }
+            Err(err) => return Err(err.to_string().into()),
         }
 
         if !client::wait_until_stopped(&paths.socket, STOP_TIMEOUT) {
@@ -462,10 +623,11 @@ mod imp {
                 "the daemon did not stop within {}s — see {}",
                 STOP_TIMEOUT.as_secs(),
                 paths.log.display()
-            ));
+            )
+            .into());
         }
 
-        let color = style::color_enabled();
+        let color = style::color_enabled_for(Stream::Stdout);
         println!(
             "{} stopped {}",
             style::paint(color, GREEN, "✓"),
@@ -475,7 +637,7 @@ mod imp {
     }
 
     fn print_table(services: &[ServiceInfo]) {
-        let color = style::color_enabled();
+        let color = style::color_enabled_for(Stream::Stdout);
         let width = services
             .iter()
             .map(|s| s.name.len())
@@ -509,8 +671,9 @@ mod imp {
                 service.name,
                 style::paint(color, tint, &state),
                 service
-                    .pid
-                    .map(|pid| pid.to_string())
+                    .pgid
+                    .or(service.pid)
+                    .map(|pgid| pgid.to_string())
                     .unwrap_or_else(|| "-".to_string()),
                 service
                     .uptime_secs
@@ -560,42 +723,48 @@ mod imp {
 mod imp {
     use super::*;
 
+    use servicrab_protocol::ErrorCode;
+
     const UNSUPPORTED: &str = "the background daemon is only supported on Linux and macOS";
+
+    fn unsupported() -> CliError {
+        CliError::new(ErrorCode::Unsupported, UNSUPPORTED)
+    }
 
     pub fn daemon(
         _config: Option<&Path>,
         _no_restart: bool,
         _profiles: &[String],
-    ) -> Result<i32, String> {
-        Err(UNSUPPORTED.to_string())
+    ) -> Result<i32, CliError> {
+        Err(unsupported())
     }
 
     pub fn start(
         _config: Option<&Path>,
         _selection: Selection<'_>,
         _options: StartOptions,
-    ) -> Result<i32, String> {
-        Err(UNSUPPORTED.to_string())
+    ) -> Result<i32, CliError> {
+        Err(unsupported())
     }
 
-    pub fn stop(_config: Option<&Path>, _services: &[String]) -> Result<i32, String> {
-        Err(UNSUPPORTED.to_string())
+    pub fn stop(_config: Option<&Path>, _services: &[String]) -> Result<i32, CliError> {
+        Err(unsupported())
     }
 
-    pub fn restart(_config: Option<&Path>, _services: &[String]) -> Result<i32, String> {
-        Err(UNSUPPORTED.to_string())
+    pub fn restart(_config: Option<&Path>, _services: &[String]) -> Result<i32, CliError> {
+        Err(unsupported())
     }
 
-    pub fn reload(_config: Option<&Path>) -> Result<i32, String> {
-        Err(UNSUPPORTED.to_string())
+    pub fn reload(_config: Option<&Path>) -> Result<i32, CliError> {
+        Err(unsupported())
     }
 
-    pub fn status(_config: Option<&Path>, _json: bool) -> Result<i32, String> {
-        Err(UNSUPPORTED.to_string())
+    pub fn status(_config: Option<&Path>, json: bool) -> Result<i32, CliError> {
+        Err(unsupported().in_json(json))
     }
 
-    pub fn down(_config: Option<&Path>) -> Result<i32, String> {
-        Err(UNSUPPORTED.to_string())
+    pub fn down(_config: Option<&Path>) -> Result<i32, CliError> {
+        Err(unsupported())
     }
 }
 

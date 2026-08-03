@@ -8,14 +8,16 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use servicrab_core::runtime::stack::{Control, ControlTx, StackOptions, StackSupervisor};
+use servicrab_core::runtime::stack::{
+    Control, ControlOutcome, ControlRefusal, ControlTx, StackOptions, StackSupervisor,
+};
 use servicrab_core::runtime::{control_channel, shutdown_channel, wait_for_shutdown};
 use servicrab_core::{
     event_channel, load, plan_stack, Config, EventKind, EventReceiver, EventSender, LogRouter,
-    ServiceName, ShutdownReason, SignalWatcher, StatusRegistry,
+    LogSink, ServiceName, ShutdownReason, SignalWatcher, StatusRegistry,
 };
-use servicrab_protocol::{decode, encode, Request, Response};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use servicrab_protocol::{decode, encode, ErrorCode, Request, Response};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 
@@ -29,6 +31,46 @@ const STREAM_BACKLOG: usize = 4096;
 
 /// How long the daemon waits for the log collector to drain on shutdown.
 const COLLECTOR_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The largest request the daemon will assemble, in bytes.
+///
+/// Every real request is a short JSON object; the longest is a `subscribe` with
+/// a service list, which the protocol crate bounds separately at 256 names.
+/// 64 KiB is far more than any of them needs and small enough that
+/// [`MAX_CONNECTIONS`] of them cannot exhaust memory.
+const MAX_FRAME: usize = 64 * 1024;
+
+/// How long a connection may say nothing before it is closed.
+///
+/// The CLI sends its request immediately and a subscriber stops reading in a
+/// different loop, so no legitimate client is idle here.  Generous anyway: a
+/// machine under load should not lose a command it already sent.
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How many clients may be connected at once.
+///
+/// Each one costs a file descriptor and a task, and a daemon that has been
+/// talked out of every descriptor in the process cannot supervise anything.  A
+/// handful of CLI invocations plus a few `events` subscribers is the realistic
+/// load, so this leaves two orders of magnitude of headroom.
+const MAX_CONNECTIONS: usize = 64;
+
+/// How many malformed lines one connection may send before it is closed.
+const MAX_MALFORMED: u32 = 3;
+
+/// How long to wait after `accept` fails before trying again.
+///
+/// `EMFILE` and `ENFILE` are not transient, and retrying straight away spun
+/// this loop at 100% CPU.
+const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How long a refusal may take to write before the connection is dropped.
+///
+/// One short line into an empty socket buffer never blocks, so this only fires
+/// for a peer that connected in order to be refused and then never read.  Short
+/// on purpose: waiting on such a peer would hold a slot in [`MAX_CONNECTIONS`],
+/// which is the limit the refusal path must not become a lever against.
+const REFUSAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Options for the daemon body.
 #[derive(Debug, Clone, Default)]
@@ -87,8 +129,14 @@ impl Session {
     /// Only `restart = "unless-stopped"` acts on this, and only when a stack is
     /// started, so a file we could not write costs nothing right now — it is
     /// logged and the command still succeeds.
-    fn remember(&self, service: &str, is_stopped: bool) {
-        if let Err(problem) = stopped::record(&self.stopped, service, is_stopped) {
+    ///
+    /// The write is a lock plus filesystem calls, so it goes to a blocking
+    /// thread: this is called from a connection task on the same runtime that
+    /// supervises the processes.
+    async fn remember(&self, service: &str, is_stopped: bool) {
+        let outcome =
+            stopped::record_blocking(self.stopped.clone(), service.to_string(), is_stopped).await;
+        if let Err(problem) = outcome {
             tracing::warn!("{problem}");
         }
     }
@@ -134,23 +182,53 @@ impl Session {
     }
 }
 
-/// Restrict the freshly bound socket to its owner.
+/// Bind the project socket so that it is unreachable by anyone else from the
+/// moment it exists.
 ///
 /// Connecting to a Unix socket needs write permission on the socket file, and
 /// a client that can connect can start, stop and restart every service in the
 /// project.  `bind` applies the process umask, which is 022 on most systems but
 /// 002 on distributions that give each user a private group — there the whole
-/// group would be able to drive the daemon.  Setting the mode explicitly means
-/// the guarantee does not depend on how the operator's shell was configured.
+/// group would be able to drive the daemon.
 ///
-/// A project socket may also land in the shared temp directory when the path
-/// next to the config would exceed the socket length limit, which makes this
-/// matter more, not less.
-fn restrict_socket(socket: &Path) -> Result<(), String> {
+/// Restricting the mode after `bind` is not enough: between the two calls the
+/// socket is live and group-writable, and whoever wins that race gets full
+/// start/stop/shutdown authority.  The invariant this function keeps is
+/// therefore stronger than "ends up 0600": **the socket is never reachable by
+/// anyone but its owner, not even for an instant.**  A umask around `bind`
+/// is what buys that, because the mode is applied when the inode is created.
+///
+/// The bind is deliberately synchronous and happens before the async runtime
+/// exists: the umask is process-global, so it must not be visible to any other
+/// thread creating a file.  `set_permissions` afterwards is not the mechanism
+/// but a check, for a platform that might ignore the umask for sockets.
+///
+/// The mode is not the only line of defence — [`super::peer`] asks the kernel
+/// who connected — but it is the one that keeps a stranger from ever reaching
+/// `accept`.
+fn bind_socket(socket: &Path) -> Result<std::os::unix::net::UnixListener, String> {
+    use nix::sys::stat::{umask, Mode};
     use std::os::unix::fs::PermissionsExt;
 
-    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("could not restrict {} to its owner: {e}", socket.display()))
+    // 0o177 masks away every bit but the owner's read and write.
+    let previous = umask(Mode::from_bits_truncate(0o177));
+    let bound = std::os::unix::net::UnixListener::bind(socket);
+    umask(previous);
+
+    let listener = bound.map_err(|e| format!("could not listen on {}: {e}", socket.display()))?;
+
+    let mode = std::fs::metadata(socket)
+        .map(|meta| meta.permissions().mode() & 0o777)
+        .unwrap_or(0);
+    if mode != 0o600 {
+        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("could not restrict {} to its owner: {e}", socket.display()))?;
+    }
+
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("could not prepare {}: {e}", socket.display()))?;
+    Ok(listener)
 }
 
 /// Run the daemon in this process until the stack stops or shutdown is
@@ -162,6 +240,43 @@ pub fn serve(
     options: DaemonOptions,
 ) -> Result<i32, String> {
     let plan = plan_stack(cfg, options.selection()).map_err(|e| e.to_string())?;
+
+    // Before anything of ours exists on disk or on the network.  SIGTERM,
+    // SIGINT and SIGHUP are fatal by default, and the real watcher cannot be
+    // installed until the runtime is built — which is after the socket is
+    // bound.  Claiming them here means a signal in that window is remembered
+    // instead of killing the process and stranding the socket file.
+    super::signals::claim()?;
+
+    paths.ensure_dir()?;
+    // One daemon per project, decided by the kernel rather than by a check
+    // that another start could slip past.  The lock is held for the whole run.
+    let lock = match super::lock::ProjectLock::acquire(&paths.pid) {
+        Ok(lock) => lock,
+        Err(super::lock::LockError::Held) => {
+            return Err(format!(
+                "a daemon is already running for this project (pidfile: {})",
+                paths.pid.display()
+            ))
+        }
+        Err(super::lock::LockError::Failed(problem)) => return Err(problem),
+    };
+
+    // Startup is the one moment when the configuration has just been read and
+    // no request can be in flight, so it is where names of services that no
+    // longer exist get dropped.  Held after the lock, because it writes.
+    match stopped::reconcile(&paths.stopped, cfg) {
+        Ok(dropped) if !dropped.is_empty() => tracing::info!(
+            services = %dropped.iter().cloned().collect::<Vec<_>>().join(", "),
+            file = %paths.stopped.display(),
+            "forgetting hand-stopped services the configuration no longer declares"
+        ),
+        Ok(_) => {}
+        // The memory of a stop is a convenience; failing to tidy it is not a
+        // reason to refuse to start a stack.
+        Err(problem) => tracing::warn!("{problem}"),
+    }
+
     let held_back = stopped::held_back(cfg, &plan, &stopped::read(&paths.stopped));
     if !held_back.is_empty() {
         tracing::info!(
@@ -175,16 +290,23 @@ pub fn serve(
         );
     }
 
-    paths.ensure_dir()?;
-    // A socket file always survives its daemon, so a stale one is only an
-    // error if somebody is still listening on it.
+    // Holding the lock rules out every daemon that takes it, so anything still
+    // answering on the socket is either a release from before the lock existed
+    // or an impostor.  Refusing is the only safe answer to both.
     if super::client::is_running(&paths.socket) {
         return Err(format!(
             "a daemon is already running for this project (socket: {})",
             paths.socket.display()
         ));
     }
+    // A socket file always survives its daemon, and the lock proves ours is
+    // gone, so a leftover here is stale.
     let _ = std::fs::remove_file(&paths.socket);
+    // Bound before the runtime exists: the umask that keeps the socket private
+    // is process-global, so no other thread may be creating files while it is
+    // in effect.  The signals were claimed above, so the socket cannot outlive
+    // a SIGTERM that lands between here and the real watcher.
+    let bound = bind_socket(&paths.socket)?;
 
     let registry = Arc::new(Mutex::new(StatusRegistry::new(plan.iter().map(|name| {
         let has_health = cfg
@@ -204,20 +326,42 @@ pub fn serve(
         keep_running: true,
     };
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|e| format!("failed to start the async runtime: {e}"))?;
+    {
+        Ok(runtime) => runtime,
+        // The socket is already bound and published, so an early return here
+        // has to tidy up just like the normal exit path does.  Nothing has
+        // accepted a connection yet, and the lock is still ours.
+        Err(problem) => {
+            let _ = std::fs::remove_file(&paths.socket);
+            drop(lock);
+            return Err(format!("failed to start the async runtime: {problem}"));
+        }
+    };
 
     let result = runtime.block_on(async {
-        let listener = UnixListener::bind(&paths.socket)
+        let listener = UnixListener::from_std(bound)
             .map_err(|e| format!("could not listen on {}: {e}", paths.socket.display()))?;
-        restrict_socket(&paths.socket)?;
 
         // One channel drives shutdown, whether it was asked for by a signal or
         // over the socket.
         let (stop_tx, mut stop_rx) = shutdown_channel();
         let signals = SignalWatcher::install(&project).map_err(|e| e.to_string())?;
+        // Every signal is now accounted for: anything from before the watcher
+        // existed was recorded by the early handler, anything after it is the
+        // watcher's.  Feeding an early one into the same channel means the
+        // supervisor sees a shutdown request before it starts a single service,
+        // so nothing is spawned only to be stopped again.
+        if let Some(reason) = super::signals::arrived() {
+            tracing::info!(
+                project = %project,
+                %reason,
+                "a shutdown arrived while the daemon was still starting up"
+            );
+            let _ = stop_tx.send(Some(reason));
+        }
         let mut signal_rx = signals.subscribe();
         let signal_stop = stop_tx.clone();
         let signal_task = tokio::spawn(async move {
@@ -256,7 +400,8 @@ pub fn serve(
         session.respawn_watchers(cfg, &plan);
         let server = tokio::spawn(accept_loop(listener, Arc::clone(&session)));
 
-        write_pid(&paths.pid)?;
+        // The pidfile is already written and locked; this is the point where a
+        // client can reach us.
         tracing::info!(project = %project, socket = %paths.socket.display(), "daemon ready");
 
         let supervisor = StackSupervisor::new(cfg, plan, stack_options, events_tx)
@@ -277,9 +422,10 @@ pub fn serve(
     });
 
     // Clean up even when the run failed, so the next start is not blocked by
-    // our leftovers.
+    // our leftovers.  Dropping the lock removes the pidfile, and it goes last:
+    // until then no other daemon can get as far as binding the socket.
     let _ = std::fs::remove_file(&paths.socket);
-    let _ = std::fs::remove_file(&paths.pid);
+    drop(lock);
 
     let outcome = result?;
     if !outcome.is_success() {
@@ -290,15 +436,21 @@ pub fn serve(
 
 /// Keep the status registry current, copy output to the log files, and hand
 /// every event to whoever is subscribed.
+///
+/// The file work is handed to a blocking task: the collector shares its worker
+/// threads with the supervisor, so a stalled disk here would stall child
+/// `wait()`s, health probes and the control channel too.
 async fn collect(
     mut events: EventReceiver,
     registry: Arc<Mutex<StatusRegistry>>,
-    mut logs: Option<LogRouter>,
+    logs: Option<LogRouter>,
     stream: tokio::sync::broadcast::Sender<servicrab_core::ServiceEvent>,
 ) {
+    let sink = logs.map(LogSink::spawn);
+
     while let Some(event) = events.recv().await {
-        if let (Some(router), EventKind::Log { line, .. }) = (logs.as_mut(), &event.kind) {
-            if let Some(problem) = router.record(&event.service, line) {
+        if let (Some(sink), EventKind::Log { line, .. }) = (sink.as_ref(), &event.kind) {
+            if let Some(problem) = sink.record(&event.service, line) {
                 tracing::warn!("{problem}");
             }
         }
@@ -308,65 +460,301 @@ async fn collect(
         // Nobody subscribed is the normal case, and not an error.
         let _ = stream.send(event);
     }
+
+    // The daemon is stopping; queued lines still have to reach the disk.
+    if let Some(sink) = sink {
+        if let Some(problem) = sink.shutdown().await {
+            tracing::warn!("{problem}");
+        }
+    }
 }
 
 /// Serve clients until the task is cancelled.
+///
+/// Every limit here exists because the socket is reachable before any request
+/// is understood, so an abusive client must cost the daemon a bounded amount of
+/// memory, file descriptors and CPU.
 async fn accept_loop(listener: UnixListener, session: Arc<Session>) {
+    // Counts live connections; each guard decrements on drop, including on a
+    // panic inside the handler.
+    let live = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
+        let mut stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(err) => {
+                // Running out of file descriptors is not transient, and
+                // retrying immediately spun this loop at 100% CPU with nothing
+                // logged.  Backing off gives whoever holds them a chance to let
+                // go, and says so.
+                tracing::warn!("could not accept a connection: {err}");
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+                continue;
+            }
+        };
+        // One task per connection with no cap is a way to be talked out of
+        // every file descriptor in the process.  Refusing the newest connection
+        // keeps the ones already being served, and the client sees a closed
+        // socket, which its own error handling already covers.
+        let Ok(permit) = Arc::clone(&live).try_acquire_owned() else {
+            tracing::warn!(
+                limit = MAX_CONNECTIONS,
+                "refused a connection: too many clients"
+            );
             continue;
         };
+
         let session = Arc::clone(&session);
         // One task per client keeps a stuck reader from blocking everybody
-        // else.
+        // else.  The peer check belongs in here rather than in the accept loop:
+        // saying why we are refusing means writing to the socket, and a peer
+        // that never reads must not be able to stall every other client.
         tokio::spawn(async move {
-            handle_client(stream, session).await;
+            if admit(&mut stream).await {
+                handle_client(stream, session).await;
+            }
+            drop(permit);
         });
     }
 }
 
+/// Decide whether a connection may be served, and tell it if not.
+///
+/// The socket's mode is the first line of defence, not the only one that should
+/// exist: a project on a filesystem that ignores Unix modes, or a directory an
+/// operator loosened, would otherwise hand the whole stack to a stranger.
+/// Asking the kernel does not depend on any of that.
+///
+/// A refusal used to be a silent close, which every client reported as "the
+/// daemon closed the connection without answering" — true, and no help at all
+/// in guessing that a uid mismatch was the cause.  Since the generated systemd
+/// unit carries a `User=`, `sudo servicrab status` against a user's daemon is a
+/// mistake people will make.
+///
+/// Naming both uids leaks nothing: a peer already knows its own, and the
+/// daemon's is readable from the socket's owner.  Nothing else is said — no
+/// path, no pid, no service name.
+async fn admit(stream: &mut UnixStream) -> bool {
+    let ours = nix::unistd::getuid().as_raw();
+    match super::peer::peer_uid(stream) {
+        Ok(uid) if uid == ours => true,
+        Ok(uid) => {
+            tracing::warn!(uid, "refused a connection from another user");
+            refuse(stream, &super::peer::wrong_user_message(ours, uid)).await;
+            false
+        }
+        Err(problem) => {
+            tracing::warn!("{problem}; refusing the connection");
+            refuse(stream, "this daemon could not confirm who is connecting").await;
+            false
+        }
+    }
+}
+
+/// Send one error line and let the connection drop.
+///
+/// A refused peer has to stay cheaper than an accepted one, or the refusal
+/// becomes the cheapest way to occupy the connection cap: nothing is read, so
+/// there is no frame to bound and no line to mis-parse, and the write is
+/// bounded in time in case the peer never reads it.
+async fn refuse(stream: &mut UnixStream, message: &str) {
+    let Ok(line) = encode(&Response::error(ErrorCode::Failed, message)) else {
+        return;
+    };
+    let _ = tokio::time::timeout(REFUSAL_TIMEOUT, async {
+        let _ = stream.write_all(line.as_bytes()).await;
+        let _ = stream.flush().await;
+    })
+    .await;
+}
+
+/// Read one request line, bounded in both size and time.
+///
+/// `tokio::io::Lines` grows its `String` until it finds a newline, so a stream
+/// that never sends one is a way to drive the daemon out of memory.  Reading
+/// into a capped buffer turns that into a closed connection.
+async fn read_request(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    line: &mut Vec<u8>,
+) -> ReadOutcome {
+    line.clear();
+    // `read_until` on a `take`-limited reader stops at the cap instead of
+    // growing the buffer forever.  One extra byte is allowed through so that a
+    // request of exactly `MAX_FRAME` bytes plus its newline still fits.
+    let read = tokio::time::timeout(IDLE_TIMEOUT, async {
+        let mut capped = (&mut *reader).take(MAX_FRAME as u64 + 1);
+        capped.read_until(b'\n', line).await
+    });
+    match read.await {
+        // The client went away — or it filled the cap without a newline, and
+        // the limited reader has nothing more to give.
+        Ok(Ok(0)) if line.is_empty() => ReadOutcome::Closed,
+        Ok(Ok(_)) | Ok(Err(_)) if !line.ends_with(b"\n") => {
+            // No newline means either a half-open connection that closed
+            // mid-request or a stream that never intends to send one.  Both are
+            // the end of this connection; only the second is worth a warning.
+            if line.len() > MAX_FRAME {
+                ReadOutcome::TooLong
+            } else {
+                ReadOutcome::Closed
+            }
+        }
+        Ok(Ok(_)) => ReadOutcome::Line,
+        Ok(Err(err)) => ReadOutcome::Broken(err.to_string()),
+        Err(_) => ReadOutcome::Idle,
+    }
+}
+
+/// What one read attempt produced.
+enum ReadOutcome {
+    /// A whole line is in the buffer.
+    Line,
+    /// The peer closed the connection.
+    Closed,
+    /// [`MAX_FRAME`] bytes arrived with no newline among them.
+    TooLong,
+    /// Nothing arrived for [`IDLE_TIMEOUT`].
+    Idle,
+    /// The read itself failed.
+    Broken(String),
+}
+
 async fn handle_client(stream: UnixStream, session: Arc<Session>) {
     let (read_half, mut write_half) = stream.into_split();
-    let mut lines = BufReader::new(read_half).lines();
+    let mut reader = BufReader::new(read_half);
+    let mut buffer = Vec::with_capacity(1024);
+    let mut strikes = 0_u32;
 
-    while let Ok(Some(line)) = lines.next_line().await {
+    loop {
+        match read_request(&mut reader, &mut buffer).await {
+            ReadOutcome::Line => {}
+            ReadOutcome::Closed => return,
+            ReadOutcome::TooLong => {
+                tracing::warn!(
+                    limit = MAX_FRAME,
+                    "closing a connection that sent an oversized request"
+                );
+                let _ = write(
+                    &mut write_half,
+                    &Response::error(
+                        ErrorCode::Failed,
+                        format!("a request may not exceed {MAX_FRAME} bytes"),
+                    ),
+                )
+                .await;
+                return;
+            }
+            ReadOutcome::Idle => {
+                tracing::debug!(
+                    timeout = ?IDLE_TIMEOUT,
+                    "closing an idle connection"
+                );
+                return;
+            }
+            ReadOutcome::Broken(problem) => {
+                tracing::debug!("a client connection broke: {problem}");
+                return;
+            }
+        }
+
+        // A request has to be valid UTF-8 to be JSON; treating it as a
+        // malformed line rather than an error of ours keeps the strike count
+        // honest.
+        let Ok(line) = std::str::from_utf8(&buffer) else {
+            if !strike(
+                &mut strikes,
+                &mut write_half,
+                "a request must be valid UTF-8",
+            )
+            .await
+            {
+                return;
+            }
+            continue;
+        };
         if line.trim().is_empty() {
             continue;
         }
-        let request = match decode::<Request>(&line) {
+        let request = match decode::<Request>(line) {
             Ok(request) => request,
             Err(err) => {
-                if !write(
-                    &mut write_half,
-                    &Response::Error {
-                        message: err.to_string(),
-                    },
-                )
-                .await
-                {
-                    break;
+                // Answering and carrying on let garbage be pumped forever.
+                if !strike(&mut strikes, &mut write_half, &err.to_string()).await {
+                    return;
                 }
                 continue;
             }
         };
+        // A client that talks sense has nothing held against it.  A request
+        // this daemon has no name for is not quite that: it decodes now, which
+        // is what makes the wildcard arm in `respond` reachable from a socket at
+        // all, but it is as good a sign of a broken or probing client as a
+        // malformed line — so it is answered properly and still counted.
+        let unusable = matches!(request, Request::Unknown);
+        if !unusable {
+            strikes = 0;
+        }
 
         // Subscribing turns the connection one-way: the client stops asking
         // and only reads until it goes away.
         if let Request::Subscribe { services, logs } = request {
             let filter = Filter::new(services, logs);
             let receiver = session.stream.subscribe();
-            if write(&mut write_half, &Response::Ok { message: None }).await {
+            // The handshake is where a subscriber learns which contract the
+            // events that follow are written to.
+            let hello = Response::Ok {
+                message: None,
+                changes: None,
+                schema_version: Some(servicrab_protocol::SCHEMA_VERSION),
+            };
+            if write(&mut write_half, &hello).await {
                 stream_events(receiver, filter, write_half).await;
             }
             return;
         }
 
-        let response = respond(request, &session).await;
+        let response = respond(request, servicrab_protocol::frame::tag(line), &session).await;
 
         if !write(&mut write_half, &response).await {
-            break;
+            return;
+        }
+        if unusable && !struck_out(&mut strikes) {
+            return;
         }
     }
+}
+
+/// Answer a malformed line and count it against the connection.
+///
+/// Returns whether the connection should carry on.
+async fn strike(
+    strikes: &mut u32,
+    sink: &mut tokio::net::unix::OwnedWriteHalf,
+    message: &str,
+) -> bool {
+    let alive = write(sink, &Response::error(ErrorCode::Failed, message)).await;
+    if !alive {
+        return false;
+    }
+    struck_out(strikes)
+}
+
+/// Count one request the daemon could not act on against the connection,
+/// reporting whether it should carry on.
+///
+/// A client that cannot form a request this daemon understands is either broken
+/// or probing; either way, three tries is enough courtesy, and closing beats
+/// letting garbage be pumped in forever.
+fn struck_out(strikes: &mut u32) -> bool {
+    *strikes += 1;
+    if *strikes >= MAX_MALFORMED {
+        tracing::warn!(
+            strikes = *strikes,
+            "closing a connection that keeps sending requests this daemon cannot act on"
+        );
+        return false;
+    }
+    true
 }
 
 /// Write one response, reporting whether the client is still there.
@@ -382,12 +770,15 @@ async fn write(sink: &mut tokio::net::unix::OwnedWriteHalf, response: &Response)
 
 /// Which events a subscriber asked for.
 struct Filter {
-    services: Vec<String>,
+    /// Empty means every service.  A set, because this is consulted once per
+    /// event per subscriber, and a linear scan of a client-supplied list turned
+    /// a busy stack into work proportional to the list length.
+    services: std::collections::BTreeSet<String>,
     logs: bool,
 }
 
 impl Filter {
-    fn new(services: Vec<String>, logs: bool) -> Self {
+    fn new(services: std::collections::BTreeSet<String>, logs: bool) -> Self {
         Self { services, logs }
     }
 
@@ -395,11 +786,7 @@ impl Filter {
         if !self.logs && matches!(event.kind, EventKind::Log { .. }) {
             return false;
         }
-        self.services.is_empty()
-            || self
-                .services
-                .iter()
-                .any(|name| name == event.service.as_str())
+        self.services.is_empty() || self.services.contains(event.service.as_str())
     }
 }
 
@@ -432,17 +819,62 @@ async fn stream_events(
     }
 }
 
-async fn respond(request: Request, session: &Session) -> Response {
+/// Refuse a request this daemon has no variant for, saying which one and what
+/// it could have asked for instead.
+///
+/// The list is generated from [`Request::SUPPORTED`], which the protocol crate
+/// keeps in step with the enum by a test that fails to compile when a variant is
+/// added without it.  So this is not a hand-maintained list that can rot into a
+/// lie — which is the only reason it is worth printing: a client author reading
+/// a refusal is exactly the person who needs it, and it is what serde's own
+/// `expected one of …` gave them for free before an unknown request stopped
+/// being a decode error.
+///
+/// A line with no usable `type` falls back to the old wording.  It should be
+/// unreachable — decoding got as far as `Request::Unknown`, which means the line
+/// was a JSON object with a `type` — but a message is not the place to insist on
+/// that.
+fn unsupported(named: Option<&str>) -> String {
+    let supported = Request::SUPPORTED.join(", ");
+    match named {
+        Some(tag) => {
+            format!("this daemon does not support the request {tag:?}; it supports: {supported}")
+        }
+        None => format!("this daemon does not support that request; it supports: {supported}"),
+    }
+}
+
+/// Answer one request.
+///
+/// `named` is the `type` the line claimed to be, which is only consulted for a
+/// request this daemon has no variant for: `#[serde(other)]` needs a unit
+/// variant, so [`Request::Unknown`] cannot carry the tag itself.
+async fn respond(request: Request, named: Option<String>, session: &Session) -> Response {
     match request {
-        Request::Ping => Response::Pong {
-            project: session.project.clone(),
-            pid: std::process::id(),
-        },
+        Request::Ping { version } => {
+            if let Some(theirs) = version {
+                if theirs < servicrab_protocol::PROTOCOL_VERSION {
+                    // Said once per ping and only downwards: a newer client
+                    // talking to us is the case we cannot help with from here,
+                    // and it hears about it from its own side.  An operator
+                    // chasing a command that behaved oddly is already reading
+                    // this log, which is why it goes here and not to the socket.
+                    tracing::info!(
+                        client = theirs,
+                        daemon = servicrab_protocol::PROTOCOL_VERSION,
+                        "a client is speaking an older revision of the protocol"
+                    );
+                }
+            }
+            Response::Pong {
+                project: session.project.clone(),
+                pid: std::process::id(),
+                version: Some(servicrab_protocol::PROTOCOL_VERSION),
+            }
+        }
         Request::Status => {
             let Ok(registry) = session.registry.lock() else {
-                return Response::Error {
-                    message: "the status registry is poisoned".to_string(),
-                };
+                return Response::error(ErrorCode::Failed, "the status registry is poisoned");
             };
             Response::Status {
                 services: registry.snapshot().iter().map(to_wire_status).collect(),
@@ -450,9 +882,7 @@ async fn respond(request: Request, session: &Session) -> Response {
         }
         Request::Shutdown => {
             let _ = session.stop.send(Some(ShutdownReason::Terminated));
-            Response::Ok {
-                message: Some("stopping the stack".to_string()),
-            }
+            Response::message("stopping the stack")
         }
         Request::StartService { name } => {
             let response = command(session, &name, |service, ack| Control::Start {
@@ -463,7 +893,7 @@ async fn respond(request: Request, session: &Session) -> Response {
             // Starting a service is how an operator takes back a stop, whether
             // it happened in this daemon or in an earlier one.
             if matches!(response, Response::Ok { .. }) {
-                session.remember(&name, false);
+                session.remember(&name, false).await;
             }
             response
         }
@@ -474,7 +904,7 @@ async fn respond(request: Request, session: &Session) -> Response {
             })
             .await;
             if matches!(response, Response::Ok { .. }) {
-                session.remember(&name, true);
+                session.remember(&name, true).await;
             }
             response
         }
@@ -485,16 +915,27 @@ async fn respond(request: Request, session: &Session) -> Response {
             })
             .await;
             if matches!(response, Response::Ok { .. }) {
-                session.remember(&name, false);
+                session.remember(&name, false).await;
             }
             response
         }
         Request::Reload => reload(session).await,
-        // `Request` is `#[non_exhaustive]`, so an older daemon can still be
-        // asked something it does not know about.
-        _ => Response::Error {
-            message: "this daemon does not support that request".to_string(),
-        },
+        // Reached by a client newer than this daemon: an unrecognised request
+        // decodes to `Request::Unknown` rather than failing, which is what lets
+        // this be answered at all — but the fallback is a unit variant and cannot
+        // carry the tag, so the name comes from the line instead.
+        //
+        // Naming it matters more for the common case than for the forward-
+        // compatible one.  A genuinely newer client knows what it asked for; a
+        // typo or a half-written client does not, and before an unknown request
+        // decoded, serde's `unknown variant "strat", expected one of …` told
+        // whoever sent it both things.  Losing that to gain the forward
+        // compatibility would have been a bad trade in a frozen contract.
+        //
+        // The prose is for that reader; the code is for the script that cannot
+        // read it, and `unsupported` is the classification this case was named
+        // after.
+        _ => Response::error(ErrorCode::Unsupported, unsupported(named.as_deref())),
     }
 }
 
@@ -510,14 +951,16 @@ async fn reload(session: &Session) -> Response {
     let (cfg, warnings) = match load(&session.config_path) {
         Ok(loaded) => loaded,
         Err(errors) => {
-            let details: Vec<String> = errors.iter().map(|e| format!("  • {e}")).collect();
+            // One entry per error, rather than one string with newlines and
+            // bullets in it that every caller would have to take apart again.
             return Response::Error {
+                code: ErrorCode::ValidationFailed,
                 message: format!(
-                    "{} has {} error(s); the stack was left untouched:\n{}",
+                    "{} has {} error(s); the stack was left untouched",
                     session.config_path.display(),
                     errors.len(),
-                    details.join("\n")
                 ),
+                errors: errors.iter().map(ToString::to_string).collect(),
             };
         }
     };
@@ -532,9 +975,10 @@ async fn reload(session: &Session) -> Response {
     let plan = match plan_stack(&cfg, selection) {
         Ok(plan) => plan,
         Err(err) => {
-            return Response::Error {
-                message: format!("{err}; the stack was left untouched"),
-            }
+            return Response::error(
+                ErrorCode::ValidationFailed,
+                format!("{err}; the stack was left untouched"),
+            )
         }
     };
 
@@ -551,28 +995,64 @@ async fn reload(session: &Session) -> Response {
     };
     if session.control.send(command).is_err() {
         restore_registry(session, &cfg, &previous);
-        return Response::Error {
-            message: "the supervisor is no longer accepting commands".to_string(),
-        };
+        return Response::error(
+            ErrorCode::Failed,
+            "the supervisor is no longer accepting commands",
+        );
     }
 
     match ack_rx.await {
-        Ok(Ok(message)) => {
+        Ok(Ok(outcome)) => {
             session.respawn_watchers(&cfg, &plan);
             Response::Ok {
-                message: Some(format!("reloaded {}: {message}", session.project)),
+                message: Some(format!("reloaded {}: {outcome}", session.project)),
+                changes: Some(reload_changes(outcome)),
+                schema_version: None,
             }
         }
-        Ok(Err(message)) => {
+        Ok(Err(refusal)) => {
             restore_registry(session, &cfg, &previous);
-            Response::Error { message }
+            Response::error(refusal_code(&refusal), refusal.to_string())
         }
         Err(_) => {
             restore_registry(session, &cfg, &previous);
-            Response::Error {
-                message: "the stack stopped before the reload completed".to_string(),
-            }
+            Response::error(
+                ErrorCode::Failed,
+                "the stack stopped before the reload completed",
+            )
         }
+    }
+}
+
+/// The three counts a reload reports, taken from what the supervisor did.
+///
+/// A `ControlOutcome` that is not a reload cannot reach here — `Control::Reload`
+/// is answered with `Reloaded` and nothing else — and reporting zeroes is a
+/// truthful answer to "what changed" for any outcome that carries no counts.
+fn reload_changes(outcome: ControlOutcome) -> servicrab_protocol::ReloadChanges {
+    match outcome {
+        ControlOutcome::Reloaded {
+            added,
+            changed,
+            removed,
+        } => servicrab_protocol::ReloadChanges {
+            added,
+            changed,
+            removed,
+        },
+        _ => servicrab_protocol::ReloadChanges::default(),
+    }
+}
+
+/// The wire code for a refusal the supervisor sent back.
+fn refusal_code(refusal: &ControlRefusal) -> ErrorCode {
+    match refusal {
+        ControlRefusal::UnknownService(_) => ErrorCode::UnknownService,
+        ControlRefusal::Busy(_) => ErrorCode::Busy,
+        ControlRefusal::AlreadyRunning(_) => ErrorCode::AlreadyRunning,
+        // A refusal a newer core knows about and this code does not is still a
+        // refusal, and saying only that is better than mislabelling it.
+        _ => ErrorCode::Failed,
     }
 }
 
@@ -605,8 +1085,9 @@ async fn command(
 ) -> Response {
     let names = session.known_names();
     let Some(service) = names.iter().find(|known| known.as_str() == name) else {
-        return Response::Error {
-            message: format!(
+        return Response::error(
+            ErrorCode::UnknownService,
+            format!(
                 "unknown service {name:?}; this daemon supervises: {}",
                 names
                     .iter()
@@ -614,7 +1095,7 @@ async fn command(
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-        };
+        );
     };
 
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
@@ -623,24 +1104,19 @@ async fn command(
         .send(build(service.clone(), ack_tx))
         .is_err()
     {
-        return Response::Error {
-            message: "the supervisor is no longer accepting commands".to_string(),
-        };
+        return Response::error(
+            ErrorCode::Failed,
+            "the supervisor is no longer accepting commands",
+        );
     }
 
     match ack_rx.await {
-        Ok(Ok(message)) => Response::Ok {
-            message: Some(format!("{name} {message}")),
-        },
-        Ok(Err(message)) => Response::Error { message },
+        Ok(Ok(outcome)) => Response::message(format!("{name} {outcome}")),
+        Ok(Err(refusal)) => Response::error(refusal_code(&refusal), refusal.to_string()),
         // The ack channel is dropped when the stack shuts down mid-command.
-        Err(_) => Response::Error {
-            message: "the stack stopped before the command completed".to_string(),
-        },
+        Err(_) => Response::error(
+            ErrorCode::Failed,
+            "the stack stopped before the command completed",
+        ),
     }
-}
-
-fn write_pid(path: &Path) -> Result<(), String> {
-    std::fs::write(path, format!("{}\n", std::process::id()))
-        .map_err(|e| format!("could not write {}: {e}", path.display()))
 }

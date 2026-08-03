@@ -76,7 +76,8 @@ name = "my-project"
 #                 `servicrab down` and `servicrab start`
 #   restart_delay         Minimum backoff before first restart (default: 1s)
 #   restart_max_delay     Maximum backoff cap (default: 30s)
-#   max_restarts          Give up after this many attempts (default: 10)
+#   max_restarts          Give up after this many attempts (default: 10,
+#                         0 means never give up)
 #   stable_after          Consider stable after running this long (default: 60s)
 #   shutdown_signal       term | int | quit | hup  (default: term)
 #   shutdown_timeout      Wait this long before forcibly killing (default: 10s)
