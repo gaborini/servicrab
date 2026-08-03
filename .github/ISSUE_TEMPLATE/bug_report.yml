@@ -54,7 +54,7 @@ body:
     attributes:
       label: Servicrab version
       description: Output of `servicrab --version`.
-      placeholder: servicrab 0.3.0
+      placeholder: servicrab 1.0.0
     validations:
       required: true
 

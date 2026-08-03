@@ -7,7 +7,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.0"
+version = "1.0.0"
 edition = "2021"
 authors = ["servicrab contributors"]
 license = "MIT OR Apache-2.0"
@@ -57,5 +57,5 @@ thiserror = "2"
 anyhow = "1"
 
 # Internal crates
-servicrab-core = { path = "crates/servicrab-core", version = "0.3.0" }
-servicrab-protocol = { path = "crates/servicrab-protocol", version = "0.3.0" }
+servicrab-core = { path = "crates/servicrab-core", version = "1.0.0" }
+servicrab-protocol = { path = "crates/servicrab-protocol", version = "1.0.0" }
