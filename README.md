@@ -1193,13 +1193,25 @@ Every service runs in its own process group, so signalling the group id — the
 `pgid` in `status --json` and in the `started` event, which is the number the
 group was created with — reaches the service and its descendants together.
 
-This is not hypothetical: during development two test daemons escaped a killed
-harness and ran for nineteen hours before anyone noticed, which is the same
-class of orphan. If you need supervision that survives its own supervisor being
-killed, run `servicrab daemon` under something whose job that is — systemd or
-launchd, with `Restart=` set — and see
+This is not hypothetical. While this documentation was being written, a check of
+the development machine found **twenty** escaped `servicrab daemon` processes
+from three different worktrees, every one of them still supervising services
+whose configuration directory had long since been deleted, and the oldest of
+them more than **twenty-four hours** old. Orphans do not announce themselves;
+they are found by going to look. If you need supervision that survives its own
+supervisor being killed, run `servicrab daemon` under something whose job that
+is — systemd or launchd, with `Restart=` set — and see
 [Running under systemd or launchd](#running-under-systemd-or-launchd). Servicrab
 supervises your services; it does not supervise itself.
+
+A quick way to go and look:
+
+```bash
+pgrep -fl 'servicrab daemon'
+```
+
+Each line names the config the daemon was started with. A config path that no
+longer exists is a daemon nothing is going to reach.
 
 ### The socket protocol
 
